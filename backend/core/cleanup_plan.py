@@ -969,6 +969,230 @@ def _raw_glyph_support_mask(raw: np.ndarray, plan: CleanupPlan, bg_bgr: np.ndarr
     return support.astype(np.uint8) * 255
 
 
+def _flat_fill_boundary_band_analysis(
+    raw: np.ndarray,
+    plan: CleanupPlan,
+    active_mask: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    empty = {
+        "boundary_band_active_px": 0,
+        "boundary_band_unsafe_px": 0,
+        "boundary_band_supported_px": 0,
+        "boundary_band_active_ratio": 0.0,
+        "boundary_band_unsafe_ratio": 0.0,
+        "boundary_band_glyph_focus_px": 0,
+        "boundary_text_component_filtered_px": 0,
+        "boundary_text_bbox_matches_region": False,
+        "boundary_active_bbox_matches_region": False,
+        "boundary_large_mask": False,
+        "boundary_damage_risk": False,
+    }
+    if (
+        active_mask is None
+        or raw is None
+        or plan.region_class not in {"speech_bubble", "caption_box"}
+        or plan.background_model not in {"flat_light", "flat_colored", "dark_bubble"}
+        or plan.cleanup_strategy != "flat_fill"
+        or plan.container_mask is None
+        or plan.container_bbox is None
+        or not np.any(active_mask)
+    ):
+        return empty
+    try:
+        container = normalize_mask_to_image(plan.container_mask, plan.container_bbox, raw.shape) > 0
+    except Exception:
+        return empty
+    inner = _cleanup_safe_interior_mask(plan, raw.shape, erode_px=8)
+    if inner is None or not np.any(inner):
+        return empty
+    boundary = container & ~(inner > 0)
+    if not np.any(boundary):
+        return empty
+    active = active_mask > 0
+    active_px = int(np.count_nonzero(active))
+    if active_px <= 0:
+        return empty
+    boundary_active = active & boundary
+    boundary_active_px = int(np.count_nonzero(boundary_active))
+    if boundary_active_px <= 0:
+        return {
+            **empty,
+            "_unsafe_mask": np.zeros(raw.shape[:2], dtype=np.uint8),
+            "_glyph_focus_mask": np.zeros(raw.shape[:2], dtype=np.uint8),
+        }
+    bg_bgr = _bg_bgr_for_verifier(raw, plan, plan.cleanup_mask if plan.cleanup_mask is not None else active_mask)
+    raw_support = (_raw_glyph_support_mask(raw, plan, bg_bgr) > 0) & container
+    text_bbox_region_like = bool(_bbox_close(plan.text_bbox, plan.region_bbox, tol=8))
+    active_bbox = _mask_bbox(active.astype(np.uint8) * 255)
+    active_bbox_region_like = bool(_bbox_close(active_bbox, plan.region_bbox, tol=8))
+    quality = plan.debug_metrics.get("quality", {}) or {}
+    region_area = max(1, int(plan.region_bbox[2] * plan.region_bbox[3])) if plan.region_bbox is not None else max(1, active.size)
+    container_area = max(1, int(np.count_nonzero(container)))
+    active_region_ratio = float(active_px) / float(region_area)
+    active_container_ratio = float(active_px) / float(container_area)
+    mask_region_ratio = max(active_region_ratio, float(quality.get("mask_region_ratio", 0.0) or 0.0))
+    mask_container_ratio = max(active_container_ratio, float(quality.get("mask_container_ratio", 0.0) or 0.0))
+    large_mask = bool(mask_region_ratio >= 0.28 or mask_container_ratio >= 0.35)
+    trusted_text_mask = None
+    text_component_filtered_px = 0
+    if plan.text_mask is not None and np.any(plan.text_mask):
+        text_px = int(np.count_nonzero(plan.text_mask))
+        text_region_ratio = float(text_px) / float(region_area)
+        trusted_text_mask = (plan.text_mask > 0) & container
+        if text_bbox_region_like and text_region_ratio >= 0.28:
+            trusted_text_mask = None
+        elif text_bbox_region_like:
+            filtered = np.zeros(raw.shape[:2], dtype=bool)
+            n_text, text_labels, text_stats, _text_centroids = cv2.connectedComponentsWithStats(trusted_text_mask.astype(np.uint8), 8)
+            for label in range(1, n_text):
+                area = int(text_stats[label, cv2.CC_STAT_AREA])
+                if area <= 0:
+                    continue
+                comp = text_labels == label
+                boundary_ratio = float(np.count_nonzero(comp & boundary)) / float(max(1, area))
+                if boundary_ratio >= 0.10 and area >= 12:
+                    text_component_filtered_px += area
+                    continue
+                filtered[comp] = True
+            trusted_text_mask = filtered
+    glyph_seed = raw_support.copy()
+    if trusted_text_mask is not None:
+        trusted_near = cv2.dilate(
+            trusted_text_mask.astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            iterations=1,
+        ) > 0
+        glyph_seed &= trusted_near
+    elif text_bbox_region_like and plan.text_mask is not None:
+        glyph_seed &= np.zeros(raw.shape[:2], dtype=bool)
+    n, labels, stats, _centroids = cv2.connectedComponentsWithStats(glyph_seed.astype(np.uint8), 8)
+    glyph_focus = np.zeros(raw.shape[:2], dtype=np.uint8)
+    for label in range(1, n):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area <= 0 or area > 1400:
+            continue
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        aspect = float(max(w, h)) / float(max(1, min(w, h)))
+        if aspect > 10.0 and area > 48:
+            continue
+        comp = labels == label
+        boundary_ratio = float(np.count_nonzero(comp & boundary)) / float(max(1, area))
+        text_ratio = (
+            float(np.count_nonzero(comp & trusted_text_mask)) / float(max(1, area))
+            if trusted_text_mask is not None else 0.0
+        )
+        if boundary_ratio >= 0.55 and text_ratio < 0.45:
+            continue
+        glyph_focus[comp] = 255
+    if np.any(glyph_focus):
+        glyph_near = cv2.dilate(
+            glyph_focus,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+            iterations=1,
+        ) > 0
+    else:
+        glyph_near = np.zeros(raw.shape[:2], dtype=bool)
+    supported_boundary = boundary_active & glyph_near
+    unsafe_boundary = boundary_active & ~glyph_near
+    unsafe_px = int(np.count_nonzero(unsafe_boundary))
+    supported_px = int(np.count_nonzero(supported_boundary))
+    active_ratio = float(boundary_active_px) / float(max(1, active_px))
+    unsafe_ratio = float(unsafe_px) / float(max(1, boundary_active_px))
+    risk_threshold = max(72, min(384, int(active_px * 0.035)))
+    weak_geometry = bool(text_bbox_region_like or active_bbox_region_like or (large_mask and active_ratio >= 0.12))
+    damage_risk = bool(
+        unsafe_px >= risk_threshold
+        and active_ratio >= 0.035
+        and unsafe_ratio >= 0.35
+        and weak_geometry
+    )
+    return {
+        **empty,
+        "boundary_band_active_px": int(boundary_active_px),
+        "boundary_band_unsafe_px": int(unsafe_px),
+        "boundary_band_supported_px": int(supported_px),
+        "boundary_band_active_ratio": round(float(active_ratio), 4),
+        "boundary_band_unsafe_ratio": round(float(unsafe_ratio), 4),
+        "boundary_band_glyph_focus_px": int(np.count_nonzero(glyph_focus)),
+        "boundary_text_component_filtered_px": int(text_component_filtered_px),
+        "boundary_text_bbox_matches_region": bool(text_bbox_region_like),
+        "boundary_active_bbox_matches_region": bool(active_bbox_region_like),
+        "boundary_large_mask": bool(large_mask),
+        "boundary_damage_risk": bool(damage_risk),
+        "_unsafe_mask": unsafe_boundary.astype(np.uint8) * 255,
+        "_glyph_focus_mask": glyph_focus,
+    }
+
+
+def _publish_boundary_band_metrics(plan: CleanupPlan, analysis: Dict[str, Any], prefix: str) -> None:
+    for key, value in analysis.items():
+        if not str(key).startswith("_"):
+            plan.debug_metrics[f"{prefix}_{key}"] = value
+
+
+def _constrain_flat_fill_boundary_mask(
+    img_cv: np.ndarray,
+    plan: CleanupPlan,
+    cleanup: np.ndarray,
+) -> np.ndarray:
+    analysis = _flat_fill_boundary_band_analysis(img_cv, plan, cleanup)
+    _publish_boundary_band_metrics(plan, analysis, "preclean")
+    if not bool(analysis.get("boundary_damage_risk", False)):
+        plan.debug_metrics["boundary_mask_constrained"] = False
+        return cleanup
+    unsafe = analysis.get("_unsafe_mask")
+    if not isinstance(unsafe, np.ndarray) or not np.any(unsafe):
+        plan.debug_metrics["boundary_mask_constrained"] = False
+        return cleanup
+    removal_mask = unsafe.copy()
+    glyph_focus = analysis.get("_glyph_focus_mask")
+    glyph_active = glyph_focus > 0 if isinstance(glyph_focus, np.ndarray) else np.zeros(cleanup.shape[:2], dtype=bool)
+    n, labels, stats, _centroids = cv2.connectedComponentsWithStats((cleanup > 0).astype(np.uint8), 8)
+    expanded_removed_px = 0
+    for label in range(1, n):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area <= 0:
+            continue
+        comp = labels == label
+        unsafe_overlap = int(np.count_nonzero(comp & (unsafe > 0)))
+        if unsafe_overlap <= 0:
+            continue
+        glyph_overlap = int(np.count_nonzero(comp & glyph_active))
+        glyph_ratio = float(glyph_overlap) / float(max(1, area))
+        unsafe_ratio = float(unsafe_overlap) / float(max(1, area))
+        if glyph_ratio <= 0.20 and (unsafe_overlap >= 24 or unsafe_ratio >= 0.12):
+            before = int(np.count_nonzero(removal_mask))
+            removal_mask[comp] = 255
+            expanded_removed_px += int(np.count_nonzero(removal_mask)) - before
+    constrained = cleanup.copy()
+    constrained[removal_mask > 0] = 0
+    original_px = int(np.count_nonzero(cleanup))
+    constrained_px = int(np.count_nonzero(constrained))
+    if constrained_px <= 0 or original_px <= 0:
+        plan.debug_metrics["boundary_mask_constrained"] = False
+        plan.debug_metrics["boundary_mask_constraint_rejection_reason"] = "empty_after_boundary_constraint"
+        return cleanup
+    glyph_px = int(np.count_nonzero(glyph_active & (cleanup > 0)))
+    glyph_kept = int(np.count_nonzero(glyph_active & (constrained > 0)))
+    glyph_retained = float(glyph_kept) / float(max(1, glyph_px)) if glyph_px > 0 else 1.0
+    retained_ratio = float(constrained_px) / float(max(1, original_px))
+    if retained_ratio < 0.35 or glyph_retained < 0.82:
+        plan.debug_metrics["boundary_mask_constrained"] = False
+        plan.debug_metrics["boundary_mask_constraint_rejection_reason"] = "would_drop_glyph_support"
+        plan.debug_metrics["boundary_mask_constraint_retained_ratio"] = round(float(retained_ratio), 4)
+        plan.debug_metrics["boundary_mask_constraint_glyph_retained_ratio"] = round(float(glyph_retained), 4)
+        return cleanup
+    plan.debug_metrics["boundary_mask_constrained"] = True
+    plan.debug_metrics["boundary_mask_constraint_removed_px"] = int(original_px - constrained_px)
+    plan.debug_metrics["boundary_mask_constraint_expanded_removed_px"] = int(expanded_removed_px)
+    plan.debug_metrics["boundary_mask_constraint_retained_ratio"] = round(float(retained_ratio), 4)
+    plan.debug_metrics["boundary_mask_constraint_glyph_retained_ratio"] = round(float(glyph_retained), 4)
+    return constrained
+
+
 def _detect_cleanup_residual_components(
     raw: np.ndarray,
     cleaned: np.ndarray,
@@ -998,7 +1222,19 @@ def _detect_cleanup_residual_components(
     ):
         return empty
     safe = _cleanup_safe_interior_mask(plan, cleaned.shape, erode_px=3)
-    if safe is None:
+    text_focus = np.zeros(cleaned.shape[:2], dtype=np.uint8)
+    if plan.text_bbox is not None:
+        tx, ty, tw, th = [int(v) for v in plan.text_bbox]
+        h_img, w_img = cleaned.shape[:2]
+        pad = 8
+        x1, y1 = max(0, tx - pad), max(0, ty - pad)
+        x2, y2 = min(w_img, tx + tw + pad), min(h_img, ty + th + pad)
+        if x2 > x1 and y2 > y1:
+            text_focus[y1:y2, x1:x2] = 255
+    search_safe = safe.copy() if safe is not None else np.zeros(cleaned.shape[:2], dtype=np.uint8)
+    if np.any(text_focus):
+        search_safe = cv2.bitwise_or(search_safe, text_focus)
+    if not np.any(search_safe):
         return {**empty, "residual_retry_rejection_reason": "no_safe_interior"}
     bg_bgr = _bg_bgr_for_verifier(raw, plan, mask)
     gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -1010,7 +1246,7 @@ def _detect_cleanup_residual_components(
     else:
         contrast = gray < bg_gray - 24.0
     suspect = ((dist > 38.0) & contrast) | ((dist > 48.0) & (edge > 0))
-    suspect &= safe > 0
+    suspect &= search_safe > 0
     raw_support = _raw_glyph_support_mask(raw, plan, bg_bgr)
     if plan.text_mask is not None:
         text_near = cv2.dilate(
@@ -1027,11 +1263,20 @@ def _detect_cleanup_residual_components(
     suspect &= ((raw_support > 0) | (text_near > 0))
     if not np.any(suspect):
         return empty
+    boundary_band = None
+    if plan.container_mask is not None and plan.container_bbox is not None:
+        try:
+            container_full = normalize_mask_to_image(plan.container_mask, plan.container_bbox, cleaned.shape) > 0
+            inner = _cleanup_safe_interior_mask(plan, cleaned.shape, erode_px=6)
+            if inner is not None and np.any(inner):
+                boundary_band = container_full & ~(inner > 0)
+        except Exception:
+            boundary_band = None
     n, labels, stats, _centroids = cv2.connectedComponentsWithStats(suspect.astype(np.uint8), 8)
     kept = np.zeros(suspect.shape, dtype=np.uint8)
     high_confidence = np.zeros(suspect.shape, dtype=np.uint8)
     component_rows: List[Dict[str, Any]] = []
-    safe_active = safe > 0
+    safe_active = search_safe > 0
     safe_bbox = _mask_bbox(safe)
     rejection = ""
     if mask is not None and np.any(mask):
@@ -1060,6 +1305,11 @@ def _detect_cleanup_residual_components(
                 continue
         support_ratio = float(np.count_nonzero(comp & (raw_support > 0))) / float(max(1, area))
         near_ratio = float(np.count_nonzero(comp & (text_near > 0))) / float(max(1, area))
+        boundary_ratio = (
+            float(np.count_nonzero(comp & boundary_band)) / float(max(1, area))
+            if boundary_band is not None else 0.0
+        )
+        boundary_artifact = bool(boundary_ratio >= 0.18 and near_ratio <= 0.20)
         if support_ratio < 0.20 and near_ratio < 0.65:
             rejection = "weak_raw_glyph_support"
             continue
@@ -1081,6 +1331,8 @@ def _detect_cleanup_residual_components(
             confidence += 0.25
         if cleanup_overlap > 0:
             confidence += 0.20
+        if boundary_artifact:
+            confidence = min(confidence, 0.45)
         confidence = min(1.0, confidence)
         is_high_confidence = bool(confidence >= 0.65)
         if is_high_confidence:
@@ -1094,10 +1346,16 @@ def _detect_cleanup_residual_components(
             "edge_px": edge_px,
             "raw_support_ratio": round(float(support_ratio), 4),
             "text_near_ratio": round(float(near_ratio), 4),
+            "container_boundary_ratio": round(float(boundary_ratio), 4),
             "cleanup_mask_overlap_px": cleanup_overlap,
             "distance_to_cleanup_mask_px": round(float(mask_distance), 3),
             "residual_confidence": round(float(confidence), 3),
-            "residual_component_verdict": "high_confidence_residual" if is_high_confidence else "low_confidence_texture_or_antialias",
+            "residual_component_verdict": (
+                "container_boundary_artifact"
+                if boundary_artifact else (
+                    "high_confidence_residual" if is_high_confidence else "low_confidence_texture_or_antialias"
+                )
+            ),
         })
     component_px = int(np.count_nonzero(kept))
     if component_px <= 0:
@@ -1109,7 +1367,7 @@ def _detect_cleanup_residual_components(
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
         iterations=1,
     )
-    retry_mask = np.where((retry_mask > 0) & (safe > 0), 255, 0).astype(np.uint8)
+    retry_mask = np.where((retry_mask > 0) & (search_safe > 0), 255, 0).astype(np.uint8)
     retry_px = int(np.count_nonzero(retry_mask & ~(mask > 0)))
     mask_px = int(np.count_nonzero(mask))
     retry_safe = bool(authoritative and 0 < retry_px <= max(96, min(700, int(mask_px * 0.12))))
@@ -1153,11 +1411,36 @@ def _changed_component_patch_analysis(
         }
     bg_bgr = _bg_bgr_for_verifier(raw, plan, plan.cleanup_mask)
     raw_support = _raw_glyph_support_mask(raw, plan, bg_bgr) > 0
+    if plan.text_mask is not None:
+        text_near = cv2.dilate(
+            (plan.text_mask > 0).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+            iterations=1,
+        ) > 0
+    elif plan.cleanup_mask is not None:
+        text_near = cv2.dilate(
+            (plan.cleanup_mask > 0).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1,
+        ) > 0
+    else:
+        text_near = np.zeros(changed.shape, dtype=bool)
     safe = _cleanup_safe_interior_mask(plan, raw.shape, erode_px=2)
     safe_bbox = _mask_bbox(safe) if safe is not None else None
+    boundary_band = None
+    if plan.container_mask is not None and plan.container_bbox is not None:
+        try:
+            container_full = normalize_mask_to_image(plan.container_mask, plan.container_bbox, raw.shape) > 0
+            inner = _cleanup_safe_interior_mask(plan, raw.shape, erode_px=6)
+            if inner is not None and np.any(inner):
+                boundary_band = container_full & ~(inner > 0)
+        except Exception:
+            boundary_band = None
     n, labels, stats, _centroids = cv2.connectedComponentsWithStats(changed.astype(np.uint8), 8)
     patch_components = np.zeros(changed.shape, dtype=np.uint8)
     reasons: List[str] = []
+    boundary_artifact_px = 0
+    boundary_artifact_count = 0
     for label in range(1, n):
         area = int(stats[label, cv2.CC_STAT_AREA])
         x = int(stats[label, cv2.CC_STAT_LEFT])
@@ -1170,16 +1453,29 @@ def _changed_component_patch_analysis(
         fill_ratio = float(area) / float(max(1, w * h))
         aspect = float(max(w, h)) / float(max(1, min(w, h)))
         raw_ratio = float(np.count_nonzero(comp & raw_support)) / float(max(1, area))
+        boundary_ratio = (
+            float(np.count_nonzero(comp & boundary_band)) / float(max(1, area))
+            if boundary_band is not None else 0.0
+        )
+        text_near_ratio = float(np.count_nonzero(comp & text_near)) / float(max(1, area))
         side_band = False
         border_band = False
         if safe_bbox is not None:
             sx, sy, sw, sh = safe_bbox
             side_band = bool(x <= sx + 4 or x + w >= sx + sw - 4)
             border_band = bool(y <= sy + 4 or y + h >= sy + sh - 4)
-        blocky = bool(fill_ratio >= 0.78 and area >= 180)
-        long_bar = bool(aspect >= 5.0 and area >= 120)
+        edge_band = bool(side_band or border_band or boundary_ratio >= 0.18)
+        blocky = bool(fill_ratio >= 0.72 and area >= 96)
+        long_bar = bool(aspect >= 4.0 and area >= 96)
         oversized = bool(plan.container_mask is not None and area >= max(240, int(np.count_nonzero(plan.container_mask) * 0.18)))
-        if raw_ratio <= 0.24 and ((blocky and (side_band or border_band or oversized)) or (long_bar and (side_band or border_band))):
+        boundary_artifact = bool(boundary_ratio >= 0.18 and text_near_ratio <= 0.20 and area >= 12)
+        if boundary_artifact:
+            boundary_artifact_px += area
+            boundary_artifact_count += 1
+        if (
+            raw_ratio <= 0.30
+            and ((blocky and (edge_band or oversized)) or (long_bar and edge_band))
+        ) or boundary_artifact:
             patch_components[comp] = 255
             if blocky:
                 reasons.append("blocky_changed_component")
@@ -1187,8 +1483,12 @@ def _changed_component_patch_analysis(
                 reasons.append("side_band_changed_component")
             if border_band:
                 reasons.append("border_band_changed_component")
+            if boundary_ratio >= 0.18:
+                reasons.append("container_boundary_changed_component")
             if long_bar:
                 reasons.append("long_bar_changed_component")
+    if boundary_artifact_count >= 3 and boundary_artifact_px >= 128:
+        reasons.append("clustered_container_boundary_changed_components")
     rows = _component_stats(patch_components, limit=8)
     reason = ",".join(dict.fromkeys(reasons))
     return {
@@ -1219,6 +1519,21 @@ def _cleanup_visual_quality_result(
             changed_bbox = [int(bx), int(by), int(bw), int(bh)]
             changed_rectangularity = float(changed_px) / float(max(1, bw * bh))
     component_analysis = _changed_component_patch_analysis(raw, cleaned, plan, changed)
+    boundary_analysis = _flat_fill_boundary_band_analysis(raw, plan, changed.astype(np.uint8) * 255)
+    boundary_damage_visible = bool(boundary_analysis.get("boundary_damage_risk", False))
+    boundary_public = {
+        f"visual_{key}": value
+        for key, value in boundary_analysis.items()
+        if not str(key).startswith("_")
+    }
+    fill_patch_reason = str(component_analysis.get("fill_patch_reason", "") or "")
+    if boundary_damage_visible:
+        fill_patch_reason = ",".join(
+            dict.fromkeys(
+                [item for item in [fill_patch_reason, "container_boundary_damage_risk"] if item]
+            )
+        )
+        component_analysis["fill_patch_reason"] = fill_patch_reason
     fill_patch_visible = bool(
         changed_px > 0
         and (
@@ -1237,6 +1552,7 @@ def _cleanup_visual_quality_result(
                 and border_touch_ratio >= 0.35
                 and mask_region_ratio >= 0.18
             )
+            or boundary_damage_visible
             or int(component_analysis.get("fill_patch_component_count", 0) or 0) > 0
         )
     )
@@ -1249,6 +1565,7 @@ def _cleanup_visual_quality_result(
         "changed_mask_bbox": changed_bbox,
         "changed_mask_rectangularity": round(float(changed_rectangularity), 4),
         **component_analysis,
+        **boundary_public,
     }
 
 
@@ -1395,13 +1712,32 @@ def validate_cleanup_proposal(
     destructive_cleanup_executed = bool(pixel_cleanup_executed)
     residual_score = plan.debug_metrics.get("residual_score", {}) or {}
     skip_reason = str(plan.skip_reason or "")
-    residual_text_visible = bool(
-        residual_score.get("bad", False)
-        or int(plan.debug_metrics.get("residual_component_authoritative_count", 0) or 0) > 0
-        or skip_reason in {"cleanup_residual_text_remains", "cleanup_ocr_text_remains"}
-    )
     visual = _cleanup_visual_quality_result(raw, cleaned, plan)
     visual_quality_ok = bool(visual.get("visual_quality_ok", True))
+    fill_patch_visible = bool(visual.get("fill_patch_visible", False))
+    authoritative_residual_count = int(plan.debug_metrics.get("residual_component_authoritative_count", 0) or 0)
+    residual_suppressed_by_components = bool(
+        plan.debug_metrics.get("residual_score_suppressed_by_components", False)
+        and authoritative_residual_count <= 0
+    )
+    non_authoritative_fill_patch = bool(fill_patch_visible and authoritative_residual_count <= 0)
+    if non_authoritative_fill_patch and skip_reason == "cleanup_residual_text_remains":
+        plan.skip_reason = str(visual.get("visual_quality_failure_reason") or "cleanup_fill_patch_visible")
+        skip_reason = str(plan.skip_reason or "")
+        plan.debug_metrics["residual_suppressed_by_fill_patch"] = True
+    residual_text_visible = bool(
+        (
+            bool(residual_score.get("bad", False))
+            and not non_authoritative_fill_patch
+            and not residual_suppressed_by_components
+        )
+        or authoritative_residual_count > 0
+        or (
+            skip_reason in {"cleanup_residual_text_remains", "cleanup_ocr_text_remains"}
+            and not non_authoritative_fill_patch
+            and not residual_suppressed_by_components
+        )
+    )
     review_required = bool(plan.debug_metrics.get("review_required_after_cleanup", False))
     force_mode = str(plan.debug_metrics.get("cleanup_override_mode", "") or "") in {
         "force_allow", "force_solid", "force_telea", "force_ns", "force_iopaint"
@@ -1811,6 +2147,7 @@ def _reject_unsafe_cleanup_mask(
     plan: CleanupPlan,
     cleanup: np.ndarray,
     policy: Optional[CleanupPolicy] = None,
+    img_cv: Optional[np.ndarray] = None,
 ) -> Optional[str]:
     policy = policy or CleanupPolicy()
 
@@ -1848,6 +2185,10 @@ def _reject_unsafe_cleanup_mask(
         safety_bbox=safety_bbox,
     )
     plan.debug_metrics["quality"] = quality
+    boundary_source = img_cv if img_cv is not None else np.zeros((*cleanup.shape[:2], 3), dtype=np.uint8)
+    boundary_analysis = _flat_fill_boundary_band_analysis(boundary_source, plan, cleanup)
+    _publish_boundary_band_metrics(plan, boundary_analysis, "safety")
+    boundary_damage_risk = bool(boundary_analysis.get("boundary_damage_risk", False))
     mask_area = int(metrics["mask_area"])
     if mask_area <= 0:
         return "empty_cleanup_mask"
@@ -1862,7 +2203,10 @@ def _reject_unsafe_cleanup_mask(
     border_touch_ratio = float(quality.get("border_touch_ratio", 0.0) or 0.0)
     rectangularity = float(quality.get("rectangularity", 0.0) or 0.0)
     long_bar_score = float(quality.get("long_bar_score", 0.0) or 0.0)
-    easy_large_mask = _easy_cleanup_large_mask_allowed(plan, policy, quality)
+    easy_large_mask = bool(_easy_cleanup_large_mask_allowed(plan, policy, quality) and not boundary_damage_risk)
+    if boundary_damage_risk:
+        plan.debug_metrics["easy_cleanup_boundary_blocked"] = True
+        plan.debug_metrics["easy_cleanup_eligible"] = False
     flat_bg = str(plan.background_model or "") in {"flat_light", "flat_colored", "dark_bubble"}
 
     if plan.region_class in ("speech_bubble", "sfx", "text_on_art"):
@@ -5067,7 +5411,8 @@ def build_cleanup_plan(
                 plan.debug_metrics["container_confine_ignored"] = "partial_container_mask"
 
         cleanup = _optimize_flat_fill_cleanup_mask(img_cv, plan, cleanup, policy)
-        reject_reason = _reject_unsafe_cleanup_mask(plan, cleanup, policy=policy)
+        cleanup = _constrain_flat_fill_boundary_mask(img_cv, plan, cleanup)
+        reject_reason = _reject_unsafe_cleanup_mask(plan, cleanup, policy=policy, img_cv=img_cv)
         plan.debug_metrics["cleanup_mask_rejected"] = bool(reject_reason)
         plan.debug_metrics["cleanup_mask_rejection_reason"] = str(reject_reason or "")
         if reject_reason:
@@ -5230,9 +5575,11 @@ def execute_cleanup_plan(
                 _execute_flat_fill(img_cv, result, retry_mask, plan)
                 residual = _score_cleanup_residual(img_cv, result, plan, retry_mask)
                 plan.debug_metrics["residual_score"] = residual
+                mask = retry_mask
         plan.debug_metrics["retry_used"] = retry_used
         residual_components = _detect_cleanup_residual_components(img_cv, result, plan, mask)
         component_retry = residual_components.pop("residual_retry_mask", None)
+        residual_review_suppressed = False
         if int(residual_components.get("residual_component_count", 0) or 0) > 0:
             plan.debug_metrics.update(residual_components)
             authoritative = int(residual_components.get("residual_component_authoritative_count", 0) or 0) > 0
@@ -5252,11 +5599,13 @@ def execute_cleanup_plan(
             if authoritative:
                 _mark_residual_review(plan)
             else:
+                residual_review_suppressed = True
+                plan.debug_metrics["residual_score_suppressed_by_components"] = True
                 plan.debug_metrics["cleanup_warning_reason"] = "residual_component_low_confidence"
         else:
             plan.debug_metrics.update(residual_components)
         plan.debug_metrics["retry_used"] = retry_used
-        if bool(residual.get("bad", False)):
+        if bool(residual.get("bad", False)) and not residual_review_suppressed:
             _mark_residual_review(plan)
         plan.debug_metrics["final_cleanup_decision"] = {
             "strategy": plan.cleanup_strategy,
@@ -6129,7 +6478,8 @@ def erase_text_region_planned(
                     cleanup = cv2.bitwise_or(cleanup, plan.outline_shadow_mask)
                 if plan.halo_mask is not None:
                     cleanup = cv2.bitwise_or(cleanup, plan.halo_mask)
-                reject_reason = _reject_unsafe_cleanup_mask(plan, cleanup, policy=policy)
+                cleanup = _constrain_flat_fill_boundary_mask(img_cv, plan, cleanup)
+                reject_reason = _reject_unsafe_cleanup_mask(plan, cleanup, policy=policy, img_cv=img_cv)
                 if reject_reason:
                     plan.cleanup_strategy        = "skip"
                     plan.inpaint_method          = "skip"

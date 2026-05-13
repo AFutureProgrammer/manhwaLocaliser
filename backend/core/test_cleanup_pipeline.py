@@ -15,6 +15,7 @@ from backend.core.cleanup_plan import (
     clamp_cleanup_outcome_fields,
     cleanup_production_patch_allowed,
     execute_cleanup_plan,
+    _constrain_flat_fill_boundary_mask,
     validate_cleanup_proposal,
 )
 from backend.core.config import ModelConfig
@@ -614,6 +615,112 @@ class CleanupPipelineTests(unittest.TestCase):
         self.assertTrue(plan.debug_metrics["fill_patch_visible"])
         self.assertFalse(plan.debug_metrics["visual_quality_ok"])
         self.assertFalse(plan.debug_metrics["cleanup_effective"])
+        self.assertFalse(cleanup_production_patch_allowed(plan))
+
+    def test_flat_fill_boundary_constraint_shrinks_unsupported_side_band(self):
+        img = _white_bubble_page()
+        text_mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.putText(text_mask, "TEXT", (82, 99), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 255, 2, cv2.LINE_AA)
+        cleanup_mask = text_mask.copy()
+        cleanup_mask[60:118, 45:56] = 255
+        container = np.zeros((100, 180), dtype=np.uint8)
+        cv2.ellipse(container, (90, 50), (88, 45), 0, 0, 360, 255, -1)
+        plan = CleanupPlan(
+            region_id="R-01",
+            region_bbox=(40, 40, 180, 100),
+            region_class="speech_bubble",
+            background_model="flat_light",
+            cleanup_strategy="flat_fill",
+            inpaint_method="local_sample",
+            text_mask=text_mask,
+            cleanup_mask=cleanup_mask,
+            text_mask_confidence=0.9,
+            container_mask=container,
+            container_bbox=(40, 40, 180, 100),
+            container_confidence=0.9,
+            text_bbox=(40, 40, 180, 100),
+        )
+
+        constrained = _constrain_flat_fill_boundary_mask(img, plan, cleanup_mask)
+
+        self.assertTrue(plan.debug_metrics["preclean_boundary_damage_risk"])
+        self.assertTrue(plan.debug_metrics["boundary_mask_constrained"])
+        self.assertLess(int(np.count_nonzero(constrained[60:118, 45:56])), 64)
+        self.assertGreater(int(np.count_nonzero(constrained & text_mask)), int(np.count_nonzero(text_mask)) * 0.82)
+
+    def test_boundary_damage_marks_visual_quality_failure_without_residual_text(self):
+        img = _white_bubble_page()
+        text_mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.putText(text_mask, "TEXT", (82, 99), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 255, 2, cv2.LINE_AA)
+        cleanup_mask = text_mask.copy()
+        cleanup_mask[60:118, 45:56] = 255
+        container = np.zeros((100, 180), dtype=np.uint8)
+        cv2.ellipse(container, (90, 50), (88, 45), 0, 0, 360, 255, -1)
+        plan = CleanupPlan(
+            region_id="R-01",
+            region_bbox=(40, 40, 180, 100),
+            region_class="speech_bubble",
+            background_model="flat_light",
+            cleanup_strategy="flat_fill",
+            inpaint_method="local_sample",
+            text_mask=text_mask,
+            cleanup_mask=cleanup_mask,
+            text_mask_confidence=0.9,
+            container_mask=container,
+            container_bbox=(40, 40, 180, 100),
+            container_confidence=0.9,
+            text_bbox=(40, 40, 180, 100),
+        )
+        result = img.copy()
+        result[text_mask > 0] = (252, 252, 252)
+        result[60:118, 45:56] = (232, 232, 232)
+
+        validate_cleanup_proposal(img, result, plan, destructive_allowed=True, validation_source="test")
+
+        self.assertTrue(plan.debug_metrics["text_removed"])
+        self.assertFalse(plan.debug_metrics["residual_text_visible"])
+        self.assertTrue(plan.debug_metrics["fill_patch_visible"])
+        self.assertFalse(plan.debug_metrics["visual_quality_ok"])
+        self.assertFalse(plan.debug_metrics["cleanup_effective"])
+        self.assertEqual(plan.debug_metrics["cleanup_failure_reason"], "cleanup_fill_patch_visible")
+        self.assertTrue(plan.debug_metrics["visual_boundary_damage_risk"])
+        self.assertFalse(cleanup_production_patch_allowed(plan))
+
+    def test_boundary_fill_patch_takes_precedence_over_non_authoritative_residual(self):
+        img = _white_bubble_page()
+        text_mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.putText(text_mask, "TEXT", (82, 99), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 255, 2, cv2.LINE_AA)
+        cleanup_mask = text_mask.copy()
+        cleanup_mask[58:118, 44:54] = 255
+        plan = CleanupPlan(
+            region_id="R-01",
+            region_bbox=(40, 40, 180, 100),
+            region_class="speech_bubble",
+            background_model="flat_light",
+            cleanup_strategy="flat_fill",
+            inpaint_method="local_sample",
+            skip_reason="cleanup_residual_text_remains",
+            text_mask=text_mask,
+            cleanup_mask=cleanup_mask,
+            text_mask_confidence=0.9,
+            container_mask=np.ones((100, 180), dtype=np.uint8) * 255,
+            container_bbox=(40, 40, 180, 100),
+            container_confidence=0.9,
+            text_bbox=(82, 75, 80, 30),
+        )
+        plan.debug_metrics["residual_score"] = {"bad": True}
+        result = img.copy()
+        result[text_mask > 0] = (252, 252, 252)
+        result[58:118, 44:54] = (232, 232, 232)
+
+        validate_cleanup_proposal(img, result, plan, destructive_allowed=True, validation_source="test")
+
+        self.assertTrue(plan.debug_metrics["fill_patch_visible"])
+        self.assertFalse(plan.debug_metrics["visual_quality_ok"])
+        self.assertFalse(plan.debug_metrics["residual_text_visible"])
+        self.assertEqual(plan.debug_metrics["cleanup_failure_reason"], "cleanup_fill_patch_visible")
+        self.assertEqual(plan.skip_reason, "cleanup_fill_patch_visible")
+        self.assertTrue(plan.debug_metrics["residual_suppressed_by_fill_patch"])
         self.assertFalse(cleanup_production_patch_allowed(plan))
 
     def test_residual_component_verifier_retries_tiny_leftover_dot(self):
