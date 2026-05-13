@@ -1,0 +1,244 @@
+{
+  "page_index": 132,
+  "region_id": "R-02",
+  "region_index": 1,
+  "role": "thought",
+  "detector_source": "yolo",
+  "yolo_class": "narration",
+  "yolo_class_id": 1,
+  "region_class": "caption_box",
+  "region_kind": "TEXTURED_BUBBLE",
+  "background_kind": "TEXTURED",
+  "bbox": [
+    129,
+    793,
+    427,
+    1387
+  ],
+  "debug_crop_bbox": [
+    129,
+    793,
+    427,
+    1387
+  ],
+  "text_bbox": [
+    178,
+    840,
+    378,
+    1307
+  ],
+  "cleanup_container_bbox": [
+    129,
+    793,
+    427,
+    1387
+  ],
+  "safe_rect": [
+    27,
+    699,
+    629,
+    472
+  ],
+  "cleanup_safe_rect": null,
+  "chosen_cleanup_strategy": "review",
+  "chosen_inpaint_method": "skip",
+  "chosen_cleanup_tier": null,
+  "cleanup_status": null,
+  "cleanup_reason": null,
+  "skip_reason": null,
+  "selected_text_mask_candidate": "region_cv_no_bbox(area=0.051)",
+  "selected_text_mask_candidate_source": "fallback_cv_no_bbox",
+  "text_mask_candidates": [
+    {
+      "reason": "dark_caption_not_dark(bg=255.0)",
+      "source": "dark_caption_path",
+      "confidence": 0.0,
+      "mask_px": 0,
+      "accepted": false,
+      "rejection_reason": "missing_or_low_confidence",
+      "selected": false
+    },
+    {
+      "reason": "container_first_glyph(stroke=0.025,container=0.65)",
+      "source": "container_first_glyph",
+      "confidence": 0.4518,
+      "mask_px": 6976,
+      "accepted": true,
+      "rejection_reason": "",
+      "selected": false,
+      "available_for_selection": true
+    },
+    {
+      "reason": "region_cv_no_bbox(area=0.051)",
+      "source": "fallback_cv_no_bbox",
+      "confidence": 0.58,
+      "mask_px": 30014,
+      "accepted": true,
+      "rejection_reason": "",
+      "selected": true,
+      "available_for_selection": true
+    }
+  ],
+  "text_confidence": 0.58,
+  "container_confidence": 0.2,
+  "border_collision_score": 0.25,
+  "mask_container_ratio": 0.0507,
+  "mask_region_ratio": 0.0507,
+  "rectangularity": 0.0608,
+  "border_collision_bbox_source": "region",
+  "cleanup_mask_rejected": false,
+  "rejection_reason": null,
+  "cleanup_execution": "skipped",
+  "cleanup_backend": "opencv",
+  "manual_mask_used": false,
+  "bbox_like_or_full_rectangle_rejected": false,
+  "mask_pixels": {
+    "text_mask": 30014,
+    "outline_shadow_mask": 10547,
+    "halo_mask": 14374,
+    "container_mask": 592249,
+    "cleanup_mask": null
+  },
+  "artifacts": {
+    "raw": true,
+    "text_mask": true,
+    "outline_shadow_mask": true,
+    "halo_mask": true,
+    "container_mask": true,
+    "cleanup_mask": null,
+    "overlay": true,
+    "cleaned": true,
+    "meta": true
+  },
+  "debug_metrics": {
+    "cleanup_residual_retry_enabled": true,
+    "region_role": "thought",
+    "detector_source": "yolo",
+    "yolo_class": "narration",
+    "yolo_class_id": 1,
+    "region_kind": "TEXTURED_BUBBLE",
+    "background_kind": "TEXTURED",
+    "safe_rect": [
+      27,
+      699,
+      629,
+      472
+    ],
+    "cleanup_safe_rect_existing": null,
+    "cleanup_safe_rect_existing_confidence": 0.0,
+    "cleanup_container_bbox_existing": null,
+    "cleanup_residual_retry_dilate_px": 1,
+    "cleanup_allow_grouped_inpaint": false,
+    "cleanup_fallback_backend": "telea",
+    "cleanup_override_mode": "",
+    "cleanup_allow_low_confidence": false,
+    "text_mask_candidate_scores": [
+      {
+        "reason": "dark_caption_not_dark(bg=255.0)",
+        "source": "dark_caption_path",
+        "confidence": 0.0,
+        "mask_px": 0,
+        "accepted": false,
+        "rejection_reason": "missing_or_low_confidence",
+        "selected": false
+      },
+      {
+        "reason": "container_first_glyph(stroke=0.025,container=0.65)",
+        "source": "container_first_glyph",
+        "confidence": 0.4518,
+        "mask_px": 6976,
+        "accepted": true,
+        "rejection_reason": "",
+        "selected": false,
+        "available_for_selection": true
+      },
+      {
+        "reason": "region_cv_no_bbox(area=0.051)",
+        "source": "fallback_cv_no_bbox",
+        "confidence": 0.58,
+        "mask_px": 30014,
+        "accepted": true,
+        "rejection_reason": "",
+        "selected": true,
+        "available_for_selection": true
+      }
+    ],
+    "selected_text_mask_candidate": "region_cv_no_bbox(area=0.051)",
+    "large_component_kept_count": 0,
+    "large_component_rejected_count": 0,
+    "component_reject_reason": "",
+    "halo_added_px": 14374,
+    "halo_ratio_to_text_mask": 0.4789,
+    "halo_rejected_reason": "",
+    "residual_expansion_px": 0,
+    "final_cleanup_mask_px": 0,
+    "caption_reason": "yolo_kind:narration",
+    "selected_candidate": "region_cv_no_bbox(area=0.051)",
+    "selected_text_mask_candidate_source": "fallback_cv_no_bbox",
+    "text_bbox_source": "cv_mask",
+    "halo_mask": {
+      "enabled": true,
+      "halo_px": 14374,
+      "max_px": 2
+    },
+    "halo_px": 14374,
+    "bg": {
+      "mean_brightness": 176.6,
+      "local_var": 13.6,
+      "grad_mag": 66.91,
+      "fine_std": 46.57,
+      "fine_edge_density": 0.18913,
+      "fine_strong_density": 0.14486,
+      "sat_var": 51.89,
+      "edge_density": 0.07522,
+      "a_mean": 126.91,
+      "b_mean": 127.3,
+      "a_std": 4.82,
+      "b_std": 5.58,
+      "chroma_offset": 1.09,
+      "monotone_score": 0.57,
+      "spread": 111.5,
+      "sample_px": 491584,
+      "excluded_text_px": 58536,
+      "sample_source": "region_inner",
+      "container_confidence": 0.2
+    },
+    "cleanup_route": "hard_background_review_or_opencv",
+    "mask": {
+      "region_area": 592249,
+      "text_bbox_area": 494046,
+      "mask_area": 0,
+      "mask_region_ratio": 0.0,
+      "mask_text_ratio": 0.0,
+      "mask_bbox": null
+    },
+    "cleanup_mask_rejected": false,
+    "cleanup_mask_rejection_reason": "",
+    "quality": {
+      "mask_area": 30014,
+      "region_area": 592249,
+      "container_area": 592249,
+      "mask_region_ratio": 0.0507,
+      "mask_container_ratio": 0.0507,
+      "mask_bbox": [
+        178,
+        840,
+        378,
+        1307
+      ],
+      "mask_bbox_area": 494046,
+      "rectangularity": 0.0608,
+      "border_touch_ratio": 0.25,
+      "component_count": 40,
+      "largest_component_ratio": 0.0784,
+      "long_bar_score": 3.458,
+      "safety_bbox_source": "region",
+      "text_bbox_area": 494046
+    },
+    "final_cleanup_decision": {
+      "strategy": "review",
+      "inpaint_method": "skip",
+      "skip_reason": ""
+    }
+  }
+}

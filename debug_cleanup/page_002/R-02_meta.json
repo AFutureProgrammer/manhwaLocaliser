@@ -1,0 +1,212 @@
+{
+  "page_index": 2,
+  "region_id": "R-02",
+  "region_index": 1,
+  "role": "thought",
+  "detector_source": "yolo",
+  "yolo_class": "",
+  "yolo_class_id": null,
+  "region_class": "speech_bubble",
+  "region_kind": "TEXTURED_BUBBLE",
+  "background_kind": "TEXTURED",
+  "bbox": [
+    421,
+    330,
+    165,
+    89
+  ],
+  "debug_crop_bbox": [
+    377,
+    286,
+    253,
+    177
+  ],
+  "text_bbox": null,
+  "cleanup_container_bbox": [
+    377,
+    286,
+    253,
+    177
+  ],
+  "safe_rect": null,
+  "cleanup_safe_rect": [
+    435,
+    340,
+    137,
+    69
+  ],
+  "chosen_cleanup_strategy": "skip",
+  "chosen_inpaint_method": "skip",
+  "chosen_cleanup_tier": null,
+  "cleanup_status": null,
+  "cleanup_reason": null,
+  "skip_reason": "no_candidates",
+  "selected_text_mask_candidate": "none",
+  "selected_text_mask_candidate_source": "none",
+  "text_mask_candidates": [
+    {
+      "reason": "container_first_no_glyphs",
+      "source": "container_first_glyph",
+      "confidence": 0.0,
+      "mask_px": 0,
+      "accepted": false,
+      "rejection_reason": "missing_or_low_confidence",
+      "selected": false
+    },
+    {
+      "reason": "no_cv_components",
+      "source": "fallback",
+      "confidence": 0.0,
+      "mask_px": 0,
+      "accepted": false,
+      "rejection_reason": "missing_or_low_confidence",
+      "selected": false
+    }
+  ],
+  "text_confidence": 0.0,
+  "container_confidence": 0.75,
+  "border_collision_score": 0.0,
+  "mask_container_ratio": 0.0,
+  "mask_region_ratio": 0.0,
+  "rectangularity": 0.0,
+  "border_collision_bbox_source": "container",
+  "cleanup_mask_rejected": false,
+  "rejection_reason": null,
+  "cleanup_execution": "skipped",
+  "cleanup_backend": "opencv",
+  "manual_mask_used": false,
+  "bbox_like_or_full_rectangle_rejected": false,
+  "mask_pixels": {
+    "text_mask": null,
+    "outline_shadow_mask": null,
+    "halo_mask": null,
+    "container_mask": 36685,
+    "cleanup_mask": null
+  },
+  "artifacts": {
+    "raw": true,
+    "text_mask": null,
+    "outline_shadow_mask": null,
+    "halo_mask": null,
+    "container_mask": true,
+    "cleanup_mask": null,
+    "overlay": true,
+    "cleaned": true,
+    "meta": true
+  },
+  "debug_metrics": {
+    "cleanup_residual_retry_enabled": true,
+    "region_role": "thought",
+    "detector_source": "yolo",
+    "yolo_class": "",
+    "yolo_class_id": null,
+    "region_kind": "TEXTURED_BUBBLE",
+    "background_kind": "TEXTURED",
+    "safe_rect": null,
+    "cleanup_safe_rect_existing": [
+      435,
+      340,
+      137,
+      69
+    ],
+    "cleanup_safe_rect_existing_confidence": 0.9163722365161894,
+    "cleanup_container_bbox_existing": null,
+    "cleanup_residual_retry_dilate_px": 1,
+    "cleanup_allow_grouped_inpaint": false,
+    "cleanup_fallback_backend": "telea",
+    "cleanup_override_mode": "",
+    "cleanup_allow_low_confidence": false,
+    "text_mask_candidate_scores": [
+      {
+        "reason": "container_first_no_glyphs",
+        "source": "container_first_glyph",
+        "confidence": 0.0,
+        "mask_px": 0,
+        "accepted": false,
+        "rejection_reason": "missing_or_low_confidence",
+        "selected": false
+      },
+      {
+        "reason": "no_cv_components",
+        "source": "fallback",
+        "confidence": 0.0,
+        "mask_px": 0,
+        "accepted": false,
+        "rejection_reason": "missing_or_low_confidence",
+        "selected": false
+      }
+    ],
+    "selected_text_mask_candidate": "none",
+    "large_component_kept_count": 0,
+    "large_component_rejected_count": 0,
+    "component_reject_reason": "",
+    "halo_added_px": 0,
+    "halo_ratio_to_text_mask": 0.0,
+    "halo_rejected_reason": "",
+    "residual_expansion_px": 0,
+    "final_cleanup_mask_px": 0,
+    "caption_reason": "geometry_not_caption(aspect=1.85,h=89)",
+    "selected_candidate": "none",
+    "selected_text_mask_candidate_source": "none",
+    "halo_mask": {
+      "enabled": false,
+      "halo_px": 0
+    },
+    "halo_px": 0,
+    "bg": {
+      "mean_brightness": 255.0,
+      "local_var": 0.0,
+      "grad_mag": 0.0,
+      "fine_std": 0.0,
+      "fine_edge_density": 0.0,
+      "fine_strong_density": 0.0,
+      "sat_var": 0.0,
+      "edge_density": 0.0,
+      "a_mean": 128.0,
+      "b_mean": 128.0,
+      "a_std": 0.0,
+      "b_std": 0.0,
+      "chroma_offset": 0.0,
+      "monotone_score": 0.0,
+      "spread": 0.0,
+      "sample_px": 11325,
+      "excluded_text_px": 0,
+      "sample_source": "region_inner",
+      "container_confidence": 0.75
+    },
+    "cleanup_route": "solid_bubble_cv",
+    "strategy_before_mask_assembly": "skip",
+    "pre_strategy_mask_px": 0,
+    "mask": {
+      "region_area": 14685,
+      "text_bbox_area": 0,
+      "mask_area": 0,
+      "mask_region_ratio": 0.0,
+      "mask_text_ratio": 0.0,
+      "mask_bbox": null
+    },
+    "cleanup_mask_rejected": false,
+    "cleanup_mask_rejection_reason": "",
+    "post_strategy_mask_px": 0,
+    "quality": {
+      "mask_area": 0,
+      "region_area": 14685,
+      "container_area": 36685,
+      "mask_region_ratio": 0.0,
+      "mask_container_ratio": 0.0,
+      "mask_bbox": null,
+      "mask_bbox_area": 0,
+      "rectangularity": 0.0,
+      "border_touch_ratio": 0.0,
+      "component_count": 0,
+      "largest_component_ratio": 0.0,
+      "long_bar_score": 0.0,
+      "safety_bbox_source": "container"
+    },
+    "final_cleanup_decision": {
+      "strategy": "skip",
+      "inpaint_method": "skip",
+      "skip_reason": "no_candidates"
+    }
+  }
+}

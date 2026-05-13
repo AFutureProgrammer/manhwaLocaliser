@@ -1,0 +1,88 @@
+[
+  {
+    "case": "page_000_region_000_sfx",
+    "flags": [],
+    "conservative_tier": 3,
+    "conservative_strategy": "skip",
+    "conservative_verdict": "UNLABELED",
+    "conservative_mask_ratio": 0.0,
+    "balanced_tier": 3,
+    "balanced_strategy": "skip",
+    "balanced_verdict": "UNLABELED",
+    "balanced_mask_ratio": 0.0,
+    "aggressive_tier": 3,
+    "aggressive_strategy": "skip",
+    "aggressive_verdict": "UNLABELED",
+    "aggressive_mask_ratio": 0.0
+  },
+  {
+    "case": "page_000_region_001_sfx",
+    "flags": [],
+    "conservative_tier": 3,
+    "conservative_strategy": "skip",
+    "conservative_verdict": "UNLABELED",
+    "conservative_mask_ratio": 0.0,
+    "balanced_tier": 3,
+    "balanced_strategy": "skip",
+    "balanced_verdict": "UNLABELED",
+    "balanced_mask_ratio": 0.0,
+    "aggressive_tier": 3,
+    "aggressive_strategy": "skip",
+    "aggressive_verdict": "UNLABELED",
+    "aggressive_mask_ratio": 0.0
+  },
+  {
+    "case": "page_000_region_002_sfx",
+    "flags": [
+      "conservative_unsafe_border_touch",
+      "balanced_unsafe_border_touch",
+      "aggressive_unsafe_border_touch"
+    ],
+    "conservative_tier": 3,
+    "conservative_strategy": "skip",
+    "conservative_verdict": "UNLABELED",
+    "conservative_mask_ratio": 0.011,
+    "balanced_tier": 3,
+    "balanced_strategy": "skip",
+    "balanced_verdict": "UNLABELED",
+    "balanced_mask_ratio": 0.011,
+    "aggressive_tier": 3,
+    "aggressive_strategy": "skip",
+    "aggressive_verdict": "UNLABELED",
+    "aggressive_mask_ratio": 0.011
+  },
+  {
+    "case": "page_000_region_003_speech_bubble",
+    "flags": [
+      "conservative_skips_balanced_processes"
+    ],
+    "conservative_tier": 3,
+    "conservative_strategy": "skip",
+    "conservative_verdict": "UNLABELED",
+    "conservative_mask_ratio": 0.211,
+    "balanced_tier": 2,
+    "balanced_strategy": "flat_fill",
+    "balanced_verdict": "UNLABELED",
+    "balanced_mask_ratio": 0.227,
+    "aggressive_tier": 2,
+    "aggressive_strategy": "flat_fill",
+    "aggressive_verdict": "UNLABELED",
+    "aggressive_mask_ratio": 0.227
+  },
+  {
+    "case": "page_001_region_000_speech_bubble",
+    "flags": [],
+    "conservative_tier": 2,
+    "conservative_strategy": "texture_clone",
+    "conservative_verdict": "UNLABELED",
+    "conservative_mask_ratio": 0.044,
+    "balanced_tier": 2,
+    "balanced_strategy": "texture_clone",
+    "balanced_verdict": "UNLABELED",
+    "balanced_mask_ratio": 0.044,
+    "aggressive_tier": 2,
+    "aggressive_strategy": "texture_clone",
+    "aggressive_verdict": "UNLABELED",
+    "aggressive_mask_ratio": 0.044
+  }
+]

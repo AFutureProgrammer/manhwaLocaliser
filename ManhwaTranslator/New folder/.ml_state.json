@@ -1,0 +1,305 @@
+{
+  "version": 3,
+  "pages": [
+    {
+      "image_path": "C:\\Users\\zaina\\Downloads\\ManhwaTranslator\\manhwaLocaliser\\ManhwaTranslator\\chapter\\raw_panel.png",
+      "translations": [
+        "Still at it, huh, Reader-san?"
+      ],
+      "render_dirty": true,
+      "regions": [
+        {
+          "text": "여전하시네요, 독자 씨.",
+          "confidence": 0.884903073310852,
+          "boxes": [
+            [
+              [
+                86.0,
+                184.0
+              ],
+              [
+                396.0,
+                184.0
+              ],
+              [
+                396.0,
+                366.0
+              ],
+              [
+                86.0,
+                366.0
+              ]
+            ]
+          ],
+          "bubble_role": "dialog",
+          "erase_only": false,
+          "detector_source": "yolo",
+          "manually_adjusted": true,
+          "font_name": "",
+          "font_size": 0,
+          "align": "center",
+          "visible": true,
+          "locked": false,
+          "outline_width": 0,
+          "cleanup_strategy": "texture_clone",
+          "placement_strategy": "bubble_center",
+          "bg_color": [
+            255,
+            255,
+            255
+          ],
+          "fg_color": [
+            0,
+            0,
+            0
+          ],
+          "outline_color": [
+            255,
+            255,
+            255
+          ],
+          "bbox_override": [
+            86,
+            184,
+            310,
+            182
+          ],
+          "bubble_bbox": [
+            86,
+            184,
+            310,
+            182
+          ],
+          "region_kind": "TEXTURED_BUBBLE",
+          "background_kind": "TEXTURED"
+        }
+      ],
+      "cleaned_artifact": ".ml_artifacts\\page_0000_cleaned.png"
+    },
+    {
+      "image_path": "C:\\Users\\zaina\\Downloads\\ManhwaTranslator\\manhwaLocaliser\\ManhwaTranslator\\chapter\\texturedRaw.png",
+      "translations": [
+        "Whoa!",
+        "Jumps",
+        "Lucas?"
+      ],
+      "render_dirty": true,
+      "regions": [
+        {
+          "text": "쿨릭!",
+          "confidence": 0.8169569373130798,
+          "boxes": [
+            [
+              [
+                163.0,
+                477.0
+              ],
+              [
+                333.0,
+                477.0
+              ],
+              [
+                333.0,
+                602.0
+              ],
+              [
+                163.0,
+                602.0
+              ]
+            ]
+          ],
+          "bubble_role": "dialog",
+          "erase_only": false,
+          "detector_source": "yolo",
+          "manually_adjusted": true,
+          "font_name": "",
+          "font_size": 0,
+          "align": "center",
+          "visible": true,
+          "locked": false,
+          "outline_width": 0,
+          "cleanup_strategy": "texture_clone",
+          "placement_strategy": "bubble_center",
+          "bg_color": [
+            255,
+            255,
+            255
+          ],
+          "fg_color": [
+            0,
+            0,
+            0
+          ],
+          "outline_color": [
+            255,
+            255,
+            255
+          ],
+          "bbox_override": [
+            163,
+            477,
+            170,
+            125
+          ],
+          "bubble_bbox": [
+            163,
+            477,
+            170,
+            125
+          ],
+          "region_kind": "TEXTURED_BUBBLE",
+          "background_kind": "TEXTURED"
+        },
+        {
+          "text": "흠칫",
+          "confidence": 0.7617492079734802,
+          "boxes": [
+            [
+              [
+                4.0,
+                286.0
+              ],
+              [
+                171.0,
+                286.0
+              ],
+              [
+                171.0,
+                522.0
+              ],
+              [
+                4.0,
+                522.0
+              ]
+            ]
+          ],
+          "bubble_role": "sfx",
+          "erase_only": false,
+          "detector_source": "yolo",
+          "manually_adjusted": true,
+          "font_name": "",
+          "font_size": 0,
+          "align": "center",
+          "visible": true,
+          "locked": false,
+          "outline_width": 0,
+          "cleanup_strategy": "mask_only_inpaint",
+          "placement_strategy": "bubble_center",
+          "bg_color": [
+            224,
+            233,
+            250
+          ],
+          "fg_color": [
+            11,
+            36,
+            101
+          ],
+          "outline_color": [
+            255,
+            255,
+            255
+          ],
+          "bbox_override": [
+            4,
+            286,
+            167,
+            236
+          ],
+          "bubble_bbox": [
+            4,
+            286,
+            167,
+            236
+          ],
+          "region_kind": "SFX_OVER_ART",
+          "background_kind": "ART",
+          "review": {
+            "flagged": true,
+            "flag_reason": "sfx_over_art",
+            "flag_details": {
+              "conf": 0.85,
+              "note": "SFX over art — verify inpaint result manually"
+            },
+            "reviewed": false,
+            "approved": null,
+            "reviewer_notes": "",
+            "fix_note": ""
+          }
+        },
+        {
+          "text": "루카스?",
+          "confidence": 0.8075026273727417,
+          "boxes": [
+            [
+              [
+                143.0,
+                811.0
+              ],
+              [
+                320.0,
+                811.0
+              ],
+              [
+                320.0,
+                897.0
+              ],
+              [
+                143.0,
+                897.0
+              ]
+            ]
+          ],
+          "bubble_role": "dialog",
+          "erase_only": false,
+          "detector_source": "yolo",
+          "manually_adjusted": false,
+          "font_name": "",
+          "font_size": 0,
+          "align": "center",
+          "visible": true,
+          "locked": false,
+          "outline_width": 0,
+          "cleanup_strategy": "texture_clone",
+          "placement_strategy": "bubble_center",
+          "bg_color": [
+            255,
+            255,
+            255
+          ],
+          "fg_color": [
+            0,
+            0,
+            0
+          ],
+          "outline_color": [
+            255,
+            255,
+            255
+          ],
+          "bbox_override": [
+            143,
+            811,
+            177,
+            86
+          ],
+          "bubble_bbox": [
+            143,
+            811,
+            177,
+            86
+          ],
+          "region_kind": "TEXTURED_BUBBLE",
+          "background_kind": "TEXTURED"
+        }
+      ],
+      "cleaned_artifact": ".ml_artifacts\\page_0001_cleaned.png"
+    },
+    {
+      "image_path": "C:\\Users\\zaina\\Downloads\\ManhwaTranslator\\manhwaLocaliser\\ManhwaTranslator\\chapter\\veryRaw.png",
+      "translations": [],
+      "render_dirty": true,
+      "cleaned_artifact": ".ml_artifacts\\page_0002_cleaned.png"
+    }
+  ]
+}

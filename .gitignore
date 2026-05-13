@@ -1,0 +1,13 @@
+.windsurf/
+backend/terminal.txt
+series_memory/
+source_naver_comic_*/
+tools/cleanup_lab/outputs/
+external/iopaint-venv/
+external/sam2/.venv/
+external/sam2_checkpoints/
+*.pt
+*.pth
+*.ckpt
+__pycache__/
+*.pyc

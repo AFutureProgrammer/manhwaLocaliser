@@ -1,0 +1,42 @@
+{
+  "region_class": "speech_bubble",
+  "background_model": "flat_light",
+  "cleanup_strategy": "skip",
+  "inpaint_method": "skip",
+  "text_mask_confidence": 0.5496,
+  "container_confidence": 0.72,
+  "cleanup_tier": 3,
+  "cleanup_status": "skipped_large_mask",
+  "cleanup_reason": "cleanup_mask_too_large_region_ratio(0.23)",
+  "skip_reason": "cleanup_mask_too_large_region_ratio(0.23)",
+  "mask_region_ratio": 0.2112,
+  "border_touch_ratio": 0.0,
+  "rectangularity": 0.2755,
+  "gradient_fit_error": "",
+  "cleanup_safe_rect": [
+    51,
+    45,
+    202,
+    146
+  ],
+  "cleanup_safe_rect_confidence": 0.9252441862440334,
+  "cleanup_safe_rect_reason": "safe_rect_ok(coverage=1.00,area=0.50,erode=8)",
+  "region_bbox": [
+    12,
+    12,
+    279,
+    211
+  ],
+  "container_bbox": [
+    12,
+    12,
+    279,
+    211
+  ],
+  "cleanup_container_bbox": [
+    12,
+    12,
+    279,
+    211
+  ]
+}

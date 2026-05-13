@@ -1,0 +1,331 @@
+{
+  "analysis": {
+    "false_negatives": {
+      "total": 0,
+      "by_cause": {}
+    },
+    "false_positives": {
+      "total": 0,
+      "by_cause": {}
+    },
+    "tier_drift": {
+      "total": 0,
+      "rows": []
+    },
+    "strategy_mismatch": {
+      "total": 0,
+      "rows": []
+    },
+    "risky_tier2": {
+      "total": 2,
+      "rows": [
+        {
+          "case": "page_000_region_003_speech_bubble",
+          "mode": "balanced",
+          "is_labeled": false,
+          "label_reason": "no expected fields",
+          "expected_tier": 0,
+          "actual_tier": 2,
+          "expected_strategy": "",
+          "actual_strategy": "flat_fill",
+          "actual_status": "auto_cautious_cleaned_review",
+          "actual_cleanup_reason": "Cleanup applied but did not meet all Tier 1 gates.",
+          "status": "auto_cautious_cleaned_review",
+          "text_conf": 0.55,
+          "cont_conf": 0.72,
+          "mask_ratio": 0.227,
+          "border_touch": 0.0,
+          "rectangularity": 0.286,
+          "gradient_fit_error": "",
+          "safe_rect_conf": 0.925,
+          "verdict": "UNLABELED",
+          "golden_verdict": "",
+          "golden_fails": [],
+          "error": ""
+        },
+        {
+          "case": "page_000_region_003_speech_bubble",
+          "mode": "aggressive",
+          "is_labeled": false,
+          "label_reason": "no expected fields",
+          "expected_tier": 0,
+          "actual_tier": 2,
+          "expected_strategy": "",
+          "actual_strategy": "flat_fill",
+          "actual_status": "auto_cautious_cleaned_review",
+          "actual_cleanup_reason": "Cleanup applied but did not meet all Tier 1 gates.",
+          "status": "auto_cautious_cleaned_review",
+          "text_conf": 0.55,
+          "cont_conf": 0.72,
+          "mask_ratio": 0.227,
+          "border_touch": 0.0,
+          "rectangularity": 0.286,
+          "gradient_fit_error": "",
+          "safe_rect_conf": 0.925,
+          "verdict": "UNLABELED",
+          "golden_verdict": "",
+          "golden_fails": [],
+          "error": ""
+        }
+      ]
+    },
+    "mode_comparison": {
+      "cons_skips_bal_processes": 1,
+      "bal_skips_agg_processes": 0,
+      "agg_false_positives": 0,
+      "safe_mode_recommendation": "conservative",
+      "verdict_counts_per_mode": {
+        "conservative": {
+          "PASS": 0,
+          "WARN": 0,
+          "FAIL": 0,
+          "NEEDS_FIX": 0,
+          "UNLABELED": 5,
+          "total": 5
+        },
+        "balanced": {
+          "PASS": 0,
+          "WARN": 0,
+          "FAIL": 0,
+          "NEEDS_FIX": 0,
+          "UNLABELED": 5,
+          "total": 5
+        },
+        "aggressive": {
+          "PASS": 0,
+          "WARN": 0,
+          "FAIL": 0,
+          "NEEDS_FIX": 0,
+          "UNLABELED": 5,
+          "total": 5
+        }
+      }
+    },
+    "unlabeled_backlog": {
+      "total": 15,
+      "by_strategy": {
+        "skip": 10,
+        "flat_fill": 2,
+        "texture_clone": 3
+      },
+      "by_tier": {
+        "3": 10,
+        "2": 5
+      },
+      "by_diag_cat": {
+        "sfx_skipped_as_expected": 9,
+        "high_border_touch": 3,
+        "mode_instability": 3,
+        "tier2_cautious": 5
+      }
+    }
+  },
+  "recommendations": [
+    "No false negatives found in reviewed cases.",
+    "No false positives found in reviewed cases.",
+    "Risky Tier 2: 2 Tier 2 case(s) with high mask_ratio, border_touch, rectangularity, or gradient_fit_error. These should be reviewed before accepting.",
+    "Mode comparison:",
+    "  conservative skips / balanced processes: 1 case(s). These are the cases most likely to benefit from balanced mode.",
+    "  Recommended default mode (lowest FAIL+NEEDS_FIX+WARN among labeled cases): 'conservative'.",
+    "Unlabeled backlog: 15 case(s) still need human review. Label these to get meaningful calibration data.",
+    "  Top strategies in backlog: skip=10, texture_clone=3, flat_fill=2",
+    "No tuning recommended based on current reviewed cases. Label more cases to increase confidence."
+  ],
+  "review_shortlist": [
+    {
+      "case": "page_000_region_003_speech_bubble",
+      "mode": "balanced",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 2,
+      "actual_strategy": "flat_fill",
+      "mask_ratio": 0.227,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_003_speech_bubble/output/balanced/side_by_side.png",
+      "metrics_path": "page_000_region_003_speech_bubble/output/balanced/metrics.json"
+    },
+    {
+      "case": "page_000_region_003_speech_bubble",
+      "mode": "aggressive",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 2,
+      "actual_strategy": "flat_fill",
+      "mask_ratio": 0.227,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_003_speech_bubble/output/aggressive/side_by_side.png",
+      "metrics_path": "page_000_region_003_speech_bubble/output/aggressive/metrics.json"
+    },
+    {
+      "case": "page_000_region_003_speech_bubble",
+      "mode": "conservative",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 3,
+      "actual_strategy": "skip",
+      "mask_ratio": 0.211,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_003_speech_bubble/output/conservative/side_by_side.png",
+      "metrics_path": "page_000_region_003_speech_bubble/output/conservative/metrics.json"
+    },
+    {
+      "case": "page_001_region_000_speech_bubble",
+      "mode": "conservative",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 2,
+      "actual_strategy": "texture_clone",
+      "mask_ratio": 0.044,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_001_region_000_speech_bubble/output/conservative/side_by_side.png",
+      "metrics_path": "page_001_region_000_speech_bubble/output/conservative/metrics.json"
+    },
+    {
+      "case": "page_001_region_000_speech_bubble",
+      "mode": "balanced",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 2,
+      "actual_strategy": "texture_clone",
+      "mask_ratio": 0.044,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_001_region_000_speech_bubble/output/balanced/side_by_side.png",
+      "metrics_path": "page_001_region_000_speech_bubble/output/balanced/metrics.json"
+    },
+    {
+      "case": "page_001_region_000_speech_bubble",
+      "mode": "aggressive",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 2,
+      "actual_strategy": "texture_clone",
+      "mask_ratio": 0.044,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_001_region_000_speech_bubble/output/aggressive/side_by_side.png",
+      "metrics_path": "page_001_region_000_speech_bubble/output/aggressive/metrics.json"
+    },
+    {
+      "case": "page_000_region_002_sfx",
+      "mode": "conservative",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 3,
+      "actual_strategy": "skip",
+      "mask_ratio": 0.011,
+      "border_touch": 0.75,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_002_sfx/output/conservative/side_by_side.png",
+      "metrics_path": "page_000_region_002_sfx/output/conservative/metrics.json"
+    },
+    {
+      "case": "page_000_region_002_sfx",
+      "mode": "balanced",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 3,
+      "actual_strategy": "skip",
+      "mask_ratio": 0.011,
+      "border_touch": 0.75,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_002_sfx/output/balanced/side_by_side.png",
+      "metrics_path": "page_000_region_002_sfx/output/balanced/metrics.json"
+    },
+    {
+      "case": "page_000_region_002_sfx",
+      "mode": "aggressive",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 3,
+      "actual_strategy": "skip",
+      "mask_ratio": 0.011,
+      "border_touch": 0.75,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_002_sfx/output/aggressive/side_by_side.png",
+      "metrics_path": "page_000_region_002_sfx/output/aggressive/metrics.json"
+    },
+    {
+      "case": "page_000_region_000_sfx",
+      "mode": "conservative",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 3,
+      "actual_strategy": "skip",
+      "mask_ratio": 0.0,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_000_sfx/output/conservative/side_by_side.png",
+      "metrics_path": "page_000_region_000_sfx/output/conservative/metrics.json"
+    },
+    {
+      "case": "page_000_region_000_sfx",
+      "mode": "balanced",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 3,
+      "actual_strategy": "skip",
+      "mask_ratio": 0.0,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_000_sfx/output/balanced/side_by_side.png",
+      "metrics_path": "page_000_region_000_sfx/output/balanced/metrics.json"
+    },
+    {
+      "case": "page_000_region_000_sfx",
+      "mode": "aggressive",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 3,
+      "actual_strategy": "skip",
+      "mask_ratio": 0.0,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_000_sfx/output/aggressive/side_by_side.png",
+      "metrics_path": "page_000_region_000_sfx/output/aggressive/metrics.json"
+    },
+    {
+      "case": "page_000_region_001_sfx",
+      "mode": "conservative",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 3,
+      "actual_strategy": "skip",
+      "mask_ratio": 0.0,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_001_sfx/output/conservative/side_by_side.png",
+      "metrics_path": "page_000_region_001_sfx/output/conservative/metrics.json"
+    },
+    {
+      "case": "page_000_region_001_sfx",
+      "mode": "balanced",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 3,
+      "actual_strategy": "skip",
+      "mask_ratio": 0.0,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_001_sfx/output/balanced/side_by_side.png",
+      "metrics_path": "page_000_region_001_sfx/output/balanced/metrics.json"
+    },
+    {
+      "case": "page_000_region_001_sfx",
+      "mode": "aggressive",
+      "verdict": "UNLABELED",
+      "review_status": "unreviewed",
+      "actual_tier": 3,
+      "actual_strategy": "skip",
+      "mask_ratio": 0.0,
+      "border_touch": 0.0,
+      "verdict_reason": "",
+      "side_by_side_path": "page_000_region_001_sfx/output/aggressive/side_by_side.png",
+      "metrics_path": "page_000_region_001_sfx/output/aggressive/metrics.json"
+    }
+  ]
+}

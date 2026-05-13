@@ -1,0 +1,242 @@
+{
+  "page_index": 31,
+  "region_id": "R-03",
+  "region_index": 2,
+  "role": "thought",
+  "detector_source": "yolo",
+  "yolo_class": "narration",
+  "yolo_class_id": 1,
+  "region_class": "caption_box",
+  "region_kind": "GRADIENT_BUBBLE",
+  "background_kind": "GRADIENT",
+  "bbox": [
+    160,
+    1317,
+    418,
+    182
+  ],
+  "debug_crop_bbox": [
+    21,
+    1226,
+    669,
+    364
+  ],
+  "text_bbox": [
+    160,
+    1317,
+    418,
+    182
+  ],
+  "cleanup_container_bbox": [
+    21,
+    1226,
+    669,
+    364
+  ],
+  "safe_rect": [
+    21,
+    1226,
+    669,
+    364
+  ],
+  "cleanup_safe_rect": null,
+  "chosen_cleanup_strategy": "skip",
+  "chosen_inpaint_method": "skip",
+  "chosen_cleanup_tier": null,
+  "cleanup_status": null,
+  "cleanup_reason": null,
+  "skip_reason": null,
+  "selected_text_mask_candidate": "region_cv_no_bbox(area=0.327)",
+  "selected_text_mask_candidate_source": "fallback_cv_no_bbox",
+  "text_mask_candidates": [
+    {
+      "reason": "dark_caption_mask_too_large(area=0.316)",
+      "source": "dark_caption_path",
+      "confidence": 0.12,
+      "mask_px": 0,
+      "accepted": false,
+      "rejection_reason": "missing_or_low_confidence",
+      "selected": false
+    },
+    {
+      "reason": "container_first_no_container",
+      "source": "container_first_glyph",
+      "confidence": 0.0,
+      "mask_px": 0,
+      "accepted": false,
+      "rejection_reason": "missing_or_low_confidence",
+      "selected": false
+    },
+    {
+      "reason": "region_cv_no_bbox(area=0.327)",
+      "source": "fallback_cv_no_bbox",
+      "confidence": 0.22,
+      "mask_px": 24847,
+      "accepted": true,
+      "rejection_reason": "",
+      "selected": true,
+      "available_for_selection": true
+    }
+  ],
+  "text_confidence": 0.22,
+  "container_confidence": 0.2,
+  "border_collision_score": 1.0,
+  "mask_container_ratio": 0.102,
+  "mask_region_ratio": 0.3266,
+  "rectangularity": 0.3266,
+  "border_collision_bbox_source": "region",
+  "cleanup_mask_rejected": false,
+  "rejection_reason": null,
+  "cleanup_execution": "skipped",
+  "cleanup_backend": "opencv",
+  "manual_mask_used": false,
+  "bbox_like_or_full_rectangle_rejected": false,
+  "mask_pixels": {
+    "text_mask": 24847,
+    "outline_shadow_mask": null,
+    "halo_mask": 4207,
+    "container_mask": 243516,
+    "cleanup_mask": null
+  },
+  "artifacts": {
+    "raw": true,
+    "text_mask": true,
+    "outline_shadow_mask": null,
+    "halo_mask": true,
+    "container_mask": true,
+    "cleanup_mask": null,
+    "overlay": true,
+    "cleaned": true,
+    "meta": true
+  },
+  "debug_metrics": {
+    "cleanup_residual_retry_enabled": true,
+    "region_role": "thought",
+    "detector_source": "yolo",
+    "yolo_class": "narration",
+    "yolo_class_id": 1,
+    "region_kind": "GRADIENT_BUBBLE",
+    "background_kind": "GRADIENT",
+    "safe_rect": [
+      21,
+      1226,
+      669,
+      364
+    ],
+    "cleanup_safe_rect_existing": null,
+    "cleanup_safe_rect_existing_confidence": 0.0,
+    "cleanup_container_bbox_existing": null,
+    "cleanup_residual_retry_dilate_px": 1,
+    "cleanup_allow_grouped_inpaint": false,
+    "cleanup_fallback_backend": "telea",
+    "cleanup_override_mode": "",
+    "cleanup_allow_low_confidence": false,
+    "text_mask_candidate_scores": [
+      {
+        "reason": "dark_caption_mask_too_large(area=0.316)",
+        "source": "dark_caption_path",
+        "confidence": 0.12,
+        "mask_px": 0,
+        "accepted": false,
+        "rejection_reason": "missing_or_low_confidence",
+        "selected": false
+      },
+      {
+        "reason": "container_first_no_container",
+        "source": "container_first_glyph",
+        "confidence": 0.0,
+        "mask_px": 0,
+        "accepted": false,
+        "rejection_reason": "missing_or_low_confidence",
+        "selected": false
+      },
+      {
+        "reason": "region_cv_no_bbox(area=0.327)",
+        "source": "fallback_cv_no_bbox",
+        "confidence": 0.22,
+        "mask_px": 24847,
+        "accepted": true,
+        "rejection_reason": "",
+        "selected": true,
+        "available_for_selection": true
+      }
+    ],
+    "selected_text_mask_candidate": "region_cv_no_bbox(area=0.327)",
+    "large_component_kept_count": 0,
+    "large_component_rejected_count": 0,
+    "component_reject_reason": "",
+    "halo_added_px": 4207,
+    "halo_ratio_to_text_mask": 0.1693,
+    "halo_rejected_reason": "",
+    "residual_expansion_px": 0,
+    "final_cleanup_mask_px": 0,
+    "caption_reason": "yolo_kind:narration",
+    "selected_candidate": "region_cv_no_bbox(area=0.327)",
+    "selected_text_mask_candidate_source": "fallback_cv_no_bbox",
+    "text_bbox_source": "cv_mask",
+    "halo_mask": {
+      "enabled": true,
+      "halo_px": 4207,
+      "max_px": 2
+    },
+    "halo_px": 4207,
+    "bg": {
+      "mean_brightness": 7.2,
+      "local_var": 1.21,
+      "grad_mag": 6.03,
+      "fine_std": 4.99,
+      "fine_edge_density": 0.02069,
+      "fine_strong_density": 0.00321,
+      "sat_var": 53.8,
+      "edge_density": 0.0,
+      "a_mean": 125.36,
+      "b_mean": 129.49,
+      "a_std": 2.18,
+      "b_std": 1.08,
+      "chroma_offset": 2.64,
+      "monotone_score": 0.0,
+      "spread": 0.9,
+      "sample_px": 27118,
+      "excluded_text_px": 35679,
+      "sample_source": "region_inner",
+      "container_confidence": 0.2
+    },
+    "cleanup_route": "solid_bubble_cv",
+    "mask": {
+      "region_area": 76076,
+      "text_bbox_area": 76076,
+      "mask_area": 0,
+      "mask_region_ratio": 0.0,
+      "mask_text_ratio": 0.0,
+      "mask_bbox": null
+    },
+    "cleanup_mask_rejected": false,
+    "cleanup_mask_rejection_reason": "",
+    "quality": {
+      "mask_area": 24847,
+      "region_area": 76076,
+      "container_area": 243516,
+      "mask_region_ratio": 0.3266,
+      "mask_container_ratio": 0.102,
+      "mask_bbox": [
+        160,
+        1317,
+        418,
+        182
+      ],
+      "mask_bbox_area": 76076,
+      "rectangularity": 0.3266,
+      "border_touch_ratio": 1.0,
+      "component_count": 10,
+      "largest_component_ratio": 0.1903,
+      "long_bar_score": 2.297,
+      "safety_bbox_source": "region",
+      "text_bbox_area": 76076
+    },
+    "final_cleanup_decision": {
+      "strategy": "skip",
+      "inpaint_method": "skip",
+      "skip_reason": ""
+    }
+  }
+}

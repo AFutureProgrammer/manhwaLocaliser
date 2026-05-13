@@ -1,0 +1,35 @@
+{
+  "source_chapter": "C:\\Users\\zaina\\Downloads\\ManhwaTranslator\\manhwaLocaliser\\source_naver_comic_849611\\chapters\\0001-1",
+  "source_page_index": 0,
+  "source_region_index": 3,
+  "source_image": "0001.jpg",
+  "region_bbox_original": [
+    369,
+    1158,
+    279,
+    211
+  ],
+  "crop_padding": 12,
+  "region_bbox": [
+    12,
+    12,
+    279,
+    211
+  ],
+  "detector_source": "yolo",
+  "yolo_kind": "",
+  "region_kind": "TEXTURED_BUBBLE",
+  "bubble_role": "dialog",
+  "actual_tier": 3,
+  "actual_status": "skipped_no_text_signal",
+  "actual_strategy": "review",
+  "expected_tier": 0,
+  "expected_strategy": "",
+  "notes": "batch_export",
+  "bubble_bbox": [
+    12,
+    12,
+    279,
+    211
+  ]
+}

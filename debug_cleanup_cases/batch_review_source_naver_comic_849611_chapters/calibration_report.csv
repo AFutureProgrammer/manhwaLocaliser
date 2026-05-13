@@ -1,0 +1,16 @@
+case,mode,verdict,review_status,actual_tier,actual_strategy,mask_ratio,border_touch,verdict_reason,side_by_side_path,metrics_path
+page_000_region_003_speech_bubble,balanced,UNLABELED,unreviewed,2,flat_fill,0.227,0.0,,page_000_region_003_speech_bubble/output/balanced/side_by_side.png,page_000_region_003_speech_bubble/output/balanced/metrics.json
+page_000_region_003_speech_bubble,aggressive,UNLABELED,unreviewed,2,flat_fill,0.227,0.0,,page_000_region_003_speech_bubble/output/aggressive/side_by_side.png,page_000_region_003_speech_bubble/output/aggressive/metrics.json
+page_000_region_003_speech_bubble,conservative,UNLABELED,unreviewed,3,skip,0.211,0.0,,page_000_region_003_speech_bubble/output/conservative/side_by_side.png,page_000_region_003_speech_bubble/output/conservative/metrics.json
+page_001_region_000_speech_bubble,conservative,UNLABELED,unreviewed,2,texture_clone,0.044,0.0,,page_001_region_000_speech_bubble/output/conservative/side_by_side.png,page_001_region_000_speech_bubble/output/conservative/metrics.json
+page_001_region_000_speech_bubble,balanced,UNLABELED,unreviewed,2,texture_clone,0.044,0.0,,page_001_region_000_speech_bubble/output/balanced/side_by_side.png,page_001_region_000_speech_bubble/output/balanced/metrics.json
+page_001_region_000_speech_bubble,aggressive,UNLABELED,unreviewed,2,texture_clone,0.044,0.0,,page_001_region_000_speech_bubble/output/aggressive/side_by_side.png,page_001_region_000_speech_bubble/output/aggressive/metrics.json
+page_000_region_002_sfx,conservative,UNLABELED,unreviewed,3,skip,0.011,0.75,,page_000_region_002_sfx/output/conservative/side_by_side.png,page_000_region_002_sfx/output/conservative/metrics.json
+page_000_region_002_sfx,balanced,UNLABELED,unreviewed,3,skip,0.011,0.75,,page_000_region_002_sfx/output/balanced/side_by_side.png,page_000_region_002_sfx/output/balanced/metrics.json
+page_000_region_002_sfx,aggressive,UNLABELED,unreviewed,3,skip,0.011,0.75,,page_000_region_002_sfx/output/aggressive/side_by_side.png,page_000_region_002_sfx/output/aggressive/metrics.json
+page_000_region_000_sfx,conservative,UNLABELED,unreviewed,3,skip,0.0,0.0,,page_000_region_000_sfx/output/conservative/side_by_side.png,page_000_region_000_sfx/output/conservative/metrics.json
+page_000_region_000_sfx,balanced,UNLABELED,unreviewed,3,skip,0.0,0.0,,page_000_region_000_sfx/output/balanced/side_by_side.png,page_000_region_000_sfx/output/balanced/metrics.json
+page_000_region_000_sfx,aggressive,UNLABELED,unreviewed,3,skip,0.0,0.0,,page_000_region_000_sfx/output/aggressive/side_by_side.png,page_000_region_000_sfx/output/aggressive/metrics.json
+page_000_region_001_sfx,conservative,UNLABELED,unreviewed,3,skip,0.0,0.0,,page_000_region_001_sfx/output/conservative/side_by_side.png,page_000_region_001_sfx/output/conservative/metrics.json
+page_000_region_001_sfx,balanced,UNLABELED,unreviewed,3,skip,0.0,0.0,,page_000_region_001_sfx/output/balanced/side_by_side.png,page_000_region_001_sfx/output/balanced/metrics.json
+page_000_region_001_sfx,aggressive,UNLABELED,unreviewed,3,skip,0.0,0.0,,page_000_region_001_sfx/output/aggressive/side_by_side.png,page_000_region_001_sfx/output/aggressive/metrics.json
