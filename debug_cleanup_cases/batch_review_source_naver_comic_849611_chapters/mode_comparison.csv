@@ -1,6 +1,0 @@
-case,flags,conservative_tier,conservative_strategy,conservative_verdict,conservative_mask_ratio,balanced_tier,balanced_strategy,balanced_verdict,balanced_mask_ratio,aggressive_tier,aggressive_strategy,aggressive_verdict,aggressive_mask_ratio
-page_000_region_000_sfx,,3,skip,UNLABELED,0.0,3,skip,UNLABELED,0.0,3,skip,UNLABELED,0.0
-page_000_region_001_sfx,,3,skip,UNLABELED,0.0,3,skip,UNLABELED,0.0,3,skip,UNLABELED,0.0
-page_000_region_002_sfx,conservative_unsafe_border_touch|balanced_unsafe_border_touch|aggressive_unsafe_border_touch,3,skip,UNLABELED,0.011,3,skip,UNLABELED,0.011,3,skip,UNLABELED,0.011
-page_000_region_003_speech_bubble,conservative_skips_balanced_processes,3,skip,UNLABELED,0.211,2,flat_fill,UNLABELED,0.227,2,flat_fill,UNLABELED,0.227
-page_001_region_000_speech_bubble,,2,texture_clone,UNLABELED,0.044,2,texture_clone,UNLABELED,0.044,2,texture_clone,UNLABELED,0.044

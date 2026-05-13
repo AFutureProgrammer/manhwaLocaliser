@@ -1,0 +1,20 @@
+{
+  "page_image": "fixtures/sample_page.png",
+  "regions": [
+    {
+      "id": "R-01",
+      "bbox": [120, 90, 180, 80],
+      "text": "optional OCR text",
+      "role": "dialog",
+      "kind": "PLAIN_BUBBLE",
+      "yolo_kind": "dialogue",
+      "detector": "yolo",
+      "detector_confidence": 0.9,
+      "boxes": [
+        [[132, 104], [260, 104], [260, 146], [132, 146]]
+      ],
+      "bubble_bbox": [80, 55, 260, 145],
+      "safe_rect": [100, 70, 220, 110]
+    }
+  ]
+}

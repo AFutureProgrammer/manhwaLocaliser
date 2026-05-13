@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    /* ── Language & environment ─────────────────────────────────────────── */
+    "target":      "ES2020",
+    "lib":         ["ES2020", "DOM", "DOM.Iterable"],
+    "module":      "ESNext",
+    "moduleResolution": "bundler",
+
+    /* ── JSX ─────────────────────────────────────────────────────────────── */
+    "jsx":                  "react-jsx",
+    "jsxImportSource":      "react",
+
+    /* ── Strictness ─────────────────────────────────────────────────────── */
+    "strict":               true,
+    "noUnusedLocals":       true,
+    "noUnusedParameters":   true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false,
+
+    /* ── Interop ─────────────────────────────────────────────────────────── */
+    "esModuleInterop":      true,
+    "allowSyntheticDefaultImports": true,
+    "isolatedModules":      true,
+    "allowImportingTsExtensions": true,
+
+    /* ── Output ─────────────────────────────────────────────────────────── */
+    /* Vite handles the actual compilation; tsc is used for type-checking only */
+    "noEmit":       true,
+    "skipLibCheck": true,
+
+    /* ── Paths ───────────────────────────────────────────────────────────── */
+    "baseUrl": ".",
+    "paths": {},
+    "ignoreDeprecations": "5.0"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "./tsconfig.node.json" }
+  ]
+}

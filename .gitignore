@@ -3,6 +3,12 @@ backend/terminal.txt
 series_memory/
 source_naver_comic_*/
 tools/cleanup_lab/outputs/
+debug_cleanup/
+debug_cleanup_runs/
+debug_cleanup_cases/
+frontend/node_modules/
+frontend/dist/
+node_modules/
 external/iopaint-venv/
 external/sam2/.venv/
 external/sam2_checkpoints/
@@ -11,6 +17,6 @@ external/sam2_checkpoints/
 *.ckpt
 __pycache__/
 *.pyc
-frontend/node_modules/
-debug_cleanup/
+.pytest_cache/
+.mypy_cache/
 ManhwaTranslator/

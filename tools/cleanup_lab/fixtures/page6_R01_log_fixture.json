@@ -1,0 +1,18 @@
+{
+  "page_image": "../../../source_naver_comic_769209/chapters/0001-1/0007.jpg",
+  "regions": [
+    {
+      "id": "R-01",
+      "bbox": [131, 565, 438, 181],
+      "text": "",
+      "role": "thought",
+      "kind": "TEXTURED_BUBBLE",
+      "yolo_kind": "narration",
+      "yolo_class_id": 1,
+      "detector": "yolo",
+      "detector_confidence": 0.807,
+      "bubble_bbox": [0, 475, 690, 362],
+      "safe_rect": [0, 475, 690, 362]
+    }
+  ]
+}
