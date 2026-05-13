@@ -11,3 +11,6 @@ external/sam2_checkpoints/
 *.ckpt
 __pycache__/
 *.pyc
+frontend/node_modules/
+debug_cleanup/
+ManhwaTranslator/
