@@ -94,9 +94,13 @@ from backend.core.cleanup_plan import (
     _write_cleanup_metadata_to_block,
     _try_force_solid_bubble_flat_fill,
     build_cleanup_plan,
+    cleanup_production_patch_allowed,
     erase_text_region_planned,
     execute_cleanup_plan,
+    mark_cleanup_proposal_blocked,
+    mark_production_patch_accepted,
     summarize_cleanup_plan,
+    validate_cleanup_proposal,
 )
 from backend.core.config import ModelConfig
 from backend.core import sam2_mask
@@ -1971,10 +1975,7 @@ class LocalizerEngine:
                     operation="apply",
                 )
                 if not allowed:
-                    plan.cleanup_mask = None
-                    plan.cleanup_strategy = "skip"
-                    plan.inpaint_method = "skip"
-                    plan.skip_reason = block_reason
+                    mark_cleanup_proposal_blocked(plan, block_reason)
                 elif _destructive_protected_region_type(block, getattr(plan, "region_class", "")):
                     if self._ensure_forced_cleanup_mask(plan):
                         plan.cleanup_strategy = "mask_inpaint"
@@ -1983,8 +1984,14 @@ class LocalizerEngine:
                 manual_mask_used = False
                 if manual_mask and allowed:
                     manual_mask_used = self._apply_manual_cleanup_mask(plan, manual_mask, composite.shape, comp_block)
-                if allowed:
-                    execute_cleanup_plan(composite, result, plan)
+                execute_cleanup_plan(composite, result, plan)
+                validate_cleanup_proposal(
+                    base,
+                    result,
+                    plan,
+                    destructive_allowed=allowed,
+                    validation_source="production_cross_page",
+                )
                 tier = None
                 if mutate_block:
                     tier = _write_cleanup_metadata_to_block(
@@ -2072,10 +2079,7 @@ class LocalizerEngine:
             operation="apply",
         )
         if not allowed:
-            plan.cleanup_mask = None
-            plan.cleanup_strategy = "skip"
-            plan.inpaint_method = "skip"
-            plan.skip_reason = block_reason
+            mark_cleanup_proposal_blocked(plan, block_reason)
         elif _destructive_protected_region_type(block, getattr(plan, "region_class", "")):
             if self._ensure_forced_cleanup_mask(plan):
                 plan.cleanup_strategy = "mask_inpaint"
@@ -2085,8 +2089,16 @@ class LocalizerEngine:
         group = self._try_grouped_fallback(region_idx, plan, base, result, manual_mask_used) if allowed else {"used": False, "reason": block_reason, "plans": [plan], "indices": [region_idx]}
         plans = list(group.get("plans") or [plan])
         indices = list(group.get("indices") or [region_idx])
-        if allowed and not bool(group.get("used", False)):
+        if not bool(group.get("used", False)):
             execute_cleanup_plan(self._raw_cv, result, plan)
+        for proposal_plan in plans:
+            validate_cleanup_proposal(
+                base,
+                result,
+                proposal_plan,
+                destructive_allowed=allowed,
+                validation_source="production",
+            )
         tier = None
         if mutate_block:
             tier = _write_cleanup_metadata_to_block(
@@ -2423,6 +2435,14 @@ class LocalizerEngine:
             operation=f"candidate:{candidate_id}",
         )
         if not allowed:
+            mark_cleanup_proposal_blocked(plan, block_reason)
+            validate_cleanup_proposal(
+                base,
+                result,
+                plan,
+                destructive_allowed=False,
+                validation_source=f"candidate:{candidate_id}",
+            )
             return {
                 "available": False,
                 "unavailable_reason": block_reason,
@@ -2459,6 +2479,14 @@ class LocalizerEngine:
                 execute_cleanup_plan(self._raw_cv, result, plan)
             plans = [plan]
             indices = [region_idx]
+        for proposal_plan in plans:
+            validate_cleanup_proposal(
+                base,
+                result,
+                proposal_plan,
+                destructive_allowed=True,
+                validation_source=f"candidate:{candidate_id}",
+            )
         bbox = self._changed_bbox(base, result, block.bbox())
         return {
             "available": True,
@@ -2634,6 +2662,17 @@ class LocalizerEngine:
         if bool(run.get("cross_page", False)):
             block = self._regions[int(region_idx)]
             pages_touched = [int(v) for v in (run.get("cross_page_pages") or [int(getattr(self.chapter_mgr, "current_idx", 0) or 0)])]
+            if not cleanup_production_patch_allowed(run["plan"]):
+                mark_production_patch_accepted(run["plan"], False)
+                _write_cleanup_metadata_to_block(
+                    block,
+                    run["plan"],
+                    run["base"],
+                    cleanup_mode=getattr(self.model_config, "cleanup_mode", "balanced"),
+                )
+                self._flush_working_state_to_page()
+                self.chapter_mgr.save_state()
+                return self.get_bootstrap()
             self._remove_cleanup_patches_for_region(pages_touched, int(region_idx))
             _write_cleanup_metadata_to_block(
                 block,
@@ -2643,6 +2682,16 @@ class LocalizerEngine:
             )
             created_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
             for page_result in run.get("page_results", []) or []:
+                if not cleanup_production_patch_allowed(run["plan"]):
+                    mark_production_patch_accepted(run["plan"], False)
+                    continue
+                mark_production_patch_accepted(run["plan"], True)
+                _write_cleanup_metadata_to_block(
+                    block,
+                    run["plan"],
+                    run["base"],
+                    cleanup_mode=getattr(self.model_config, "cleanup_mode", "balanced"),
+                )
                 pidx = int(page_result["page_idx"])
                 x, y, w, h = [int(v) for v in page_result["bbox"]]
                 patch = {
@@ -2669,6 +2718,12 @@ class LocalizerEngine:
                     "review_required": bool((getattr(block, "cleanup_meta", {}) or {}).get("review_required", False)),
                     "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                     "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
+                    "diagnostic_only": bool((getattr(block, "cleanup_meta", {}) or {}).get("diagnostic_only", False)),
+                    "destructive_cleanup_executed": bool((getattr(block, "cleanup_meta", {}) or {}).get("destructive_cleanup_executed", False)),
+                    "production_patch_accepted": bool((getattr(block, "cleanup_meta", {}) or {}).get("production_patch_accepted", False)),
+                    "proposal_valid": bool((getattr(block, "cleanup_meta", {}) or {}).get("proposal_valid", False)),
+                    "proposal_failure_reason": str((getattr(block, "cleanup_meta", {}) or {}).get("proposal_failure_reason", "") or ""),
+                    "cleanup_effective": bool((getattr(block, "cleanup_meta", {}) or {}).get("cleanup_effective", False)),
                     "rerun": False,
                     "patch_png_b64": self._encode_cv_png_b64(page_result["crop"]),
                 }
@@ -2684,14 +2739,20 @@ class LocalizerEngine:
         group_indices = [int(v) for v in (run.get("group_region_indices") or [region_idx])]
         group_plans = list(run.get("plans") or [run["plan"]])
         replace_ids = {self._region_id_for_cleanup_patch(i) for i in group_indices}
-        page.cleanup_patches = [
-            p for p in (getattr(page, "cleanup_patches", []) or [])
-            if not (p.get("region_id") in replace_ids or int(p.get("region_idx", -1) or -1) in group_indices)
-        ]
         created_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         patches: List[Dict[str, Any]] = []
         for idx, patch_plan in zip(group_indices, group_plans):
             block = self._regions[idx]
+            if not cleanup_production_patch_allowed(patch_plan):
+                mark_production_patch_accepted(patch_plan, False)
+                _write_cleanup_metadata_to_block(
+                    block,
+                    patch_plan,
+                    self._raw_cv,
+                    cleanup_mode=getattr(self.model_config, "cleanup_mode", "balanced"),
+                )
+                continue
+            mark_production_patch_accepted(patch_plan, True)
             _write_cleanup_metadata_to_block(
                 block,
                 patch_plan,
@@ -2727,14 +2788,27 @@ class LocalizerEngine:
                 "review_required": bool((getattr(block, "cleanup_meta", {}) or {}).get("review_required", False)),
                 "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                 "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
+                "diagnostic_only": bool((getattr(block, "cleanup_meta", {}) or {}).get("diagnostic_only", False)),
+                "destructive_cleanup_executed": bool((getattr(block, "cleanup_meta", {}) or {}).get("destructive_cleanup_executed", False)),
+                "production_patch_accepted": bool((getattr(block, "cleanup_meta", {}) or {}).get("production_patch_accepted", False)),
+                "proposal_valid": bool((getattr(block, "cleanup_meta", {}) or {}).get("proposal_valid", False)),
+                "proposal_failure_reason": str((getattr(block, "cleanup_meta", {}) or {}).get("proposal_failure_reason", "") or ""),
+                "cleanup_effective": bool((getattr(block, "cleanup_meta", {}) or {}).get("cleanup_effective", False)),
                 "rerun": False,
                 "patch_png_b64": self._encode_cv_png_b64(crop),
             }
             if not self._attach_cleanup_patch_mask(patch, getattr(patch_plan, "cleanup_mask", None), (x, y, w, h), run["result"].shape):
                 continue
             patches.append(patch)
-        page.cleanup_patches.extend(patches)
-        page.cleaned_cv = self._rebuild_cleaned_from_cleanup_patches(page, self._raw_cv)
+        if patches:
+            page.cleanup_patches = [
+                p for p in (getattr(page, "cleanup_patches", []) or [])
+                if not (p.get("region_id") in replace_ids or int(p.get("region_idx", -1) or -1) in group_indices)
+            ]
+            page.cleanup_patches.extend(patches)
+            page.cleaned_cv = self._rebuild_cleaned_from_cleanup_patches(page, self._raw_cv)
+        elif not getattr(page, "cleanup_patches", None):
+            page.cleaned_cv = self._raw_cv.copy()
         page.typeset_pil = None
         page.render_dirty = True
         page.bump_render_version()
@@ -2936,6 +3010,13 @@ class LocalizerEngine:
                 "rectangularity": round(float(quality.get("rectangularity", 0.0) or 0.0), 4),
                 "cleanup_mask_rejected": bool((getattr(plan, "debug_metrics", {}) or {}).get("cleanup_mask_rejected", False)),
                 "cleanup_mask_rejection_reason": str((getattr(plan, "debug_metrics", {}) or {}).get("cleanup_mask_rejection_reason", "") or ""),
+                "diagnostic_only": bool((getattr(plan, "debug_metrics", {}) or {}).get("diagnostic_only", False)),
+                "diagnostic_cleanup_ran": bool((getattr(plan, "debug_metrics", {}) or {}).get("diagnostic_cleanup_ran", False)),
+                "destructive_cleanup_executed": bool((getattr(plan, "debug_metrics", {}) or {}).get("destructive_cleanup_executed", False)),
+                "production_patch_accepted": bool((patch or {}).get("production_patch_accepted", (getattr(plan, "debug_metrics", {}) or {}).get("production_patch_accepted", False))),
+                "proposal_valid": bool((getattr(plan, "debug_metrics", {}) or {}).get("proposal_valid", False)),
+                "proposal_failure_reason": str((getattr(plan, "debug_metrics", {}) or {}).get("proposal_failure_reason", "") or ""),
+                "cleanup_effective": bool((getattr(plan, "debug_metrics", {}) or {}).get("cleanup_effective", False)),
                 "selected_text_mask_candidate_source": str((getattr(plan, "debug_metrics", {}) or {}).get("selected_text_mask_candidate_source", "") or ""),
                 "solid_fill_eligible": bool(solid) if solid is not None else None,
                 "halo_mask_used": bool(halo_info.get("enabled", False)) if halo_info else None,
@@ -3080,9 +3161,30 @@ class LocalizerEngine:
         if bool(run.get("cross_page", False)):
             block = self._regions[int(region_idx)]
             pages_touched = [int(v) for v in (run.get("cross_page_pages") or [int(getattr(self.chapter_mgr, "current_idx", 0) or 0)])]
+            if not cleanup_production_patch_allowed(run["plan"]):
+                mark_production_patch_accepted(run["plan"], False)
+                _write_cleanup_metadata_to_block(
+                    block,
+                    run["plan"],
+                    run["base"],
+                    cleanup_mode=getattr(self.model_config, "cleanup_mode", "balanced"),
+                )
+                self._flush_working_state_to_page()
+                self.chapter_mgr.save_state()
+                return self.get_bootstrap()
             self._remove_cleanup_patches_for_region(pages_touched, int(region_idx))
             created_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
             for page_result in run.get("page_results", []) or []:
+                if not cleanup_production_patch_allowed(run["plan"]):
+                    mark_production_patch_accepted(run["plan"], False)
+                    continue
+                mark_production_patch_accepted(run["plan"], True)
+                _write_cleanup_metadata_to_block(
+                    block,
+                    run["plan"],
+                    run["base"],
+                    cleanup_mode=getattr(self.model_config, "cleanup_mode", "balanced"),
+                )
                 pidx = int(page_result["page_idx"])
                 x, y, w, h = [int(v) for v in page_result["bbox"]]
                 patch = {
@@ -3108,6 +3210,12 @@ class LocalizerEngine:
                     "review_required": bool((getattr(block, "cleanup_meta", {}) or {}).get("review_required", False)),
                     "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                     "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
+                    "diagnostic_only": bool((getattr(block, "cleanup_meta", {}) or {}).get("diagnostic_only", False)),
+                    "destructive_cleanup_executed": bool((getattr(block, "cleanup_meta", {}) or {}).get("destructive_cleanup_executed", False)),
+                    "production_patch_accepted": bool((getattr(block, "cleanup_meta", {}) or {}).get("production_patch_accepted", False)),
+                    "proposal_valid": bool((getattr(block, "cleanup_meta", {}) or {}).get("proposal_valid", False)),
+                    "proposal_failure_reason": str((getattr(block, "cleanup_meta", {}) or {}).get("proposal_failure_reason", "") or ""),
+                    "cleanup_effective": bool((getattr(block, "cleanup_meta", {}) or {}).get("cleanup_effective", False)),
                     "rerun": bool(rerun),
                     "patch_png_b64": self._encode_cv_png_b64(page_result["crop"]),
                 }
@@ -3123,21 +3231,26 @@ class LocalizerEngine:
         group_indices = [int(v) for v in (run.get("group_region_indices") or [region_idx])]
         group_plans = list(run.get("plans") or [run["plan"]])
         replace_ids = {self._region_id_for_cleanup_patch(i) for i in group_indices}
-        page.cleanup_patches = [
-            p for p in (getattr(page, "cleanup_patches", []) or [])
-            if not (p.get("region_id") in replace_ids or int(p.get("region_idx", -1) or -1) in group_indices)
-        ]
         created_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         patches: List[Dict[str, Any]] = []
         for idx, patch_plan in zip(group_indices, group_plans):
             block = self._regions[idx]
-            if idx != int(region_idx):
+            if not cleanup_production_patch_allowed(patch_plan):
+                mark_production_patch_accepted(patch_plan, False)
                 _write_cleanup_metadata_to_block(
                     block,
                     patch_plan,
                     self._raw_cv,
                     cleanup_mode=getattr(self.model_config, "cleanup_mode", "balanced"),
                 )
+                continue
+            mark_production_patch_accepted(patch_plan, True)
+            _write_cleanup_metadata_to_block(
+                block,
+                patch_plan,
+                self._raw_cv,
+                cleanup_mode=getattr(self.model_config, "cleanup_mode", "balanced"),
+            )
             x, y, w, h = self._mask_bbox(getattr(patch_plan, "cleanup_mask", None), block.bbox())
             crop = run["result"][y:y + h, x:x + w].copy()
             mask_bytes = b""
@@ -3166,14 +3279,27 @@ class LocalizerEngine:
                 "review_required": bool((getattr(block, "cleanup_meta", {}) or {}).get("review_required", False)),
                 "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                 "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
+                "diagnostic_only": bool((getattr(block, "cleanup_meta", {}) or {}).get("diagnostic_only", False)),
+                "destructive_cleanup_executed": bool((getattr(block, "cleanup_meta", {}) or {}).get("destructive_cleanup_executed", False)),
+                "production_patch_accepted": bool((getattr(block, "cleanup_meta", {}) or {}).get("production_patch_accepted", False)),
+                "proposal_valid": bool((getattr(block, "cleanup_meta", {}) or {}).get("proposal_valid", False)),
+                "proposal_failure_reason": str((getattr(block, "cleanup_meta", {}) or {}).get("proposal_failure_reason", "") or ""),
+                "cleanup_effective": bool((getattr(block, "cleanup_meta", {}) or {}).get("cleanup_effective", False)),
                 "rerun": bool(rerun),
                 "patch_png_b64": self._encode_cv_png_b64(crop),
             }
             if not self._attach_cleanup_patch_mask(patch, getattr(patch_plan, "cleanup_mask", None), (x, y, w, h), run["result"].shape):
                 continue
             patches.append(patch)
-        page.cleanup_patches.extend(patches)
-        page.cleaned_cv = self._rebuild_cleaned_from_cleanup_patches(page, self._raw_cv)
+        if patches:
+            page.cleanup_patches = [
+                p for p in (getattr(page, "cleanup_patches", []) or [])
+                if not (p.get("region_id") in replace_ids or int(p.get("region_idx", -1) or -1) in group_indices)
+            ]
+            page.cleanup_patches.extend(patches)
+            page.cleaned_cv = self._rebuild_cleaned_from_cleanup_patches(page, self._raw_cv)
+        elif not getattr(page, "cleanup_patches", None):
+            page.cleaned_cv = self._raw_cv.copy()
         page.typeset_pil = None
         page.render_dirty = True
         page.bump_render_version()

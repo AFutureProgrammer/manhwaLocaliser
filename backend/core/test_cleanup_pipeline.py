@@ -9,7 +9,14 @@ import numpy as np
 from PIL import Image, ImageFont
 
 from backend.core import sam2_mask
-from backend.core.cleanup_plan import CleanupPlan, build_cleanup_plan, execute_cleanup_plan
+from backend.core.cleanup_plan import (
+    CleanupPlan,
+    build_cleanup_plan,
+    clamp_cleanup_outcome_fields,
+    cleanup_production_patch_allowed,
+    execute_cleanup_plan,
+    validate_cleanup_proposal,
+)
 from backend.core.config import ModelConfig
 from backend.core.ocr import YoloV8RegionDetector
 from backend.core.project import ChapterManager, ChapterPage
@@ -451,6 +458,12 @@ class CleanupPipelineTests(unittest.TestCase):
 
         self.assertEqual(page.cleanup_patches, [])
         self.assertTrue(np.array_equal(page.cleaned_cv, raw))
+        self.assertFalse(block.cleanup_meta["proposal_valid"])
+        self.assertTrue(block.cleanup_meta["diagnostic_only"])
+        self.assertFalse(block.cleanup_meta["destructive_cleanup_executed"])
+        self.assertFalse(block.cleanup_meta["production_patch_accepted"])
+        self.assertFalse(block.cleanup_meta["cleanup_effective"])
+        self.assertIn("protected_sfx", block.cleanup_meta["proposal_failure_reason"])
 
     def test_text_over_art_region_apply_is_blocked_by_default(self):
         cfg = ModelConfig()
@@ -463,6 +476,10 @@ class CleanupPipelineTests(unittest.TestCase):
 
         self.assertEqual(page.cleanup_patches, [])
         self.assertTrue(np.array_equal(page.cleaned_cv, raw))
+        self.assertFalse(block.cleanup_meta["proposal_valid"])
+        self.assertTrue(block.cleanup_meta["diagnostic_only"])
+        self.assertFalse(block.cleanup_meta["production_patch_accepted"])
+        self.assertFalse(block.cleanup_meta["cleanup_effective"])
 
     def test_cleanup_risky_attempt_does_not_override_sfx_gate(self):
         cfg = ModelConfig()
@@ -505,7 +522,7 @@ class CleanupPipelineTests(unittest.TestCase):
 
         self.assertNotIn(1, group.get("indices", []))
 
-    def test_explicit_force_allow_with_global_gate_allows_sfx_cleanup(self):
+    def test_explicit_force_allow_still_requires_valid_proposal_for_patch(self):
         cfg = ModelConfig()
         cfg.cleanup_allow_sfx_cleanup = True
         block = _protected_art_block((35, 35, 185, 85), RegionKind.SFX_OVER_ART, "sfx")
@@ -514,8 +531,281 @@ class CleanupPipelineTests(unittest.TestCase):
 
         engine.apply_region_cleanup(0)
 
-        self.assertTrue(page.cleanup_patches)
-        self.assertFalse(np.array_equal(page.cleaned_cv, raw))
+        self.assertEqual(page.cleanup_patches, [])
+        self.assertTrue(np.array_equal(page.cleaned_cv, raw))
+        self.assertFalse(block.cleanup_meta["proposal_valid"])
+        self.assertTrue(block.cleanup_meta["diagnostic_only"])
+        self.assertFalse(block.cleanup_meta["production_patch_accepted"])
+
+    def test_valid_flat_unknown_region_is_not_metadata_blocked(self):
+        img = _white_bubble_page()
+        block = _dialogue_block((40, 40, 180, 100), kind=RegionKind.UNKNOWN)
+        block.bubble_role = "manual"
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.putText(mask, "TEXT", (82, 99), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 255, 2, cv2.LINE_AA)
+        block.text_mask = mask
+        plan = build_cleanup_plan(img, block, page_index=0, region_id="R-01")
+        result = img.copy()
+
+        execute_cleanup_plan(img, result, plan)
+        validate_cleanup_proposal(img, result, plan, destructive_allowed=True, validation_source="test")
+
+        self.assertEqual(plan.background_model, "flat_light")
+        self.assertEqual(plan.region_class, "unknown")
+        self.assertEqual(plan.cleanup_strategy, "flat_fill")
+        self.assertTrue(plan.debug_metrics["proposal_valid"])
+        self.assertFalse(plan.debug_metrics["diagnostic_only"])
+        self.assertTrue(cleanup_production_patch_allowed(plan))
+
+    def test_manual_review_proposal_does_not_accept_production_patch(self):
+        img = _white_bubble_page()
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.putText(mask, "TEXT", (82, 99), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 255, 2, cv2.LINE_AA)
+        plan = CleanupPlan(
+            region_id="R-01",
+            region_bbox=(40, 40, 180, 100),
+            region_class="speech_bubble",
+            background_model="flat_light",
+            cleanup_strategy="review",
+            inpaint_method="skip",
+            skip_reason="manual_review_required",
+            text_mask=mask,
+            cleanup_mask=mask,
+            text_mask_confidence=0.9,
+        )
+        result = img.copy()
+
+        execute_cleanup_plan(img, result, plan)
+        validate_cleanup_proposal(img, result, plan, destructive_allowed=True, validation_source="test")
+
+        self.assertFalse(plan.debug_metrics["proposal_valid"])
+        self.assertEqual(plan.debug_metrics["proposal_failure_reason"], "manual_review_required")
+        self.assertTrue(plan.debug_metrics["diagnostic_only"])
+        self.assertFalse(plan.debug_metrics["destructive_cleanup_executed"])
+        self.assertFalse(plan.debug_metrics["production_patch_accepted"])
+        self.assertFalse(plan.debug_metrics["cleanup_effective"])
+        self.assertFalse(cleanup_production_patch_allowed(plan))
+
+    def test_visible_rectangular_fill_patch_marks_cleanup_non_effective(self):
+        img = _white_bubble_page()
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        mask[50:120, 45:215] = 255
+        plan = CleanupPlan(
+            region_id="R-01",
+            region_bbox=(40, 40, 180, 100),
+            region_class="speech_bubble",
+            background_model="flat_light",
+            cleanup_strategy="flat_fill",
+            inpaint_method="local_sample",
+            text_mask=mask,
+            cleanup_mask=mask,
+            text_mask_confidence=0.9,
+            container_mask=np.ones((100, 180), dtype=np.uint8) * 255,
+            container_bbox=(40, 40, 180, 100),
+            container_confidence=0.9,
+            text_bbox=(45, 50, 170, 70),
+        )
+        result = img.copy()
+
+        execute_cleanup_plan(img, result, plan)
+        validate_cleanup_proposal(img, result, plan, destructive_allowed=True, validation_source="test")
+
+        self.assertFalse(plan.debug_metrics["proposal_valid"])
+        self.assertTrue(plan.debug_metrics["fill_patch_visible"])
+        self.assertFalse(plan.debug_metrics["visual_quality_ok"])
+        self.assertFalse(plan.debug_metrics["cleanup_effective"])
+        self.assertFalse(cleanup_production_patch_allowed(plan))
+
+    def test_residual_component_verifier_retries_tiny_leftover_dot(self):
+        img = _white_bubble_page()
+        cv2.circle(img, (164, 100), 2, (0, 0, 0), -1, cv2.LINE_AA)
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.putText(mask, "TEXT", (82, 99), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 255, 2, cv2.LINE_AA)
+        plan = CleanupPlan(
+            region_id="R-01",
+            region_bbox=(40, 40, 180, 100),
+            region_class="speech_bubble",
+            background_model="flat_light",
+            cleanup_strategy="flat_fill",
+            inpaint_method="local_sample",
+            text_mask=mask,
+            cleanup_mask=mask.copy(),
+            text_mask_confidence=0.9,
+            container_mask=np.ones((100, 180), dtype=np.uint8) * 255,
+            container_bbox=(40, 40, 180, 100),
+            container_confidence=0.9,
+            text_bbox=(82, 75, 80, 30),
+        )
+        result = img.copy()
+
+        execute_cleanup_plan(img, result, plan)
+        validate_cleanup_proposal(img, result, plan, destructive_allowed=True, validation_source="test")
+
+        self.assertTrue(plan.debug_metrics.get("residual_component_retry_used", False))
+        self.assertEqual(plan.debug_metrics.get("residual_component_count"), 0)
+        self.assertFalse(plan.debug_metrics["residual_text_visible"])
+        self.assertTrue(plan.debug_metrics["proposal_valid"])
+        self.assertTrue(cleanup_production_patch_allowed(plan))
+
+    def test_glyph_shaped_changed_components_do_not_trigger_patch_failure(self):
+        img = _white_bubble_page()
+        block = _dialogue_block((40, 40, 180, 100))
+        plan = build_cleanup_plan(img, block, page_index=0, region_id="R-01")
+        result = img.copy()
+
+        execute_cleanup_plan(img, result, plan)
+        validate_cleanup_proposal(img, result, plan, destructive_allowed=True, validation_source="test")
+
+        self.assertFalse(plan.debug_metrics["fill_patch_visible"])
+        self.assertTrue(plan.debug_metrics["visual_quality_ok"])
+        self.assertTrue(plan.debug_metrics["cleanup_effective"])
+
+    def test_diagnostic_cleanup_ran_does_not_set_production_gate_violation(self):
+        img = _white_bubble_page()
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.putText(mask, "TEXT", (82, 99), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 255, 2, cv2.LINE_AA)
+        plan = CleanupPlan(
+            region_id="R-01",
+            region_bbox=(40, 40, 180, 100),
+            region_class="speech_bubble",
+            background_model="flat_light",
+            cleanup_strategy="flat_fill",
+            inpaint_method="local_sample",
+            skip_reason="manual_review_required",
+            text_mask=mask,
+            cleanup_mask=mask,
+            text_mask_confidence=0.9,
+            container_mask=np.ones((100, 180), dtype=np.uint8) * 255,
+            container_bbox=(40, 40, 180, 100),
+            container_confidence=0.9,
+        )
+        plan.debug_metrics["proposal_failure_reason"] = "manual_review_required"
+        result = img.copy()
+        result[mask > 0] = (252, 252, 252)
+
+        validate_cleanup_proposal(img, result, plan, destructive_allowed=True, validation_source="test")
+
+        self.assertFalse(plan.debug_metrics["proposal_valid"])
+        self.assertTrue(plan.debug_metrics["diagnostic_only"])
+        self.assertTrue(plan.debug_metrics["diagnostic_cleanup_ran"])
+        self.assertTrue(plan.debug_metrics["destructive_cleanup_executed"])
+        self.assertFalse(plan.debug_metrics["production_patch_accepted"])
+        self.assertFalse(plan.debug_metrics["gate_violation"])
+        self.assertEqual(plan.debug_metrics["proposal_failure_reason"], "manual_review_required")
+
+    def test_cleanup_reason_does_not_overwrite_manual_proposal_reason(self):
+        img = _white_bubble_page()
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.putText(mask, "TEXT", (82, 99), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 255, 2, cv2.LINE_AA)
+        plan = CleanupPlan(
+            region_id="R-01",
+            region_bbox=(40, 40, 180, 100),
+            region_class="speech_bubble",
+            background_model="flat_light",
+            cleanup_strategy="flat_fill",
+            inpaint_method="local_sample",
+            text_mask=mask,
+            cleanup_mask=mask,
+            text_mask_confidence=0.9,
+            container_mask=np.ones((100, 180), dtype=np.uint8) * 255,
+            container_bbox=(40, 40, 180, 100),
+            container_confidence=0.9,
+        )
+        plan.debug_metrics["proposal_failure_reason"] = "manual_review_required"
+        plan.debug_metrics["residual_score"] = {"bad": True}
+        result = img.copy()
+        result[mask > 0] = (252, 252, 252)
+
+        validate_cleanup_proposal(img, result, plan, destructive_allowed=True, validation_source="test")
+
+        self.assertEqual(plan.debug_metrics["proposal_failure_reason"], "manual_review_required")
+        self.assertEqual(plan.debug_metrics["cleanup_failure_reason"], "cleanup_residual_text_remains")
+        self.assertTrue(plan.debug_metrics["residual_text_visible"])
+        self.assertFalse(plan.debug_metrics["cleanup_effective"])
+
+    def test_cleanup_outcome_clamp_blocks_invalid_proposal(self):
+        outcome = {
+            "proposal_valid": False,
+            "production_patch_accepted": True,
+            "cleanup_effective": True,
+            "residual_text_visible": False,
+            "visual_quality_ok": True,
+            "fill_patch_visible": False,
+            "gate_violation": False,
+            "manual_visual_success": True,
+        }
+
+        clamp_cleanup_outcome_fields(outcome)
+
+        self.assertFalse(outcome["cleanup_effective"])
+        self.assertFalse(outcome["production_patch_accepted"])
+        self.assertEqual(outcome["proposal_failure_reason"], "cleanup_proposal_invalid")
+
+    def test_cleanup_outcome_clamp_blocks_residual_text(self):
+        outcome = {
+            "proposal_valid": True,
+            "cleanup_effective": True,
+            "residual_text_visible": True,
+            "visual_quality_ok": True,
+            "fill_patch_visible": False,
+            "gate_violation": False,
+            "manual_visual_success": True,
+        }
+
+        clamp_cleanup_outcome_fields(outcome)
+
+        self.assertFalse(outcome["cleanup_effective"])
+        self.assertTrue(outcome["cleanup_partial"])
+        self.assertEqual(outcome["cleanup_failure_reason"], "cleanup_residual_text_remains")
+
+    def test_cleanup_outcome_clamp_blocks_fill_patch(self):
+        outcome = {
+            "proposal_valid": True,
+            "cleanup_effective": True,
+            "residual_text_visible": False,
+            "visual_quality_ok": True,
+            "fill_patch_visible": True,
+            "gate_violation": False,
+            "manual_visual_success": True,
+        }
+
+        clamp_cleanup_outcome_fields(outcome)
+
+        self.assertFalse(outcome["cleanup_effective"])
+        self.assertFalse(outcome["visual_quality_ok"])
+        self.assertEqual(outcome["cleanup_failure_reason"], "cleanup_fill_patch_visible")
+
+    def test_cleanup_outcome_clamp_blocks_visual_quality_failure(self):
+        outcome = {
+            "proposal_valid": True,
+            "cleanup_effective": True,
+            "residual_text_visible": False,
+            "visual_quality_ok": False,
+            "fill_patch_visible": False,
+            "gate_violation": False,
+            "manual_visual_success": True,
+        }
+
+        clamp_cleanup_outcome_fields(outcome)
+
+        self.assertFalse(outcome["cleanup_effective"])
+        self.assertEqual(outcome["cleanup_failure_reason"], "visual_quality_failed")
+
+    def test_cleanup_outcome_clamp_blocks_gate_violation(self):
+        outcome = {
+            "proposal_valid": True,
+            "cleanup_effective": True,
+            "residual_text_visible": False,
+            "visual_quality_ok": True,
+            "fill_patch_visible": False,
+            "gate_violation": True,
+            "manual_visual_success": True,
+        }
+
+        clamp_cleanup_outcome_fields(outcome)
+
+        self.assertFalse(outcome["cleanup_effective"])
+        self.assertEqual(outcome["cleanup_failure_reason"], "cleanup_gate_violation")
 
     def test_solid_colored_bubble_uses_sampled_color_not_white(self):
         fill_bgr = np.array([210, 185, 235], dtype=np.uint8)

@@ -22,6 +22,7 @@ from backend.core.cleanup_plan import (  # noqa: E402
     build_cleanup_plan,
     execute_cleanup_plan,
     normalize_mask_to_image,
+    validate_cleanup_proposal,
 )
 from backend.core.config import ModelConfig  # noqa: E402
 from backend.core.regions import OCRBlock, RegionKind, RegionOverride, _block_from_dict  # noqa: E402
@@ -450,9 +451,51 @@ def _write_artifacts(out_dir: Path, image: np.ndarray, cleaned: np.ndarray, plan
         "cleanup_mask_px": _mask_px(plan.cleanup_mask),
         "text_mask_reason": plan.text_mask_reason,
         "container_reason": plan.container_reason,
+        "effectiveness": {
+            key: value
+            for key, value in plan.debug_metrics.items()
+            if key in {
+                "raw_cleaned_diff_px",
+                "raw_cleaned_diff_ratio",
+                "diff_inside_cleanup_mask_px",
+                "diff_outside_cleanup_mask_px",
+                "cleanup_mask_px",
+                "text_mask_px",
+                "cleaned_same_as_raw",
+                "near_identical_raw_cleaned",
+                "near_identical_tolerance_px",
+                "cleanup_effective",
+                "cleanup_failure_reason",
+                "cleanup_validation_source",
+                "manual_visual_success",
+                "manual_visual_partial",
+                "diagnostic_only",
+                "diagnostic_cleanup_ran",
+                "destructive_cleanup_executed",
+                "production_patch_accepted",
+                "proposal_valid",
+                "proposal_failure_reason",
+                "gate_violation",
+                "text_removed",
+                "residual_text_visible",
+                "visual_quality_ok",
+                "fill_patch_visible",
+                "cleanup_partial",
+                "residual_component_count",
+                "residual_component_px",
+                "residual_component_bboxes",
+                "residual_verifier_reason",
+                "residual_retry_safe",
+                "residual_retry_rejection_reason",
+                "fill_patch_component_count",
+                "fill_patch_component_bboxes",
+                "fill_patch_reason",
+            }
+        },
         "debug_metrics": plan.debug_metrics,
         "artifacts": files,
     }
+    report.update(report["effectiveness"])
     report_path = out_dir / "report.json"
     with report_path.open("w", encoding="utf-8") as f:
         json.dump(_json_safe(report), f, indent=2, ensure_ascii=False)
@@ -503,6 +546,14 @@ def run(args: argparse.Namespace) -> int:
     plan.cleanup_backend = "opencv"
     cleaned = image.copy()
     execute_cleanup_plan(image, cleaned, plan)
+    validate_cleanup_proposal(
+        image,
+        cleaned,
+        plan,
+        destructive_allowed=True,
+        production_patch_accepted=False,
+        validation_source="cleanup_lab",
+    )
     out_dir = Path(args.out).resolve() if args.out else _default_out(image_path, region_id).resolve()
     source.update({"image": str(image_path), "raw_region": raw_region})
     files = _write_artifacts(out_dir, image, cleaned, plan, source)

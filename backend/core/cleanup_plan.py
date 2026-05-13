@@ -789,6 +789,711 @@ def _mask_px(mask: Optional[np.ndarray]) -> Optional[int]:
     return int(np.count_nonzero(mask))
 
 
+def compute_cleanup_effectiveness_metrics(
+    raw: np.ndarray,
+    cleaned: np.ndarray,
+    cleanup_mask: Optional[np.ndarray],
+    text_mask: Optional[np.ndarray] = None,
+    *,
+    attempted: bool = False,
+    intended_skip: bool = False,
+    manual_label: Optional[Dict[str, Any]] = None,
+    validation_source: str = "metric_only",
+) -> Dict[str, Any]:
+    manual_label = manual_label or {}
+    h = min(int(raw.shape[0]), int(cleaned.shape[0]))
+    w = min(int(raw.shape[1]), int(cleaned.shape[1]))
+    if h <= 0 or w <= 0:
+        changed = np.zeros((0, 0), dtype=bool)
+    else:
+        raw_cmp = raw[:h, :w]
+        cleaned_cmp = cleaned[:h, :w]
+        changed = (
+            np.any(raw_cmp != cleaned_cmp, axis=2)
+            if raw_cmp.ndim == 3 and cleaned_cmp.ndim == 3
+            else raw_cmp != cleaned_cmp
+        )
+    diff_px = int(np.count_nonzero(changed))
+    total_px = int(max(1, changed.size))
+    near_identical_px = int(max(2, min(12, int(total_px * 0.00001))))
+    mask_full = None
+    if cleanup_mask is not None and cleanup_mask.shape[:2] == changed.shape[:2]:
+        mask_full = cleanup_mask[:h, :w] > 0
+    text_px = int(np.count_nonzero(text_mask)) if text_mask is not None else 0
+    cleanup_px = int(np.count_nonzero(cleanup_mask)) if cleanup_mask is not None else 0
+    if mask_full is not None:
+        inside = int(np.count_nonzero(changed & mask_full))
+        outside = int(np.count_nonzero(changed & ~mask_full))
+    else:
+        inside = 0
+        outside = diff_px
+    manual_success = str(manual_label.get("manual_visual_success", "")).strip().lower() in {"1", "true", "yes", "success"}
+    manual_partial = str(manual_label.get("manual_visual_partial", "")).strip().lower() in {"1", "true", "yes", "partial"}
+    if manual_label.get("cleanup_effective") not in (None, ""):
+        manual_success = manual_success or str(manual_label.get("cleanup_effective")).strip().lower() in {"1", "true", "yes"}
+    did_attempt = bool(attempted or (cleanup_px > 0 and not intended_skip))
+    cleaned_same = bool(diff_px == 0)
+    near_identical = bool(diff_px <= near_identical_px)
+    effective = False
+    reason = ""
+    source = validation_source or "metric_only"
+    if manual_success or manual_partial:
+        source = "manual_visual_label" if validation_source == "metric_only" else "mixed"
+    if intended_skip and not did_attempt:
+        reason = str(manual_label.get("cleanup_failure_reason") or "intentionally_skipped")
+    elif cleanup_px <= 0:
+        reason = "empty_cleanup_mask"
+    elif did_attempt and near_identical:
+        reason = "cleanup_executed_but_no_pixel_change"
+    elif mask_full is None:
+        reason = "mask_alignment_unknown"
+    elif inside <= 0 and diff_px > near_identical_px:
+        reason = "cleanup_changed_outside_cleanup_mask"
+    elif manual_partial:
+        reason = str(manual_label.get("cleanup_failure_reason") or "cleanup_residual_text_remains")
+    elif manual_success:
+        effective = True
+    elif did_attempt and inside > 0 and diff_px > near_identical_px:
+        effective = True
+    else:
+        reason = str(manual_label.get("cleanup_failure_reason") or "cleanup_not_validated")
+    if effective:
+        reason = ""
+    return {
+        "raw_cleaned_diff_px": diff_px,
+        "raw_cleaned_diff_ratio": float(diff_px / max(1, total_px)),
+        "diff_inside_cleanup_mask_px": inside,
+        "diff_outside_cleanup_mask_px": outside,
+        "cleanup_mask_px": cleanup_px,
+        "text_mask_px": text_px,
+        "cleaned_same_as_raw": cleaned_same,
+        "near_identical_raw_cleaned": near_identical,
+        "near_identical_tolerance_px": near_identical_px,
+        "cleanup_effective": bool(effective),
+        "cleanup_failure_reason": reason,
+        "cleanup_validation_source": source,
+        "manual_visual_success": bool(manual_success),
+        "manual_visual_partial": bool(manual_partial),
+    }
+
+
+def _cleanup_changed_mask(
+    raw: np.ndarray,
+    cleaned: np.ndarray,
+    cleanup_mask: Optional[np.ndarray],
+) -> Tuple[np.ndarray, int, int, int]:
+    h = min(int(raw.shape[0]), int(cleaned.shape[0]))
+    w = min(int(raw.shape[1]), int(cleaned.shape[1]))
+    if h <= 0 or w <= 0:
+        return np.zeros((0, 0), dtype=bool), 0, 0, 0
+    raw_cmp = raw[:h, :w]
+    cleaned_cmp = cleaned[:h, :w]
+    changed = (
+        np.any(raw_cmp != cleaned_cmp, axis=2)
+        if raw_cmp.ndim == 3 and cleaned_cmp.ndim == 3
+        else raw_cmp != cleaned_cmp
+    )
+    if cleanup_mask is not None and cleanup_mask.shape[:2] == changed.shape[:2]:
+        changed = changed & (cleanup_mask[:h, :w] > 0)
+    changed_px = int(np.count_nonzero(changed))
+    total_px = int(max(1, changed.size))
+    near_identical_px = int(max(2, min(12, int(total_px * 0.00001))))
+    return changed, changed_px, total_px, near_identical_px
+
+
+def _cleanup_safe_interior_mask(plan: CleanupPlan, shape: Tuple[int, ...], erode_px: int = 3) -> Optional[np.ndarray]:
+    if plan.container_mask is None or plan.container_bbox is None:
+        return None
+    try:
+        safe = normalize_mask_to_image(plan.container_mask, plan.container_bbox, shape)
+    except Exception:
+        return None
+    if safe is None or not np.any(safe):
+        return None
+    safe = (safe > 0).astype(np.uint8) * 255
+    if erode_px > 0:
+        k = max(3, int(erode_px) * 2 + 1)
+        safe = cv2.erode(safe, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), iterations=1)
+    return safe if np.any(safe) else None
+
+
+def _component_stats(mask: np.ndarray, limit: int = 8) -> List[Dict[str, Any]]:
+    if mask is None or mask.size == 0 or not np.any(mask):
+        return []
+    n, labels, stats, _centroids = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
+    rows: List[Dict[str, Any]] = []
+    for label in range(1, n):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        rows.append({
+            "area": area,
+            "bbox": [x, y, w, h],
+            "rectangularity": round(float(area) / float(max(1, w * h)), 4),
+            "aspect": round(float(max(w, h)) / float(max(1, min(w, h))), 4),
+        })
+    rows.sort(key=lambda item: int(item.get("area", 0)), reverse=True)
+    return rows[:max(0, int(limit))]
+
+
+def _bg_bgr_for_verifier(raw: np.ndarray, plan: CleanupPlan, mask: Optional[np.ndarray]) -> np.ndarray:
+    residual = plan.debug_metrics.get("residual_score", {}) or {}
+    bg_bgr = residual.get("sampled_bg_bgr")
+    if isinstance(bg_bgr, list) and len(bg_bgr) == 3:
+        return np.array(bg_bgr, dtype=np.float32)
+    sampled, _metrics = _sample_container_bg_metrics(raw, plan, mask)
+    if sampled is not None:
+        return sampled.astype(np.float32)
+    estimated, _conf = _estimate_plain_bg_color(
+        raw,
+        None,
+        mask,
+        plan.region_bbox,
+        allow_dark=(plan.background_model == "dark_bubble"),
+    )
+    return estimated.astype(np.float32)
+
+
+def _raw_glyph_support_mask(raw: np.ndarray, plan: CleanupPlan, bg_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    bg_gray = float(0.114 * bg_bgr[0] + 0.587 * bg_bgr[1] + 0.299 * bg_bgr[2])
+    dist = np.sqrt(np.sum((raw.astype(np.float32) - bg_bgr[None, None, :]) ** 2, axis=2))
+    edge = cv2.Canny(cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY), 40, 120).astype(np.float32)
+    if plan.background_model == "dark_bubble":
+        contrast = gray > bg_gray + 28.0
+    else:
+        contrast = gray < bg_gray - 22.0
+    support = ((dist > 34.0) & contrast) | (edge > 0)
+    return support.astype(np.uint8) * 255
+
+
+def _detect_cleanup_residual_components(
+    raw: np.ndarray,
+    cleaned: np.ndarray,
+    plan: CleanupPlan,
+    mask: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    empty = {
+        "residual_component_count": 0,
+        "residual_component_px": 0,
+        "residual_component_bboxes": [],
+        "residual_component_authoritative_count": 0,
+        "residual_component_authoritative_px": 0,
+        "residual_component_stats": [],
+        "residual_component_verdict": "",
+        "residual_confidence": "",
+        "residual_verifier_reason": "",
+        "residual_retry_safe": False,
+        "residual_retry_rejection_reason": "",
+    }
+    if (
+        plan.region_class not in {"speech_bubble", "caption_box"}
+        or plan.background_model not in {"flat_light", "flat_colored", "dark_bubble"}
+        or plan.cleanup_strategy != "flat_fill"
+        or mask is None
+        or not np.any(mask)
+        or plan.debug_metrics.get("cleanup_mask_rejected", False)
+    ):
+        return empty
+    safe = _cleanup_safe_interior_mask(plan, cleaned.shape, erode_px=3)
+    if safe is None:
+        return {**empty, "residual_retry_rejection_reason": "no_safe_interior"}
+    bg_bgr = _bg_bgr_for_verifier(raw, plan, mask)
+    gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    bg_gray = float(0.114 * bg_bgr[0] + 0.587 * bg_bgr[1] + 0.299 * bg_bgr[2])
+    dist = np.sqrt(np.sum((cleaned.astype(np.float32) - bg_bgr[None, None, :]) ** 2, axis=2))
+    edge = cv2.Canny(cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY), 35, 110).astype(np.float32)
+    if plan.background_model == "dark_bubble":
+        contrast = gray > bg_gray + 32.0
+    else:
+        contrast = gray < bg_gray - 24.0
+    suspect = ((dist > 38.0) & contrast) | ((dist > 48.0) & (edge > 0))
+    suspect &= safe > 0
+    raw_support = _raw_glyph_support_mask(raw, plan, bg_bgr)
+    if plan.text_mask is not None:
+        text_near = cv2.dilate(
+            (plan.text_mask > 0).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+            iterations=1,
+        )
+    else:
+        text_near = cv2.dilate(
+            (mask > 0).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+            iterations=1,
+        )
+    suspect &= ((raw_support > 0) | (text_near > 0))
+    if not np.any(suspect):
+        return empty
+    n, labels, stats, _centroids = cv2.connectedComponentsWithStats(suspect.astype(np.uint8), 8)
+    kept = np.zeros(suspect.shape, dtype=np.uint8)
+    high_confidence = np.zeros(suspect.shape, dtype=np.uint8)
+    component_rows: List[Dict[str, Any]] = []
+    safe_active = safe > 0
+    safe_bbox = _mask_bbox(safe)
+    rejection = ""
+    if mask is not None and np.any(mask):
+        distance_to_mask = cv2.distanceTransform((mask <= 0).astype(np.uint8), cv2.DIST_L2, 3)
+    else:
+        distance_to_mask = np.full(suspect.shape, 9999.0, dtype=np.float32)
+    for label in range(1, n):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if area < 1 or area > 420 or max(w, h) > 46:
+            rejection = "component_size"
+            continue
+        aspect = float(max(w, h)) / float(max(1, min(w, h)))
+        fill = float(area) / float(max(1, w * h))
+        if aspect > 10.0 or (fill > 0.88 and area > 80):
+            rejection = "non_glyph_shape"
+            continue
+        comp = labels == label
+        if safe_bbox is not None:
+            sx, sy, sw, sh = safe_bbox
+            if x <= sx + 1 or y <= sy + 1 or x + w >= sx + sw - 1 or y + h >= sy + sh - 1:
+                rejection = "touches_safe_border"
+                continue
+        support_ratio = float(np.count_nonzero(comp & (raw_support > 0))) / float(max(1, area))
+        near_ratio = float(np.count_nonzero(comp & (text_near > 0))) / float(max(1, area))
+        if support_ratio < 0.20 and near_ratio < 0.65:
+            rejection = "weak_raw_glyph_support"
+            continue
+        kept[comp & safe_active] = 255
+        cleanup_overlap = int(np.count_nonzero(comp & (mask > 0)))
+        mask_distance = float(np.min(distance_to_mask[comp])) if np.any(comp) else 9999.0
+        color_distance_mean = float(dist[comp].mean())
+        color_distance_max = float(dist[comp].max())
+        edge_mean = float(edge[comp].mean())
+        edge_px = int(np.count_nonzero(edge[comp]))
+        confidence = 0.35
+        if near_ratio >= 0.65:
+            confidence += 0.45
+        if mask_distance <= 8.0:
+            confidence += 0.30
+        elif mask_distance <= 16.0:
+            confidence += 0.12
+        if mask_distance <= 16.0 and support_ratio >= 0.80 and (color_distance_mean >= 90.0 or edge_mean >= 50.0):
+            confidence += 0.25
+        if cleanup_overlap > 0:
+            confidence += 0.20
+        confidence = min(1.0, confidence)
+        is_high_confidence = bool(confidence >= 0.65)
+        if is_high_confidence:
+            high_confidence[comp & safe_active] = 255
+        component_rows.append({
+            "area": area,
+            "bbox": [x, y, w, h],
+            "color_distance_mean": round(float(color_distance_mean), 3),
+            "color_distance_max": round(float(color_distance_max), 3),
+            "edge_mean": round(float(edge_mean), 3),
+            "edge_px": edge_px,
+            "raw_support_ratio": round(float(support_ratio), 4),
+            "text_near_ratio": round(float(near_ratio), 4),
+            "cleanup_mask_overlap_px": cleanup_overlap,
+            "distance_to_cleanup_mask_px": round(float(mask_distance), 3),
+            "residual_confidence": round(float(confidence), 3),
+            "residual_component_verdict": "high_confidence_residual" if is_high_confidence else "low_confidence_texture_or_antialias",
+        })
+    component_px = int(np.count_nonzero(kept))
+    if component_px <= 0:
+        return {**empty, "residual_retry_rejection_reason": rejection or "no_kept_components"}
+    high_confidence_px = int(np.count_nonzero(high_confidence))
+    authoritative = bool(high_confidence_px > 0)
+    retry_mask = cv2.dilate(
+        high_confidence if authoritative else kept,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    retry_mask = np.where((retry_mask > 0) & (safe > 0), 255, 0).astype(np.uint8)
+    retry_px = int(np.count_nonzero(retry_mask & ~(mask > 0)))
+    mask_px = int(np.count_nonzero(mask))
+    retry_safe = bool(authoritative and 0 < retry_px <= max(96, min(700, int(mask_px * 0.12))))
+    component_rows.sort(key=lambda row: int(row.get("area", 0)), reverse=True)
+    verdict = "high_confidence_residual" if authoritative else "low_confidence_texture_or_antialias"
+    result = {
+        "residual_component_count": len(_component_stats(kept, limit=32)),
+        "residual_component_px": component_px,
+        "residual_component_bboxes": [row["bbox"] for row in _component_stats(kept, limit=8)],
+        "residual_component_authoritative_count": len(_component_stats(high_confidence, limit=32)),
+        "residual_component_authoritative_px": high_confidence_px,
+        "residual_component_stats": component_rows[:16],
+        "residual_component_verdict": verdict,
+        "residual_confidence": "high" if authoritative else "low",
+        "residual_verifier_reason": "component_glyph_residual" if authoritative else "residual_component_low_confidence",
+        "residual_retry_safe": retry_safe,
+        "residual_retry_rejection_reason": "" if retry_safe else ("low_confidence_residual_components" if not authoritative else "retry_growth_too_large_or_empty"),
+        "residual_retry_mask": retry_mask if retry_safe else None,
+        "residual_retry_px": retry_px,
+    }
+    return result
+
+
+def _changed_component_patch_analysis(
+    raw: np.ndarray,
+    cleaned: np.ndarray,
+    plan: CleanupPlan,
+    changed: np.ndarray,
+) -> Dict[str, Any]:
+    if (
+        changed is None
+        or changed.size == 0
+        or not np.any(changed)
+        or plan.background_model not in {"flat_light", "flat_colored", "dark_bubble"}
+        or plan.cleanup_strategy != "flat_fill"
+    ):
+        return {
+            "fill_patch_component_count": 0,
+            "fill_patch_component_bboxes": [],
+            "fill_patch_reason": "",
+        }
+    bg_bgr = _bg_bgr_for_verifier(raw, plan, plan.cleanup_mask)
+    raw_support = _raw_glyph_support_mask(raw, plan, bg_bgr) > 0
+    safe = _cleanup_safe_interior_mask(plan, raw.shape, erode_px=2)
+    safe_bbox = _mask_bbox(safe) if safe is not None else None
+    n, labels, stats, _centroids = cv2.connectedComponentsWithStats(changed.astype(np.uint8), 8)
+    patch_components = np.zeros(changed.shape, dtype=np.uint8)
+    reasons: List[str] = []
+    for label in range(1, n):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if area < 64:
+            continue
+        comp = labels == label
+        fill_ratio = float(area) / float(max(1, w * h))
+        aspect = float(max(w, h)) / float(max(1, min(w, h)))
+        raw_ratio = float(np.count_nonzero(comp & raw_support)) / float(max(1, area))
+        side_band = False
+        border_band = False
+        if safe_bbox is not None:
+            sx, sy, sw, sh = safe_bbox
+            side_band = bool(x <= sx + 4 or x + w >= sx + sw - 4)
+            border_band = bool(y <= sy + 4 or y + h >= sy + sh - 4)
+        blocky = bool(fill_ratio >= 0.78 and area >= 180)
+        long_bar = bool(aspect >= 5.0 and area >= 120)
+        oversized = bool(plan.container_mask is not None and area >= max(240, int(np.count_nonzero(plan.container_mask) * 0.18)))
+        if raw_ratio <= 0.24 and ((blocky and (side_band or border_band or oversized)) or (long_bar and (side_band or border_band))):
+            patch_components[comp] = 255
+            if blocky:
+                reasons.append("blocky_changed_component")
+            if side_band:
+                reasons.append("side_band_changed_component")
+            if border_band:
+                reasons.append("border_band_changed_component")
+            if long_bar:
+                reasons.append("long_bar_changed_component")
+    rows = _component_stats(patch_components, limit=8)
+    reason = ",".join(dict.fromkeys(reasons))
+    return {
+        "fill_patch_component_count": len(rows),
+        "fill_patch_component_bboxes": [row["bbox"] for row in rows],
+        "fill_patch_reason": reason,
+    }
+
+
+def _cleanup_visual_quality_result(
+    raw: np.ndarray,
+    cleaned: np.ndarray,
+    plan: CleanupPlan,
+) -> Dict[str, Any]:
+    changed, changed_px, total_px, _near_identical_px = _cleanup_changed_mask(raw, cleaned, plan.cleanup_mask)
+    quality = plan.debug_metrics.get("quality", {}) or {}
+    mask_region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
+    mask_container_ratio = float(quality.get("mask_container_ratio", 0.0) or 0.0)
+    rectangularity = float(quality.get("rectangularity", 0.0) or 0.0)
+    border_touch_ratio = float(quality.get("border_touch_ratio", 0.0) or 0.0)
+    long_bar_score = float(quality.get("long_bar_score", 0.0) or 0.0)
+    changed_bbox = None
+    changed_rectangularity = 0.0
+    if changed_px > 0:
+        bbox = _mask_bbox(changed.astype(np.uint8) * 255)
+        if bbox is not None:
+            bx, by, bw, bh = bbox
+            changed_bbox = [int(bx), int(by), int(bw), int(bh)]
+            changed_rectangularity = float(changed_px) / float(max(1, bw * bh))
+    component_analysis = _changed_component_patch_analysis(raw, cleaned, plan, changed)
+    fill_patch_visible = bool(
+        changed_px > 0
+        and (
+            (
+                rectangularity >= 0.92
+                and border_touch_ratio >= 0.28
+                and (mask_container_ratio >= 0.38 or mask_region_ratio >= 0.30)
+            )
+            or (
+                changed_rectangularity >= 0.90
+                and changed_px / max(1, total_px) >= 0.025
+                and (mask_region_ratio >= 0.28 or mask_container_ratio >= 0.35)
+            )
+            or (
+                long_bar_score > 32.0
+                and border_touch_ratio >= 0.35
+                and mask_region_ratio >= 0.18
+            )
+            or int(component_analysis.get("fill_patch_component_count", 0) or 0) > 0
+        )
+    )
+    failure_reason = "cleanup_fill_patch_visible" if fill_patch_visible else ""
+    return {
+        "visual_quality_ok": not fill_patch_visible,
+        "visual_quality_failure_reason": failure_reason,
+        "fill_patch_visible": fill_patch_visible,
+        "changed_mask_px": int(changed_px),
+        "changed_mask_bbox": changed_bbox,
+        "changed_mask_rectangularity": round(float(changed_rectangularity), 4),
+        **component_analysis,
+    }
+
+
+def _outcome_bool(outcome: Dict[str, Any], key: str, default: bool = False) -> bool:
+    value = outcome.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "success"}:
+        return True
+    if text in {"0", "false", "no", "off", "failure", "failed"}:
+        return False
+    return bool(value)
+
+
+def _outcome_reason(outcome: Dict[str, Any]) -> str:
+    return str(
+        outcome.get("cleanup_failure_reason")
+        or outcome.get("proposal_failure_reason")
+        or outcome.get("visual_quality_failure_reason")
+        or ""
+    )
+
+
+def clamp_cleanup_outcome_fields(outcome: Dict[str, Any]) -> Dict[str, Any]:
+    cleanup_reason = str(outcome.get("cleanup_failure_reason") or outcome.get("visual_quality_failure_reason") or "")
+    proposal_reason = str(outcome.get("proposal_failure_reason") or "")
+    reason = cleanup_reason or proposal_reason
+    proposal_valid = _outcome_bool(outcome, "proposal_valid", False)
+    residual_text_visible = bool(
+        _outcome_bool(outcome, "residual_text_visible", False)
+        or reason in {"cleanup_residual_text_remains", "cleanup_ocr_text_remains"}
+    )
+    fill_patch_visible = bool(
+        _outcome_bool(outcome, "fill_patch_visible", False)
+        or reason in {"cleanup_fill_patch_visible", "fill_patch_visible"}
+    )
+    visual_quality_ok = bool(
+        _outcome_bool(outcome, "visual_quality_ok", True)
+        and reason not in {"visual_quality_failed", "cleanup_fill_patch_visible", "fill_patch_visible"}
+    )
+    gate_violation = _outcome_bool(outcome, "gate_violation", False)
+
+    if fill_patch_visible:
+        visual_quality_ok = False
+        outcome["visual_quality_ok"] = False
+        if not outcome.get("visual_quality_failure_reason"):
+            outcome["visual_quality_failure_reason"] = "cleanup_fill_patch_visible"
+
+    can_be_effective = bool(
+        proposal_valid
+        and not residual_text_visible
+        and visual_quality_ok
+        and not fill_patch_visible
+        and not gate_violation
+    )
+    if not can_be_effective:
+        outcome["cleanup_effective"] = False
+        if not proposal_valid:
+            outcome["production_patch_accepted"] = False
+            if not outcome.get("proposal_failure_reason"):
+                outcome["proposal_failure_reason"] = proposal_reason or "cleanup_proposal_invalid"
+        if residual_text_visible:
+            outcome["cleanup_partial"] = True
+            if not cleanup_reason:
+                outcome["cleanup_failure_reason"] = "cleanup_residual_text_remains"
+                cleanup_reason = "cleanup_residual_text_remains"
+        if fill_patch_visible and not outcome.get("cleanup_failure_reason"):
+            outcome["cleanup_failure_reason"] = "cleanup_fill_patch_visible"
+            cleanup_reason = "cleanup_fill_patch_visible"
+        if not visual_quality_ok and not cleanup_reason:
+            outcome["cleanup_failure_reason"] = str(
+                outcome.get("visual_quality_failure_reason") or "visual_quality_failed"
+            )
+            cleanup_reason = str(outcome.get("cleanup_failure_reason") or "")
+        if gate_violation and not cleanup_reason:
+            outcome["cleanup_failure_reason"] = "cleanup_gate_violation"
+        if not outcome.get("cleanup_failure_reason") and outcome.get("proposal_failure_reason"):
+            outcome["cleanup_failure_reason"] = str(outcome.get("proposal_failure_reason") or "")
+    else:
+        outcome["cleanup_effective"] = True
+        outcome.setdefault("cleanup_partial", False)
+    outcome["proposal_valid"] = bool(proposal_valid)
+    outcome["residual_text_visible"] = bool(residual_text_visible)
+    outcome["fill_patch_visible"] = bool(fill_patch_visible)
+    outcome["visual_quality_ok"] = bool(visual_quality_ok)
+    outcome["gate_violation"] = bool(gate_violation)
+    return outcome
+
+
+def mark_cleanup_proposal_blocked(plan: CleanupPlan, reason: str) -> None:
+    failure = str(reason or "cleanup_proposal_blocked")
+    plan.debug_metrics.setdefault("proposal_original_strategy", plan.cleanup_strategy)
+    plan.debug_metrics.setdefault("proposal_original_inpaint_method", plan.inpaint_method)
+    plan.debug_metrics["diagnostic_only"] = True
+    plan.debug_metrics["destructive_cleanup_executed"] = False
+    plan.debug_metrics["production_patch_accepted"] = False
+    plan.debug_metrics["proposal_valid"] = False
+    plan.debug_metrics["proposal_failure_reason"] = failure
+    plan.debug_metrics["gate_violation"] = False
+    plan.debug_metrics["diagnostic_cleanup_ran"] = False
+    plan.debug_metrics["text_removed"] = False
+    plan.debug_metrics["residual_text_visible"] = False
+    plan.debug_metrics["visual_quality_ok"] = False
+    plan.debug_metrics["fill_patch_visible"] = False
+    plan.debug_metrics["cleanup_effective"] = False
+    plan.cleanup_strategy = "skip"
+    plan.inpaint_method = "skip"
+    plan.skip_reason = failure
+
+
+def validate_cleanup_proposal(
+    raw: np.ndarray,
+    cleaned: np.ndarray,
+    plan: CleanupPlan,
+    *,
+    destructive_allowed: bool = True,
+    production_patch_accepted: bool = False,
+    validation_source: str = "production",
+) -> Dict[str, Any]:
+    if not isinstance(plan.debug_metrics.get("quality", None), dict):
+        _refresh_cleanup_quality(plan, raw)
+    intended_skip = bool(plan.cleanup_strategy in ("skip", "review"))
+    mask_present = bool(plan.cleanup_mask is not None and np.any(plan.cleanup_mask))
+    attempted = bool(destructive_allowed and not intended_skip and mask_present)
+    metrics = compute_cleanup_effectiveness_metrics(
+        raw,
+        cleaned,
+        plan.cleanup_mask,
+        plan.text_mask,
+        attempted=attempted,
+        intended_skip=intended_skip,
+        validation_source=validation_source,
+    )
+    pixel_cleanup_executed = bool(
+        int(metrics.get("raw_cleaned_diff_px", 0) or 0)
+        > int(metrics.get("near_identical_tolerance_px", 0) or 0)
+        and int(metrics.get("diff_inside_cleanup_mask_px", 0) or 0) > 0
+    )
+    destructive_cleanup_executed = bool(pixel_cleanup_executed)
+    residual_score = plan.debug_metrics.get("residual_score", {}) or {}
+    skip_reason = str(plan.skip_reason or "")
+    residual_text_visible = bool(
+        residual_score.get("bad", False)
+        or int(plan.debug_metrics.get("residual_component_authoritative_count", 0) or 0) > 0
+        or skip_reason in {"cleanup_residual_text_remains", "cleanup_ocr_text_remains"}
+    )
+    visual = _cleanup_visual_quality_result(raw, cleaned, plan)
+    visual_quality_ok = bool(visual.get("visual_quality_ok", True))
+    review_required = bool(plan.debug_metrics.get("review_required_after_cleanup", False))
+    force_mode = str(plan.debug_metrics.get("cleanup_override_mode", "") or "") in {
+        "force_allow", "force_solid", "force_telea", "force_ns", "force_iopaint"
+    }
+    production_gate_blocked = bool(
+        not destructive_allowed
+        or intended_skip
+        or bool(skip_reason)
+        or review_required
+        or bool(plan.debug_metrics.get("cleanup_mask_rejected", False))
+        or not mask_present
+    )
+    gate_violation = bool(production_patch_accepted and production_gate_blocked)
+    text_removed = bool(destructive_cleanup_executed)
+    failure_reason = str(plan.debug_metrics.get("proposal_failure_reason", "") or "")
+    if not failure_reason:
+        if not destructive_allowed:
+            failure_reason = "destructive_cleanup_not_allowed"
+        elif intended_skip:
+            failure_reason = skip_reason or "cleanup_strategy_skip_or_review"
+        elif not mask_present:
+            failure_reason = "empty_cleanup_mask"
+        elif review_required:
+            failure_reason = skip_reason or "cleanup_requires_review"
+        elif not destructive_cleanup_executed:
+            failure_reason = str(metrics.get("cleanup_failure_reason") or "destructive_cleanup_not_executed")
+        elif gate_violation:
+            failure_reason = skip_reason or "cleanup_gate_violation"
+    cleanup_failure_reason = ""
+    if residual_text_visible:
+        cleanup_failure_reason = "cleanup_residual_text_remains"
+    elif not visual_quality_ok:
+        cleanup_failure_reason = str(visual.get("visual_quality_failure_reason") or "visual_quality_failed")
+    elif not destructive_cleanup_executed:
+        cleanup_failure_reason = str(metrics.get("cleanup_failure_reason") or "destructive_cleanup_not_executed")
+    elif gate_violation:
+        cleanup_failure_reason = "cleanup_gate_violation"
+    proposal_valid = bool(
+        destructive_allowed
+        and not production_gate_blocked
+        and destructive_cleanup_executed
+        and text_removed
+        and not residual_text_visible
+        and visual_quality_ok
+    )
+    if not proposal_valid and not failure_reason:
+        failure_reason = "cleanup_proposal_invalid"
+    if not visual_quality_ok and not skip_reason:
+        plan.skip_reason = str(visual.get("visual_quality_failure_reason") or "visual_quality_failed")
+        plan.debug_metrics["review_required_after_cleanup"] = True
+    cleanup_effective = bool(proposal_valid and destructive_cleanup_executed)
+    proposal = {
+        **metrics,
+        **visual,
+        "diagnostic_only": bool(not proposal_valid),
+        "diagnostic_cleanup_ran": bool(not proposal_valid and destructive_cleanup_executed),
+        "destructive_cleanup_executed": bool(destructive_cleanup_executed),
+        "production_patch_accepted": bool(production_patch_accepted and proposal_valid),
+        "proposal_valid": bool(proposal_valid),
+        "proposal_failure_reason": "" if proposal_valid else failure_reason,
+        "cleanup_failure_reason": "" if proposal_valid else cleanup_failure_reason,
+        "gate_violation": bool(gate_violation),
+        "forced_cleanup_override": bool(force_mode),
+        "text_removed": bool(text_removed),
+        "residual_text_visible": bool(residual_text_visible),
+        "cleanup_effective": bool(cleanup_effective),
+    }
+    clamp_cleanup_outcome_fields(proposal)
+    plan.debug_metrics.update(proposal)
+    return proposal
+
+
+def cleanup_production_patch_allowed(plan: CleanupPlan) -> bool:
+    metrics = plan.debug_metrics or {}
+    return bool(
+        metrics.get("proposal_valid", False)
+        and metrics.get("cleanup_effective", False)
+        and metrics.get("destructive_cleanup_executed", False)
+        and not metrics.get("diagnostic_only", True)
+        and not metrics.get("gate_violation", False)
+        and not metrics.get("residual_text_visible", False)
+        and not metrics.get("fill_patch_visible", False)
+        and plan.cleanup_strategy not in ("skip", "review")
+        and plan.cleanup_mask is not None
+        and np.any(plan.cleanup_mask)
+    )
+
+
+def mark_production_patch_accepted(plan: CleanupPlan, accepted: bool) -> None:
+    plan.debug_metrics["production_patch_accepted"] = bool(accepted and cleanup_production_patch_allowed(plan))
+
+
 def _candidate_source_from_reason(reason: str) -> str:
     text = str(reason or "")
     if text.startswith("existing_mask"):
@@ -965,6 +1670,78 @@ def _translucent_detail_score(metrics: Dict[str, Any]) -> float:
     score += max(0.0, (sat_var - 24.0) / 30.0)
     score += max(0.0, (spread - 34.0) / 34.0)
     return round(float(score), 3)
+
+
+def _try_adopt_existing_safe_rect_container(
+    img_cv: np.ndarray,
+    plan: CleanupPlan,
+) -> bool:
+    if (
+        plan.region_class not in {"speech_bubble", "caption_box"}
+        or plan.background_model not in {"flat_light", "flat_colored", "dark_bubble"}
+        or plan.container_mask is not None
+        or float(plan.text_mask_confidence or 0.0) < 0.45
+    ):
+        return False
+    safe_rect = plan.debug_metrics.get("cleanup_safe_rect_existing")
+    safe_conf = float(plan.debug_metrics.get("cleanup_safe_rect_existing_confidence", 0.0) or 0.0)
+    if not isinstance(safe_rect, list) or len(safe_rect) != 4 or safe_conf < 0.70:
+        return False
+    h_img, w_img = img_cv.shape[:2]
+    x, y, w, h = [int(v) for v in safe_rect]
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(w_img, x + w), min(h_img, y + h)
+    if x2 <= x1 or y2 <= y1:
+        return False
+    safe_bbox = (x1, y1, x2 - x1, y2 - y1)
+    safe_area = max(1, safe_bbox[2] * safe_bbox[3])
+    region_area = max(1, int(plan.region_bbox[2] * plan.region_bbox[3]))
+    if safe_area < region_area or safe_area > max(region_area * 8, 120000):
+        return False
+    text_bbox = plan.text_bbox or (_mask_bbox(plan.text_mask) if plan.text_mask is not None else None)
+    if text_bbox is None:
+        return False
+    tx, ty, tw, th = [int(v) for v in text_bbox]
+    if tx < x1 or ty < y1 or tx + tw > x2 or ty + th > y2:
+        return False
+    local = img_cv[y1:y2, x1:x2]
+    sample = np.ones(local.shape[:2], dtype=bool)
+    if plan.text_mask is not None:
+        tm = plan.text_mask[y1:y2, x1:x2] > 0
+        tm = cv2.dilate(
+            tm.astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            iterations=1,
+        ) > 0
+        sample &= ~tm
+    if int(np.count_nonzero(sample)) < 64:
+        return False
+    gray = cv2.cvtColor(local, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(local, cv2.COLOR_BGR2HSV)
+    edges = cv2.Canny(local, 40, 120)
+    gray_std = float(np.std(gray[sample]))
+    sat_std = float(np.std(hsv[:, :, 1][sample]))
+    edge_density = float(edges[sample].sum()) / max(1, int(np.count_nonzero(sample)) * 255)
+    if gray_std > 18.0 or sat_std > 24.0 or edge_density > 0.035:
+        plan.debug_metrics["safe_rect_container_rejected"] = {
+            "reason": "not_flat",
+            "gray_std": round(gray_std, 3),
+            "sat_std": round(sat_std, 3),
+            "edge_density": round(edge_density, 5),
+        }
+        return False
+    plan.container_bbox = safe_bbox
+    plan.container_mask = np.full((safe_bbox[3], safe_bbox[2]), 255, dtype=np.uint8)
+    plan.container_confidence = float(min(0.72, max(0.60, safe_conf)))
+    plan.container_reason = "existing_cleanup_safe_rect_flat_container"
+    plan.debug_metrics["safe_rect_container_adopted"] = {
+        "bbox": _bbox_list(safe_bbox),
+        "confidence": round(float(plan.container_confidence), 4),
+        "gray_std": round(gray_std, 3),
+        "sat_std": round(sat_std, 3),
+        "edge_density": round(edge_density, 5),
+    }
+    return True
 
 
 def _easy_cleanup_large_mask_allowed(
@@ -1458,6 +2235,18 @@ def _write_cleanup_metadata_to_block(
         "status": str(status),
         "reason": str(reason),
         "review_required": bool(tier == 2 and policy.require_review_for_tier2),
+        "diagnostic_only": bool(plan.debug_metrics.get("diagnostic_only", False)),
+        "diagnostic_cleanup_ran": bool(plan.debug_metrics.get("diagnostic_cleanup_ran", False)),
+        "destructive_cleanup_executed": bool(plan.debug_metrics.get("destructive_cleanup_executed", False)),
+        "production_patch_accepted": bool(plan.debug_metrics.get("production_patch_accepted", False)),
+        "proposal_valid": bool(plan.debug_metrics.get("proposal_valid", False)),
+        "proposal_failure_reason": str(plan.debug_metrics.get("proposal_failure_reason", "") or ""),
+        "cleanup_failure_reason": str(plan.debug_metrics.get("cleanup_failure_reason", "") or ""),
+        "gate_violation": bool(plan.debug_metrics.get("gate_violation", False)),
+        "residual_text_visible": bool(plan.debug_metrics.get("residual_text_visible", False)),
+        "visual_quality_ok": bool(plan.debug_metrics.get("visual_quality_ok", True)),
+        "fill_patch_visible": bool(plan.debug_metrics.get("fill_patch_visible", False)),
+        "cleanup_effective": bool(plan.debug_metrics.get("cleanup_effective", False)),
     }
 
     if plan.container_bbox is not None and plan.container_confidence >= 0.40:
@@ -3447,7 +4236,7 @@ def _build_residual_guided_expansion(
     active = mask > 0
     ring = cv2.dilate(
         active.astype(np.uint8) * 255,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
         iterations=1,
     ) > 0
     ring &= ~active
@@ -3477,11 +4266,15 @@ def _build_residual_guided_expansion(
     sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     edge = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+    flat_light_target = plan.background_model in {"flat_light", "flat_colored", "dark_bubble"}
+    diff_gate = 28.0 if flat_light_target else 36.0
+    gray_gate = 14.0 if flat_light_target else 18.0
+    edge_gate = 36.0 if flat_light_target else 48.0
     raw = np.where(
         ring
         & (
-            ((diff > 36.0) & (np.abs(gray - bg_gray) > 18.0))
-            | (edge > 48.0)
+            ((diff > diff_gate) & (np.abs(gray - bg_gray) > gray_gate))
+            | (edge > edge_gate)
         ),
         255,
         0,
@@ -3492,10 +4285,10 @@ def _build_residual_guided_expansion(
     n, labels, stats, _ = cv2.connectedComponentsWithStats(raw, 8)
     kept = np.zeros_like(raw)
     mask_px = max(1, int(np.count_nonzero(mask)))
-    max_total = max(32, min(int(mask_px * 0.35), 1800))
+    max_total = max(32, min(int(mask_px * (0.55 if flat_light_target else 0.35)), 3200 if flat_light_target else 1800))
     for label in range(1, n):
         area = int(stats[label, cv2.CC_STAT_AREA])
-        if area < 2 or area > max(128, int(mask_px * 0.18)):
+        if area < 2 or area > max(192 if flat_light_target else 128, int(mask_px * (0.26 if flat_light_target else 0.18))):
             continue
         comp = labels == label
         touches = cv2.dilate(
@@ -3519,11 +4312,11 @@ def _build_residual_guided_expansion(
         safety_bbox=_select_safety_bbox(plan),
     )
     if (
-        float(quality.get("mask_container_ratio", 0.0) or 0.0) > 0.45
-        or float(quality.get("mask_region_ratio", 0.0) or 0.0) > 0.36
+        float(quality.get("mask_container_ratio", 0.0) or 0.0) > (0.55 if flat_light_target else 0.45)
+        or float(quality.get("mask_region_ratio", 0.0) or 0.0) > (0.44 if flat_light_target else 0.36)
         or (
-            float(quality.get("rectangularity", 0.0) or 0.0) > 0.70
-            and float(quality.get("mask_region_ratio", 0.0) or 0.0) > 0.18
+            float(quality.get("rectangularity", 0.0) or 0.0) > (0.82 if flat_light_target else 0.70)
+            and float(quality.get("mask_region_ratio", 0.0) or 0.0) > (0.24 if flat_light_target else 0.18)
         )
     ):
         return None, 0
@@ -4100,6 +4893,7 @@ def build_cleanup_plan(
                     else:
                         plan.background_model = "flat_colored"
                     plan.debug_metrics["background_override"] = "solid_container_recheck"
+        _try_adopt_existing_safe_rect_container(img_cv, plan)
         if plan.background_model == "translucent_gradient":
             detail_score = _translucent_detail_score(bg_metrics)
             plan.debug_metrics["translucent_detail_score"] = detail_score
@@ -4437,6 +5231,31 @@ def execute_cleanup_plan(
                 residual = _score_cleanup_residual(img_cv, result, plan, retry_mask)
                 plan.debug_metrics["residual_score"] = residual
         plan.debug_metrics["retry_used"] = retry_used
+        residual_components = _detect_cleanup_residual_components(img_cv, result, plan, mask)
+        component_retry = residual_components.pop("residual_retry_mask", None)
+        if int(residual_components.get("residual_component_count", 0) or 0) > 0:
+            plan.debug_metrics.update(residual_components)
+            authoritative = int(residual_components.get("residual_component_authoritative_count", 0) or 0) > 0
+            if bool(residual_components.get("residual_retry_safe", False)) and component_retry is not None and np.any(component_retry):
+                retry_used = True
+                union_retry = cv2.bitwise_or((mask > 0).astype(np.uint8) * 255, component_retry)
+                plan.cleanup_mask = union_retry
+                _execute_flat_fill(img_cv, result, union_retry, plan)
+                residual = _score_cleanup_residual(img_cv, result, plan, union_retry)
+                plan.debug_metrics["residual_score"] = residual
+                after_components = _detect_cleanup_residual_components(img_cv, result, plan, union_retry)
+                after_components.pop("residual_retry_mask", None)
+                after_components["residual_component_retry_used"] = True
+                plan.debug_metrics.update(after_components)
+                authoritative = int(after_components.get("residual_component_authoritative_count", 0) or 0) > 0
+                mask = union_retry
+            if authoritative:
+                _mark_residual_review(plan)
+            else:
+                plan.debug_metrics["cleanup_warning_reason"] = "residual_component_low_confidence"
+        else:
+            plan.debug_metrics.update(residual_components)
+        plan.debug_metrics["retry_used"] = retry_used
         if bool(residual.get("bad", False)):
             _mark_residual_review(plan)
         plan.debug_metrics["final_cleanup_decision"] = {
@@ -4681,6 +5500,18 @@ def _cleanup_debug_meta(
         "cleanup_execution": backend_label,
         "cleanup_backend": cleanup_backend,
         "manual_mask_used": bool(plan.debug_metrics.get("manual_mask_used", False)),
+        "diagnostic_only": bool(plan.debug_metrics.get("diagnostic_only", False)),
+        "diagnostic_cleanup_ran": bool(plan.debug_metrics.get("diagnostic_cleanup_ran", False)),
+        "destructive_cleanup_executed": bool(plan.debug_metrics.get("destructive_cleanup_executed", False)),
+        "production_patch_accepted": bool(plan.debug_metrics.get("production_patch_accepted", False)),
+        "proposal_valid": bool(plan.debug_metrics.get("proposal_valid", False)),
+        "proposal_failure_reason": str(plan.debug_metrics.get("proposal_failure_reason", "") or "") or None,
+        "cleanup_failure_reason": str(plan.debug_metrics.get("cleanup_failure_reason", "") or "") or None,
+        "gate_violation": bool(plan.debug_metrics.get("gate_violation", False)),
+        "residual_text_visible": bool(plan.debug_metrics.get("residual_text_visible", False)),
+        "visual_quality_ok": bool(plan.debug_metrics.get("visual_quality_ok", True)),
+        "fill_patch_visible": bool(plan.debug_metrics.get("fill_patch_visible", False)),
+        "cleanup_effective": bool(plan.debug_metrics.get("cleanup_effective", False)),
         "bbox_like_or_full_rectangle_rejected": bool(
             "bbox_matches" in str(plan.skip_reason or "")
             or "rectangular" in str(plan.skip_reason or "")
@@ -5364,6 +6195,18 @@ def summarize_cleanup_plan(plan: "CleanupPlan") -> Dict[str, Any]:
         "cleanup_safe_rect":     [int(v) for v in safe_rect] if safe_rect is not None else None,
         "cleanup_safe_rect_confidence": round(safe_conf, 4),
         "cleanup_safe_rect_reason":     safe_reason,
+        "diagnostic_only":       bool(plan.debug_metrics.get("diagnostic_only", False)),
+        "diagnostic_cleanup_ran": bool(plan.debug_metrics.get("diagnostic_cleanup_ran", False)),
+        "destructive_cleanup_executed": bool(plan.debug_metrics.get("destructive_cleanup_executed", False)),
+        "production_patch_accepted": bool(plan.debug_metrics.get("production_patch_accepted", False)),
+        "proposal_valid":       bool(plan.debug_metrics.get("proposal_valid", False)),
+        "proposal_failure_reason": str(plan.debug_metrics.get("proposal_failure_reason", "") or ""),
+        "cleanup_failure_reason": str(plan.debug_metrics.get("cleanup_failure_reason", "") or ""),
+        "gate_violation":       bool(plan.debug_metrics.get("gate_violation", False)),
+        "residual_text_visible": bool(plan.debug_metrics.get("residual_text_visible", False)),
+        "visual_quality_ok":    bool(plan.debug_metrics.get("visual_quality_ok", True)),
+        "fill_patch_visible":   bool(plan.debug_metrics.get("fill_patch_visible", False)),
+        "cleanup_effective":    bool(plan.debug_metrics.get("cleanup_effective", False)),
         "region_bbox":           list(plan.region_bbox) if plan.region_bbox else None,
         "container_bbox":        list(plan.container_bbox) if plan.container_bbox else None,
     }
