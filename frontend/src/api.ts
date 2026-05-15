@@ -54,8 +54,8 @@ type PywebviewBridge = {
     reveal_export_folder: ()                              => Promise<ApiResponse>;
     get_page_image:       (idx: number, mode?: "best" | "raw" | "cleaned" | "typeset") => Promise<ApiResponse & { b64: string | null }>;
     update_region:        (idx: number, field: string, value: unknown) => Promise<BootstrapResponse>;
-    update_region_bbox:   (idx: number, x: number, y: number, w: number, h: number) => Promise<BootstrapResponse>;
-    get_region_preview_sprite: (idx: number, draft?: Record<string, unknown>) => Promise<RegionPreviewSprite>;
+    update_region_bbox:   (idx: number, x: number, y: number, w: number, h: number, pageIdx?: number | null) => Promise<BootstrapResponse>;
+    get_region_preview_sprite: (idx: number, draft?: Record<string, unknown>, pageIdx?: number | null) => Promise<RegionPreviewSprite>;
     list_fonts:           ()                              => Promise<FontOptionsResponse>;
     add_region:           (x: number, y: number, w: number, h: number, text?: string) => Promise<BootstrapResponse>;
     delete_region:        (idx: number, yoloRejectReason?: string) => Promise<BootstrapResponse>;
@@ -296,11 +296,11 @@ const api = {
   updateRegion: (idx: number, field: string, value: unknown) =>
     call(() => getBridge().update_region(idx, field, value)),
 
-  updateRegionBBox: (idx: number, x: number, y: number, w: number, h: number) =>
-    call(() => getBridge().update_region_bbox(idx, x, y, w, h)),
+  updateRegionBBox: (idx: number, x: number, y: number, w: number, h: number, pageIdx?: number | null) =>
+    call(() => getBridge().update_region_bbox(idx, x, y, w, h, pageIdx ?? null)),
 
-  getRegionPreviewSprite: (idx: number, draft: Record<string, unknown> = {}) =>
-    call(() => getBridge().get_region_preview_sprite(idx, draft)),
+  getRegionPreviewSprite: (idx: number, draft: Record<string, unknown> = {}, pageIdx?: number | null) =>
+    call(() => getBridge().get_region_preview_sprite(idx, draft, pageIdx ?? null)),
 
   listFonts: () =>
     call(() => getBridge().list_fonts()),

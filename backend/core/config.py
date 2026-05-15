@@ -41,9 +41,10 @@ class ModelConfig:
 
     # Cleanup backend abstraction. LaMa can be wired later without making it a
     # required dependency.
-    cleanup_backend: str = "opencv"
+    cleanup_backend: str = "lama_pt"
     iopaint_url: str = ""
     lama_model_path: str = ""
+    max_tile_size: int = 1024
     cleanup_debug_artifacts: bool = False
     cleanup_debug_dir: str = ""
     auto_clean_sfx: bool = False

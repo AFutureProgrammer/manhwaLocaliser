@@ -1,5 +1,8 @@
 import unittest
+import builtins
+import os
 import sys
+import tempfile
 import types
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +18,8 @@ from backend.core.cleanup_plan import (
     clamp_cleanup_outcome_fields,
     cleanup_production_patch_allowed,
     execute_cleanup_plan,
+    select_strategy,
+    _execute_telea,
     _constrain_flat_fill_boundary_mask,
     validate_cleanup_proposal,
 )
@@ -341,6 +346,7 @@ class CleanupPipelineTests(unittest.TestCase):
 
     def test_halftone_texture_opencv_policy_is_review_only(self):
         cfg = ModelConfig()
+        cfg.cleanup_backend = "opencv"
         cfg.cleanup_allow_texture_inpaint = True
         cfg.cleanup_fallback_backend = "telea"
         img = _halftone_bubble_page()
@@ -351,6 +357,40 @@ class CleanupPipelineTests(unittest.TestCase):
         self.assertEqual(plan.background_model, "halftone_texture")
         self.assertEqual(plan.cleanup_strategy, "review")
         self.assertEqual(plan.inpaint_method, "skip")
+
+    def test_lama_backend_routes_halftone_bubble_to_model_inpaint(self):
+        cfg = ModelConfig()
+        cfg.cleanup_backend = "lama_pt"
+        img = _halftone_bubble_page()
+        block = _dialogue_block((40, 40, 180, 100), kind=RegionKind.TEXTURED_BUBBLE)
+
+        plan = build_cleanup_plan(img, block, page_index=0, region_id="R-01", model_config=cfg)
+
+        self.assertEqual(plan.background_model, "halftone_texture")
+        self.assertEqual(plan.cleanup_backend, "lama_pt")
+        self.assertEqual(plan.cleanup_strategy, "texture_clone")
+        self.assertEqual(plan.inpaint_method, "telea")
+        self.assertIsNotNone(plan.cleanup_mask)
+        self.assertEqual(plan.debug_metrics.get("cleanup_route"), "model_inpaint")
+
+    def test_aggressive_halftone_caption_attempts_cleanup_with_review_flag(self):
+        cfg = ModelConfig()
+        cfg.cleanup_mode = "aggressive"
+        cfg.cleanup_backend = "opencv"
+        cfg.cleanup_allow_texture_inpaint = True
+        cfg.cleanup_fallback_backend = "telea"
+        cfg.cleanup_risky_action = "attempt"
+        img = _halftone_bubble_page()
+        block = _caption_block((40, 40, 180, 100))
+
+        plan = build_cleanup_plan(img, block, page_index=0, region_id="R-01", model_config=cfg)
+
+        self.assertEqual(plan.background_model, "halftone_texture")
+        self.assertEqual(plan.cleanup_strategy, "texture_clone")
+        self.assertEqual(plan.inpaint_method, "telea")
+        self.assertIsNotNone(plan.cleanup_mask)
+        self.assertTrue(plan.debug_metrics.get("review_required_after_cleanup"))
+        self.assertIn("aggressive_review_attempt", plan.debug_metrics)
 
     def test_halftone_texture_prefers_iopaint_when_configured(self):
         cfg = ModelConfig()
@@ -495,6 +535,23 @@ class CleanupPipelineTests(unittest.TestCase):
         self.assertTrue(resp["candidates"])
         self.assertTrue(all(not c["is_available"] for c in resp["candidates"]))
         self.assertTrue(all("protected_sfx" in c["unavailable_reason"] for c in resp["candidates"]))
+
+    def test_sfx_region_class_override_does_not_enable_pipeline_cleanup(self):
+        cfg = ModelConfig()
+        cfg.process_sfx_regions = False
+        cfg.cleanup_allow_sfx_cleanup = False
+        block = _protected_art_block((35, 35, 185, 85), RegionKind.SFX_OVER_ART, "sfx")
+        block.override = RegionOverride(cleanup_region_class="sfx")
+        engine, page, raw = _cleanup_engine_for_blocks([block], cfg)
+        engine._progress_ctx = {}
+        engine._active_op_depth = 0
+        engine._active_ops = set()
+        engine._active_op_names = []
+
+        engine.cleanup_current_page()
+
+        self.assertTrue(page.cleaned_cv is None or np.array_equal(page.cleaned_cv, raw))
+        self.assertEqual(getattr(page, "cleanup_patches", []) or [], [])
 
     def test_protected_region_candidates_unavailable_by_default(self):
         cfg = ModelConfig()
@@ -981,6 +1038,23 @@ class CleanupPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(plan.text_mask_confidence, 0.25)
         self.assertLess(plan.debug_metrics["quality"]["mask_container_ratio"], 0.35)
 
+    def test_low_confidence_dark_caption_still_uses_flat_fill(self):
+        strategy, method = select_strategy("caption_box", "dark_bubble", 0.22, 0.20)
+
+        self.assertEqual(strategy, "flat_fill")
+        self.assertEqual(method, "local_sample")
+
+    def test_forced_telea_accepts_bool_mask(self):
+        img = np.full((32, 32, 3), 220, np.uint8)
+        img[10:20, 10:20] = 20
+        result = img.copy()
+        mask = np.zeros((32, 32), dtype=bool)
+        mask[10:20, 10:20] = True
+
+        _execute_telea(result, mask)
+
+        self.assertGreater(int(np.count_nonzero(result != img)), 0)
+
     def test_partial_caption_container_does_not_clip_cleanup_mask(self):
         img = _dark_caption_page((24, 24, 24))
         block = _caption_block((40, 45, 181, 51))
@@ -1362,6 +1436,153 @@ class CleanupPipelineTests(unittest.TestCase):
         self.assertEqual(engine._ocr_composite_crop(crop, "cp-test"), "이어진 말")
         self.assertEqual(calls["paddle"], 1)
 
+    def test_cross_page_pair_only_mutates_after_stitched_ocr_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page0_path = os.path.join(tmp, "p0.png")
+            page1_path = os.path.join(tmp, "p1.png")
+            cv2.imwrite(page0_path, _white_bubble_page())
+            cv2.imwrite(page1_path, _white_bubble_page())
+
+            engine = LocalizerEngine.__new__(LocalizerEngine)
+            engine.model_config = SimpleNamespace(cross_page_merge_sfx=False)
+            engine._raw_cv = cv2.imread(page0_path)
+            primary = _dialogue_block((80, 140, 90, 38), text="앞")
+            secondary = _dialogue_block((80, 0, 90, 38), text="뒤")
+            engine._regions = [primary]
+            engine._translations = ["old primary"]
+            engine.chapter_mgr = ChapterManager()
+            engine.chapter_mgr.pages = [
+                ChapterPage(image_path=page0_path),
+                ChapterPage(image_path=page1_path),
+            ]
+            engine.chapter_mgr.pages[0].regions = engine._regions
+            engine.chapter_mgr.pages[0].translations = engine._translations
+            engine.chapter_mgr.pages[1].regions = [secondary]
+            engine.chapter_mgr.pages[1].translations = ["stale secondary"]
+            engine.chapter_mgr.current_idx = 0
+            engine._ocr_composite_crop = lambda *_args, **_kwargs: ""
+
+            engine._try_cross_page_ocr_groups(0)
+
+            self.assertFalse(primary.cross_page)
+            self.assertFalse(secondary.cross_page)
+            self.assertEqual(primary.text, "앞")
+            self.assertEqual(secondary.text, "뒤")
+            self.assertEqual(engine.chapter_mgr.pages[1].translations[0], "stale secondary")
+
+            engine._ocr_composite_crop = lambda *_args, **_kwargs: "앞 뒤"
+            engine._try_cross_page_ocr_groups(0)
+
+            self.assertTrue(primary.cross_page)
+            self.assertEqual(primary.text, "앞 뒤")
+            self.assertTrue(engine._is_cross_page_secondary(secondary))
+            self.assertEqual(secondary.text, "")
+            self.assertEqual(engine.chapter_mgr.pages[1].translations[0], "")
+            self.assertEqual(primary.cross_page_pages, [0, 1])
+            self.assertIn(0, primary.page_local_bboxes)
+            self.assertIn(1, primary.page_local_bboxes)
+
+    def test_cross_page_candidates_ignore_mid_page_masks(self):
+        engine = LocalizerEngine.__new__(LocalizerEngine)
+        engine.chapter_mgr = ChapterManager()
+        engine.chapter_mgr.current_idx = 0
+        engine._raw_cv = _white_bubble_page()
+        mid_page = _dialogue_block((80, 70, 90, 38), text="middle")
+
+        candidates = engine._log_cross_page_candidates(0, [mid_page], engine._raw_cv)
+
+        self.assertEqual(candidates["top"], [])
+        self.assertEqual(candidates["bottom"], [])
+
+    def test_cross_page_secondary_cannot_be_reused_as_next_primary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for i in range(3):
+                path = os.path.join(tmp, f"p{i}.png")
+                cv2.imwrite(path, _white_bubble_page())
+                paths.append(path)
+
+            engine = LocalizerEngine.__new__(LocalizerEngine)
+            engine.model_config = SimpleNamespace(cross_page_merge_sfx=False)
+            engine.chapter_mgr = ChapterManager()
+            engine.chapter_mgr.pages = [ChapterPage(image_path=p) for p in paths]
+            p0_bottom = _dialogue_block((80, 140, 90, 38), text="p0")
+            p1_top = _dialogue_block((80, 0, 90, 38), text="p1 top")
+            p1_bottom = _dialogue_block((80, 140, 90, 38), text="p1 bottom")
+            p2_top = _dialogue_block((80, 0, 90, 38), text="p2")
+            engine.chapter_mgr.pages[0].regions = [p0_bottom]
+            engine.chapter_mgr.pages[0].translations = [""]
+            engine.chapter_mgr.pages[1].regions = [p1_top, p1_bottom]
+            engine.chapter_mgr.pages[1].translations = ["stale", ""]
+            engine.chapter_mgr.pages[2].regions = [p2_top]
+            engine.chapter_mgr.pages[2].translations = [""]
+            engine._ocr_composite_crop = lambda *_args, **_kwargs: "stitched"
+
+            engine.chapter_mgr.current_idx = 0
+            engine._raw_cv = cv2.imread(paths[0])
+            engine._regions = engine.chapter_mgr.pages[0].regions
+            engine._translations = engine.chapter_mgr.pages[0].translations
+            engine._try_cross_page_ocr_groups(0)
+
+            self.assertTrue(engine._is_cross_page_secondary(p1_top))
+
+            engine.chapter_mgr.current_idx = 1
+            engine._raw_cv = cv2.imread(paths[1])
+            engine._regions = engine.chapter_mgr.pages[1].regions
+            engine._translations = engine.chapter_mgr.pages[1].translations
+            engine._try_cross_page_ocr_groups(1)
+
+            self.assertTrue(engine._is_cross_page_secondary(p1_top))
+            self.assertFalse(p1_top.cross_page_group_id == p1_bottom.cross_page_group_id)
+            self.assertTrue(p1_bottom.cross_page)
+            self.assertTrue(engine._is_cross_page_secondary(p2_top))
+
+    def test_cross_page_primary_bbox_edit_updates_page_local_geometry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page0_path = os.path.join(tmp, "p0.png")
+            page1_path = os.path.join(tmp, "p1.png")
+            cv2.imwrite(page0_path, _white_bubble_page())
+            cv2.imwrite(page1_path, _white_bubble_page())
+
+            engine = LocalizerEngine.__new__(LocalizerEngine)
+            engine.model_config = ModelConfig()
+            engine._raw_cv = cv2.imread(page0_path)
+            engine._progress_ctx = {}
+            engine._active_op_depth = 0
+            engine._active_ops = set()
+            engine._active_op_names = []
+            engine._undo_stack = []
+            engine._memory_hits = {}
+            engine._consistency_warnings = []
+            engine._notify = lambda *args, **kwargs: None
+            block = _dialogue_block((80, 140, 90, 38), text="stitched")
+            block.cross_page = True
+            block.cross_page_group_id = "cp-0-0-1-0"
+            block.cross_page_pages = [0, 1]
+            block.page_local_bboxes = {0: (80, 140, 90, 38), 1: (80, 0, 90, 38)}
+            block.composite_bbox = (80, 140, 90, 78)
+            engine._regions = [block]
+            engine._translations = ["combined"]
+            engine.chapter_mgr = ChapterManager()
+            engine.chapter_mgr.pages = [
+                ChapterPage(image_path=page0_path),
+                ChapterPage(image_path=page1_path),
+            ]
+            engine.chapter_mgr.pages[0].regions = engine._regions
+            engine.chapter_mgr.pages[0].translations = engine._translations
+            engine.chapter_mgr.pages[1].regions = []
+            engine.chapter_mgr.pages[1].translations = []
+            engine.chapter_mgr.current_idx = 0
+            engine.chapter_mgr.request_save_state = lambda: None
+            engine.get_bootstrap = lambda: {"ok": True}
+
+            engine.update_region_bbox(0, 90, 10, 90, 38, page_idx=1)
+
+            self.assertEqual(block.page_local_bboxes[1], (90, 10, 90, 38))
+            self.assertEqual(block.page_local_bboxes[0], (90, 142, 90, 38))
+            self.assertEqual(block.bbox(), (90, 142, 90, 38))
+            self.assertEqual(block.composite_bbox, (90, 142, 90, 86))
+
     def test_cross_page_cleanup_without_context_does_not_recurse(self):
         engine = LocalizerEngine.__new__(LocalizerEngine)
         engine.model_config = ModelConfig()
@@ -1413,6 +1634,11 @@ class CleanupPipelineTests(unittest.TestCase):
 
     def test_cross_page_secondary_survives_serialization(self):
         block = _dialogue_block((40, 40, 180, 100))
+        block.cross_page = True
+        block.cross_page_group_id = "cp-0-0-1-0"
+        block.cross_page_pages = [0, 1]
+        block.composite_bbox = (40, 160, 180, 120)
+        block.page_local_bboxes = {0: (40, 160, 180, 20), 1: (40, 0, 180, 100)}
         block.cleanup_meta["cross_page_secondary"] = True
         block.typeset_meta["cross_page_secondary"] = True
 
@@ -1420,6 +1646,11 @@ class CleanupPipelineTests(unittest.TestCase):
         engine = LocalizerEngine.__new__(LocalizerEngine)
 
         self.assertTrue(engine._is_cross_page_secondary(restored))
+        self.assertEqual(restored.cross_page_group_id, "cp-0-0-1-0")
+        self.assertEqual(restored.cross_page_pages, [0, 1])
+        self.assertEqual(restored.composite_bbox, (40, 160, 180, 120))
+        self.assertEqual(restored.page_local_bboxes[0], (40, 160, 180, 20))
+        self.assertEqual(restored.page_local_bboxes[1], (40, 0, 180, 100))
 
     def test_typeset_noops_when_only_sfx_is_skipped(self):
         engine = LocalizerEngine.__new__(LocalizerEngine)
@@ -1429,6 +1660,28 @@ class CleanupPipelineTests(unittest.TestCase):
         block.bubble_role = "sfx"
         block.yolo_kind = "sfx"
         block.yolo_class_id = 2
+        engine._regions = [block]
+        engine._translations = [""]
+        engine.chapter_mgr = ChapterManager()
+        engine.chapter_mgr.pages = [ChapterPage(image_path="")]
+        engine.chapter_mgr.current_idx = 0
+        engine.chapter_mgr.save_state = lambda: None
+        engine._progress_ctx = {}
+        engine._notify = lambda *args, **kwargs: None
+        engine._flush_working_state_to_page = lambda: None
+        engine.get_bootstrap = lambda: {"ok": True}
+
+        resp = engine.typeset_current_page()
+
+        self.assertTrue(resp["ok"])
+        self.assertIsNotNone(engine.chapter_mgr.current_page.typeset_pil)
+        self.assertFalse(engine.chapter_mgr.current_page.render_dirty)
+
+    def test_typeset_noops_when_regions_have_no_ocr_text(self):
+        engine = LocalizerEngine.__new__(LocalizerEngine)
+        engine.model_config = SimpleNamespace(process_sfx_regions=False)
+        engine._raw_cv = _white_bubble_page()
+        block = _dialogue_block((40, 40, 180, 100), text="")
         engine._regions = [block]
         engine._translations = [""]
         engine.chapter_mgr = ChapterManager()
@@ -1462,6 +1715,59 @@ class CleanupPipelineTests(unittest.TestCase):
         resp = engine.ocr_current_page()
 
         self.assertTrue(resp["ok"])
+
+    def test_translation_slots_trim_to_region_count(self):
+        engine = LocalizerEngine.__new__(LocalizerEngine)
+        engine._regions = [_dialogue_block((40, 40, 180, 100))]
+        engine._translations = ["current", "stale"]
+
+        engine._sync_translation_slots()
+
+        self.assertEqual(engine._translations, ["current"])
+
+    def test_run_all_processes_each_page_through_all_steps_before_next_page(self):
+        engine = LocalizerEngine.__new__(LocalizerEngine)
+        calls = []
+        chapter_mgr = SimpleNamespace(
+            pages=[ChapterPage(image_path="p0.png"), ChapterPage(image_path="p1.png")],
+            current_idx=0,
+            total_pages=lambda: 2,
+            save_state=lambda: None,
+            save_run_all_checkpoint=lambda checkpoint: None,
+            clear_run_all_checkpoint=lambda: None,
+        )
+        engine.chapter_mgr = chapter_mgr
+        engine._progress_ctx = {}
+        engine._active_op_depth = 0
+        engine._active_ops = set()
+        engine._notify = lambda *args, **kwargs: None
+        engine._set_progress = lambda **updates: engine._progress_ctx.update(updates)
+        engine._begin_active_operation = lambda name: None
+        engine._end_active_operation = lambda name: None
+        engine.get_bootstrap = lambda: {"ok": True}
+
+        def go_to_page(idx):
+            chapter_mgr.current_idx = idx
+            calls.append(("go", idx))
+
+        engine.go_to_page = go_to_page
+        for step in ("detect", "ocr", "translate", "cleanup", "typeset"):
+            setattr(
+                engine,
+                f"{step}_current_page" if step != "detect" else "detect_current_page",
+                lambda step=step: calls.append((step, chapter_mgr.current_idx)) or {"ok": True},
+            )
+
+        engine._run_all_steps_from(None, 0)
+
+        step_calls = [call for call in calls if call[0] != "go"]
+        self.assertEqual(
+            step_calls,
+            [
+                ("detect", 0), ("ocr", 0), ("translate", 0), ("cleanup", 0), ("typeset", 0),
+                ("detect", 1), ("ocr", 1), ("translate", 1), ("cleanup", 1), ("typeset", 1),
+            ],
+        )
 
     def test_sfx_font_fallback_uses_bold_when_primary_fails_sanity(self):
         calls = []
@@ -1508,6 +1814,63 @@ class CleanupPipelineTests(unittest.TestCase):
         self.assertIn("iopaint_fallback", plan.debug_metrics["cleanup_backend_fallback"])
         _assert_changed_pixels_within_mask(self, img, result, plan.cleanup_mask)
 
+    def test_force_telea_bypasses_external_backend(self):
+        img = _white_bubble_page()
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        mask[80:95, 95:120] = 255
+        plan = CleanupPlan(
+            region_id="R-01",
+            region_bbox=(40, 40, 180, 100),
+            region_class="speech_bubble",
+            background_model="busy_art",
+            cleanup_strategy="mask_inpaint",
+            inpaint_method="telea",
+            cleanup_mask=mask,
+            cleanup_backend="lama_pt",
+        )
+        plan.debug_metrics["cleanup_override_mode"] = "force_telea"
+        result = img.copy()
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "simple_lama_inpainting":
+                raise AssertionError("force_telea should not import LaMa")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=guarded_import):
+            execute_cleanup_plan(img, result, plan)
+
+        self.assertNotIn("cleanup_backend_fallback", plan.debug_metrics)
+        _assert_changed_pixels_within_mask(self, img, result, plan.cleanup_mask)
+
+    def test_lama_backend_runs_before_flat_fill_for_solid_bubbles(self):
+        img = _white_bubble_page()
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        mask[80:95, 95:120] = 255
+        plan = CleanupPlan(
+            region_id="R-01",
+            region_bbox=(40, 40, 180, 100),
+            region_class="speech_bubble",
+            background_model="flat_light",
+            cleanup_strategy="flat_fill",
+            inpaint_method="local_sample",
+            cleanup_mask=mask,
+            cleanup_backend="lama_pt",
+        )
+        result = img.copy()
+
+        def fake_lama(img_cv, out, cleanup_mask, cleanup_plan):
+            out[cleanup_mask > 0] = (12, 34, 56)
+            cleanup_plan.debug_metrics["fake_lama_used"] = True
+            return True
+
+        with patch("backend.core.cleanup_plan._try_external_inpaint_backend", side_effect=fake_lama):
+            execute_cleanup_plan(img, result, plan)
+
+        self.assertTrue(plan.debug_metrics.get("fake_lama_used"))
+        self.assertFalse(np.array_equal(img[mask > 0], result[mask > 0]))
+        _assert_changed_pixels_within_mask(self, img, result, plan.cleanup_mask)
+
     def test_sam2_purges_conflicting_torchvision_namespace(self):
         names = [name for name in list(sys.modules) if name in {"torch", "torchvision", "sam2"} or name.startswith(("torch.", "torchvision.", "sam2."))]
         saved = {name: sys.modules[name] for name in names}
@@ -1542,6 +1905,16 @@ class CleanupPipelineTests(unittest.TestCase):
         self.assertIn("Could not import torch/SAM2", err)
         self.assertIn("Retried after clearing conflicting modules", err)
         self.assertIn("Restart the app", err)
+
+    def test_sam2_auto_device_does_not_probe_cuda(self):
+        class BrokenCuda:
+            @staticmethod
+            def is_available():
+                raise RuntimeError("cudnnGetLibConfig")
+
+        fake_torch = SimpleNamespace(cuda=BrokenCuda())
+
+        self.assertEqual(sam2_mask._select_device(fake_torch, "auto"), "cpu")
 
     def test_yolo_overlap_merge_unions_duplicate_regions(self):
         detections = [

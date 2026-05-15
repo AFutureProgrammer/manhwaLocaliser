@@ -52,9 +52,36 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+import gc
+import tempfile
+
 import cv2
 import numpy as np
 import requests
+
+# ── Optional AI/hardware dependencies (graceful fallback when absent) ──────────
+ort = None
+_ONNX_AVAILABLE = False
+
+
+def _get_onnxruntime():
+    global ort, _ONNX_AVAILABLE
+    if ort is not None:
+        return ort
+    try:
+        import onnxruntime as _ort  # type: ignore[import]
+    except ImportError:  # pragma: no cover
+        _ONNX_AVAILABLE = False
+        return None
+    ort = _ort
+    _ONNX_AVAILABLE = True
+    return ort
+
+try:
+    import psutil as _psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PSUTIL_AVAILABLE = False
 
 from backend.core.constants import debug_print
 
@@ -103,10 +130,13 @@ class CleanupPlan:
     # flat_fill | gradient_fill | texture_clone | mask_inpaint | skip | review
     inpaint_method:   str = "none"
     # telea | ns | idw_lab | local_sample | skip
-    cleanup_backend: str = "opencv"
-    iopaint_url: str = ""
-    skip_reason:  str = ""
-    cache_key:    str = ""
+    cleanup_backend:   str = "opencv"
+    # "opencv" | "iopaint" | "lama_onnx"
+    iopaint_url:       str = ""
+    lama_model_path:   str = ""   # path to lama.onnx (used when backend="lama_onnx")
+    max_tile_size:     int = 1024 # tiling engine tile width/height (px)
+    skip_reason:       str = ""
+    cache_key:         str = ""
 
     # ── Debug ─────────────────────────────────────────────────────────────────
     debug_metrics: Dict[str, Any] = field(default_factory=dict)
@@ -317,6 +347,453 @@ class CleanupPolicy:
             self.t2_text_conf = 0.25
             self.t2_max_mask_region_ratio = 0.28
             self.t2_max_border_touch = 0.35
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Merged from manga-cleaner (NeTRuNNeRGLiTCH/manga-cleaner)
+# Features: ONNXEngine, AIManager, LamaTilingEngine (4K tiling + Gaussian seam
+#           blending + VRAM guard), SystemMonitor, PhotoshopBridge, BatchEngine.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ── Hardware-aware ONNX inference session ─────────────────────────────────────
+
+class ONNXEngine:
+    """
+    Thin wrapper around an ONNX Runtime session.
+
+    Tries CUDA first; falls back to CPU automatically.
+    Can be used without the rest of cleanup_plan as long as _ONNX_AVAILABLE=True.
+    """
+
+    def __init__(self, model_path: str) -> None:
+        ort_mod = _get_onnxruntime()
+        if ort_mod is None:
+            raise ImportError(
+                "onnxruntime is not installed. "
+                "Run: pip install onnxruntime-gpu  (or onnxruntime for CPU-only)"
+            )
+        providers = ort_mod.get_available_providers()
+
+        sess_opt = ort_mod.SessionOptions()
+        sess_opt.enable_mem_pattern = False
+        sess_opt.execution_mode = ort_mod.ExecutionMode.ORT_SEQUENTIAL
+
+        self.device = "CPU"
+        if "CUDAExecutionProvider" in providers:
+            try:
+                cuda_opts = {
+                    "device_id": 0,
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "do_copy_in_default_stream": True,
+                }
+                self.session = ort_mod.InferenceSession(
+                    model_path,
+                    sess_options=sess_opt,
+                    providers=[("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"],
+                )
+                self.device = "GPU"
+            except Exception as exc:
+                debug_print(f"ONNXEngine: CUDA init failed ({exc}), falling back to CPU")
+                self.session = ort_mod.InferenceSession(
+                    model_path,
+                    sess_options=sess_opt,
+                    providers=["CPUExecutionProvider"],
+                )
+        else:
+            self.session = ort_mod.InferenceSession(
+                model_path,
+                sess_options=sess_opt,
+                providers=["CPUExecutionProvider"],
+            )
+
+        self.input_names = [i.name for i in self.session.get_inputs()]
+        debug_print(f"ONNXEngine: ready device={self.device} model={model_path}")
+
+    def run(self, input_data):
+        if isinstance(input_data, dict):
+            return self.session.run(None, input_data)
+        return self.session.run(None, {self.input_names[0]: input_data})
+
+
+# ── Shared model resource manager ─────────────────────────────────────────────
+
+class AIManager:
+    """
+    Singleton-style model cache.
+
+    Keeps at most one model loaded at a time in non-persistent mode so VRAM is
+    released when switching between OCR and LaMa passes.
+    """
+
+    _lama_engine: Optional["ONNXEngine"] = None
+    _lama_model_path: str = ""
+    _persistent_mode: bool = False
+
+    @staticmethod
+    def set_persistence(enabled: bool) -> None:
+        AIManager._persistent_mode = enabled
+        if not enabled:
+            AIManager.flush()
+
+    @staticmethod
+    def get_lama(model_path: str) -> Optional["ONNXEngine"]:
+        if not model_path:
+            return None
+        if AIManager._lama_engine is None or AIManager._lama_model_path != model_path:
+            try:
+                AIManager._lama_engine = ONNXEngine(model_path)
+                AIManager._lama_model_path = model_path
+            except Exception as exc:
+                AIManager._lama_engine = None
+                AIManager._lama_model_path = ""
+                debug_print(f"AIManager: failed to load lama model: {exc}")
+                return None
+        return AIManager._lama_engine
+
+    @staticmethod
+    def flush() -> None:
+        AIManager._lama_engine = None
+        AIManager._lama_model_path = ""
+        gc.collect()
+        debug_print("AIManager: VRAM flushed – model memory released")
+
+
+# ── VRAM guard: compute safe tile size from available GPU memory ──────────────
+
+def _compute_safe_tile_size(
+    default_tile: int = 1024,
+    min_tile: int = 256,
+    bytes_per_pixel_estimate: int = 96,
+) -> int:
+    """
+    Return a tile size (square) that fits within ~60 % of available GPU memory.
+
+    *bytes_per_pixel_estimate* is conservative: image + mask + LaMa activations.
+    Falls back to *default_tile* when psutil or VRAM info is unavailable.
+    """
+    ort_mod = _get_onnxruntime()
+    if not _PSUTIL_AVAILABLE or ort_mod is None:
+        return default_tile
+    try:
+        providers = ort_mod.get_available_providers()
+        if "CUDAExecutionProvider" not in providers:
+            return default_tile
+        try:
+            import pynvml  # type: ignore[import]
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            free_bytes = int(mem.free * 0.60)
+        except Exception:
+            proc = _psutil.Process()
+            free_bytes = max(
+                256 * 1024 * 1024,
+                1024 * 1024 * 1024 - proc.memory_info().rss,
+            )
+            free_bytes = int(free_bytes * 0.60)
+        safe_px = int((free_bytes / bytes_per_pixel_estimate) ** 0.5)
+        safe_tile = max(min_tile, (safe_px // 32) * 32)
+        return min(safe_tile, default_tile)
+    except Exception:
+        return default_tile
+
+
+# ── LaMa ONNX tiling engine ───────────────────────────────────────────────────
+
+class LamaTilingEngine:
+    """
+    Runs LaMa inpainting (ONNX) over an arbitrary-size image via adaptive tiling.
+
+    Algorithm
+    ---------
+    1. Find connected components in *mask*.
+    2. For each blob (largest-first, de-duplicating via processed_mask):
+       a. Centre a tile of *max_tile_size* around the blob centroid.
+       b. Snap tile dims to a multiple of 8 (LaMa requirement).
+       c. Run the ONNX session on the padded tile.
+       d. Gaussian-weight the result and blend it back so tile seams vanish.
+    3. Return the reconstructed full-image array (uint8 RGB).
+    """
+
+    def __init__(self, engine: ONNXEngine, max_tile_size: int = 1024) -> None:
+        self.engine = engine
+        self.max_tile_size = max_tile_size
+
+    @staticmethod
+    def _gaussian_weight_map(h: int, w: int) -> np.ndarray:
+        cy, cx = h / 2.0, w / 2.0
+        sigma = min(h, w) / 4.0
+        ys = np.arange(h, dtype=np.float32)
+        xs = np.arange(w, dtype=np.float32)
+        yy, xx = np.meshgrid(ys, xs, indexing="ij")
+        d2 = ((yy - cy) ** 2 + (xx - cx) ** 2) / (2.0 * sigma ** 2 + 1e-9)
+        return np.exp(-d2).astype(np.float32)
+
+    @staticmethod
+    def _snap8(n: int) -> int:
+        return ((n + 7) // 8) * 8
+
+    def inpaint(
+        self,
+        img_rgb: np.ndarray,
+        mask: np.ndarray,
+        progress_callback=None,
+    ) -> np.ndarray:
+        """
+        Return an inpainted copy of *img_rgb* (H×W×3, uint8, RGB).
+
+        *mask* must be H×W uint8 with 255 = erase region.
+        """
+        h, w = img_rgb.shape[:2]
+        accum    = np.zeros((h, w, 3), dtype=np.float32)
+        weight   = np.zeros((h, w, 1), dtype=np.float32)
+        processed = np.zeros((h, w),   dtype=np.uint8)
+
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        blobs = [stats[i] for i in range(1, len(stats)) if stats[i, 4] > 5]
+        blobs = sorted(blobs, key=lambda s: s[4], reverse=True)
+        total = max(len(blobs), 1)
+
+        for idx, blob in enumerate(blobs):
+            bx, by, bw, bh, _ = blob
+            if np.all(processed[by:by + bh, bx:bx + bw] == 255):
+                continue
+
+            ts = self.max_tile_size
+            cx, cy = bx + bw // 2, by + bh // 2
+            x1 = max(0, min(cx - ts // 2, w - ts))
+            y1 = max(0, min(cy - ts // 2, h - ts))
+            x2 = min(w, x1 + ts)
+            y2 = min(h, y1 + ts)
+            x1 = max(0, x2 - ts)
+            y1 = max(0, y2 - ts)
+
+            tile_img  = img_rgb[y1:y2, x1:x2]
+            tile_mask = mask[y1:y2, x1:x2]
+            th, tw = tile_img.shape[:2]
+
+            ph = self._snap8(th)
+            pw = self._snap8(tw)
+            pad_h, pad_w = ph - th, pw - tw
+
+            inp_img = cv2.copyMakeBorder(
+                tile_img, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT
+            ).astype(np.float32) / 255.0
+            inp_img = np.transpose(inp_img, (2, 0, 1))[np.newaxis, :]
+
+            inp_mask = cv2.copyMakeBorder(
+                tile_mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT
+            )
+            inp_mask = (inp_mask > 127).astype(np.float32)[np.newaxis, np.newaxis, :]
+
+            res = self.engine.run({"image": inp_img, "mask": inp_mask})[0][0]
+            res = np.clip(np.transpose(res, (1, 2, 0)) * 255, 0, 255).astype(np.float32)
+            res = res[:th, :tw]
+
+            gmap = self._gaussian_weight_map(th, tw)[:, :, np.newaxis]
+            accum[y1:y2, x1:x2]  += res * gmap
+            weight[y1:y2, x1:x2] += gmap
+            processed[y1:y2, x1:x2] = 255
+
+            if progress_callback:
+                progress_callback(int((idx / total) * 100))
+
+        w_safe  = np.where(weight > 0, weight, 1.0)
+        blended = (accum / w_safe).astype(np.uint8)
+        out = img_rgb.copy()
+        out[mask > 0] = blended[mask > 0]
+        return out
+
+
+# ── System telemetry ──────────────────────────────────────────────────────────
+
+class SystemMonitor:
+    """Lightweight hardware telemetry used by the tiling engine and UI."""
+
+    def __init__(self) -> None:
+        self._proc = _psutil.Process() if _PSUTIL_AVAILABLE else None
+
+    def get_stats(self) -> Tuple[int, bool]:
+        """Return (app_ram_mb, gpu_active)."""
+        ram_mb = 0
+        if self._proc is not None:
+            try:
+                ram_mb = self._proc.memory_info().rss // (1024 * 1024)
+            except Exception:
+                pass
+        ort_mod = _get_onnxruntime()
+        gpu_active = bool(
+            ort_mod is not None
+            and "CUDAExecutionProvider" in ort_mod.get_available_providers()
+        )
+        return ram_mb, gpu_active
+
+    @staticmethod
+    def get_detailed_specs() -> Dict[str, Any]:
+        specs: Dict[str, Any] = {"engine": "CPU ONLY (Slow Mode)", "os": "unknown"}
+        if _PSUTIL_AVAILABLE:
+            try:
+                specs["ram"] = round(_psutil.virtual_memory().total / (1024 ** 3), 1)
+            except Exception:
+                specs["ram"] = "unknown"
+        ort_mod = _get_onnxruntime()
+        if ort_mod is not None:
+            if "CUDAExecutionProvider" in ort_mod.get_available_providers():
+                specs["engine"] = "NVIDIA CUDA (High Speed)"
+        import os as _os
+        specs["os"] = _os.name.upper()
+        return specs
+
+
+# ── Photoshop COM bridge (Windows only) ──────────────────────────────────────
+
+class PhotoshopBridge:
+    """
+    Automates Adobe Photoshop via win32com.
+
+    Available on Windows only; raises RuntimeError on other platforms.
+    """
+
+    @staticmethod
+    def _ps():
+        try:
+            import win32com.client  # type: ignore[import]
+            return win32com.client.Dispatch("Photoshop.Application")
+        except ImportError:
+            raise RuntimeError(
+                "pywin32 is not installed or not running on Windows. "
+                "PhotoshopBridge is unavailable."
+            )
+
+    @staticmethod
+    def send_to_ps(original_bgr: np.ndarray, cleaned_bgr: np.ndarray) -> str:
+        """
+        Open *original_bgr* in Photoshop and paste *cleaned_bgr* as a new layer.
+
+        Both arrays should be in BGR order (cv2 convention).
+        Returns "Success" or an error string.
+        """
+        import os as _os
+        try:
+            ps  = PhotoshopBridge._ps()
+            tmp = tempfile.gettempdir()
+            orig_file  = _os.path.join(tmp, "mc_transfer_orig.jpg")
+            clean_file = _os.path.join(tmp, "mc_transfer_clean.jpg")
+            cv2.imwrite(orig_file,  original_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
+            cv2.imwrite(clean_file, cleaned_bgr,  [int(cv2.IMWRITE_JPEG_QUALITY), 98])
+            ps.Open(orig_file)
+            doc = ps.ActiveDocument
+            doc.ActiveLayer.Name = "Original"
+            ps.Open(clean_file)
+            ps.ActiveDocument.Selection.SelectAll()
+            ps.ActiveDocument.Selection.Copy()
+            ps.ActiveDocument.Close(2)
+            doc.Paste()
+            doc.ActiveLayer.Name = "MangaCleaner_Result"
+            return "Success"
+        except Exception as exc:
+            return str(exc)
+
+    @staticmethod
+    def open_batch_in_ps(orig_paths: List[str], clean_dir: str) -> bool:
+        """Open every original/cleaned page pair as layered documents in Photoshop."""
+        import os as _os
+        try:
+            ps = PhotoshopBridge._ps()
+            debug_print(f"PhotoshopBridge: batch {len(orig_paths)} pages → {clean_dir}")
+            for i, orig_path in enumerate(orig_paths):
+                ps.Open(orig_path)
+                doc = ps.ActiveDocument
+                doc.ActiveLayer.Name = f"Page_{i + 1}_Original"
+                base  = _os.path.splitext(_os.path.basename(orig_path))[0]
+                cpath = _os.path.join(clean_dir, f"{base}_cleaned.jpg")
+                if _os.path.exists(cpath):
+                    ps.Open(cpath)
+                    ps.ActiveDocument.Selection.SelectAll()
+                    ps.ActiveDocument.Selection.Copy()
+                    ps.ActiveDocument.Close(2)
+                    doc.Paste()
+                    doc.ActiveLayer.Name = f"Page_{i + 1}_Cleaned"
+                debug_print(f"PhotoshopBridge: page {i + 1} merged")
+            return True
+        except Exception as exc:
+            debug_print(f"PhotoshopBridge: batch failed: {exc}")
+            return False
+
+
+# ── Batch processing engine ───────────────────────────────────────────────────
+
+class BatchEngine:
+    """
+    Manages an ordered list of image files to process and save.
+
+    Typical usage::
+
+        engine = BatchEngine()
+        out_dir = engine.initialize_batch(paths, export_format="jpg")
+        while (path := engine.get_next()):
+            img = cv2.imread(path)
+            ...
+            done = engine.save_current(cleaned_bgr)
+            if done:
+                break
+    """
+
+    def __init__(self) -> None:
+        self.files:         List[str] = []
+        self.current_index: int       = 0
+        self.output_dir:    str       = ""
+        self.export_format: str       = "jpg"
+
+    def initialize_batch(
+        self,
+        file_paths: List[str],
+        export_format: str = "jpg",
+        output_dir: str = "",
+    ) -> str:
+        import os as _os
+        self.files          = list(file_paths)
+        self.export_format  = export_format
+        self.current_index  = 0
+        if output_dir:
+            self.output_dir = output_dir
+        else:
+            base = _os.path.dirname(file_paths[0]) if file_paths else "."
+            self.output_dir = _os.path.join(base, "manga_cleaner_output")
+        _os.makedirs(self.output_dir, exist_ok=True)
+        debug_print(f"BatchEngine: initialised → {self.output_dir}")
+        return self.output_dir
+
+    def get_next(self) -> Optional[str]:
+        if self.current_index < len(self.files):
+            return self.files[self.current_index]
+        return None
+
+    def save_current(self, cv_img_bgr: np.ndarray) -> bool:
+        """Save *cv_img_bgr* (BGR, uint8) and advance. Returns True when done."""
+        import os as _os
+        ext  = self.export_format if self.export_format != "photoshop" else "jpg"
+        stem = _os.path.splitext(_os.path.basename(self.files[self.current_index]))[0]
+        path = _os.path.join(self.output_dir, f"{stem}_cleaned.{ext}")
+        cv2.imwrite(path, cv_img_bgr)
+        debug_print(f"BatchEngine: saved [{self.current_index + 1}/{len(self.files)}] → {path}")
+        self.current_index += 1
+        return self.current_index >= len(self.files)
+
+    @property
+    def total(self) -> int:
+        return len(self.files)
+
+    @property
+    def progress(self) -> float:
+        return self.current_index / max(1, len(self.files))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# End of merged section
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def _coerce_optional_float(value: Any) -> Optional[float]:
@@ -4714,7 +5191,8 @@ def select_strategy(
         return "skip", "skip"
 
     if region_class == "caption_box":
-        if text_mask_confidence < 0.25:
+        min_caption_conf = 0.20 if background_model == "dark_bubble" else 0.25
+        if text_mask_confidence < min_caption_conf:
             return "skip", "skip"
         if background_model in ("flat_light", "flat_colored", "dark_bubble"):
             return "flat_fill", "local_sample"
@@ -4821,12 +5299,34 @@ def _hybrid_cleanup_route(
         plan.debug_metrics["cleanup_route"] = "opencv_fallback"
         return
 
+    configured_backend = str(getattr(model_config, "cleanup_backend", "") or "").strip().lower()
+    prefers_lama = configured_backend in {"lama_pt", "lama_onnx"}
     prefers_iopaint = (
-        str(getattr(model_config, "cleanup_backend", "") or "").strip().lower() == "iopaint"
+        configured_backend == "iopaint"
         or policy.cleanup_fallback_backend == "iopaint"
         or (bg == "halftone_texture" and policy.cleanup_prefer_iopaint_for_texture)
         or (bg == "translucent_gradient" and policy.cleanup_prefer_iopaint_for_translucent)
     )
+    if prefers_lama and not prefers_iopaint:
+        plan.debug_metrics["cleanup_route"] = "model_inpaint"
+        plan.debug_metrics["model_inpaint_required"] = True
+        plan.cleanup_backend = configured_backend
+        if model_config is not None:
+            plan.lama_model_path = str(getattr(model_config, "lama_model_path", "") or "")
+            try:
+                plan.max_tile_size = int(getattr(model_config, "max_tile_size", plan.max_tile_size) or plan.max_tile_size)
+            except (TypeError, ValueError):
+                pass
+        if plan.text_mask_confidence < 0.18:
+            plan.cleanup_strategy = "review"
+            plan.inpaint_method = "skip"
+            plan.skip_reason = "model_inpaint_text_mask_confidence_low"
+            return
+        if plan.cleanup_strategy in {"skip", "review"}:
+            plan.cleanup_strategy = "texture_clone" if bg in {"halftone_texture", "translucent_gradient"} else "mask_inpaint"
+            plan.inpaint_method = "telea"
+            plan.skip_reason = ""
+        return
     if not prefers_iopaint:
         plan.debug_metrics["cleanup_route"] = "hard_background_review_or_opencv"
         return
@@ -4851,6 +5351,31 @@ def _hybrid_cleanup_route(
         plan.cleanup_strategy = "texture_clone" if bg in {"halftone_texture", "translucent_gradient"} else "mask_inpaint"
         plan.inpaint_method = "telea"
         plan.skip_reason = ""
+
+
+def _try_aggressive_review_attempt(plan: CleanupPlan, policy: CleanupPolicy) -> None:
+    if (
+        policy.cleanup_mode != "aggressive"
+        or policy.cleanup_manual_review_only
+        or plan.cleanup_strategy != "review"
+        or plan.inpaint_method != "skip"
+        or plan.region_class not in {"speech_bubble", "caption_box"}
+        or plan.text_mask is None
+        or not np.any(plan.text_mask)
+        or float(plan.text_mask_confidence or 0.0) < policy.t2_text_conf
+    ):
+        return
+    bg = str(plan.background_model or "")
+    if bg in {"halftone_texture", "busy_art", "unknown", "translucent_gradient"}:
+        plan.cleanup_strategy = "texture_clone" if bg in {"halftone_texture", "translucent_gradient"} else "mask_inpaint"
+        plan.inpaint_method = "telea"
+        plan.skip_reason = ""
+        plan.debug_metrics["aggressive_review_attempt"] = {
+            "from_strategy": "review",
+            "background_model": bg,
+            "text_mask_confidence": round(float(plan.text_mask_confidence or 0.0), 4),
+        }
+        plan.debug_metrics["review_required_after_cleanup"] = True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -5293,6 +5818,7 @@ def build_cleanup_plan(
             plan.cleanup_strategy = "gradient_fill"
             plan.inpaint_method = "idw_lab"
     _hybrid_cleanup_route(plan, policy, model_config)
+    _try_aggressive_review_attempt(plan, policy)
     if override_mode == "skip":
         plan.cleanup_strategy = "skip"
         plan.inpaint_method = "skip"
@@ -5531,6 +6057,25 @@ def execute_cleanup_plan(
     )
 
     if strategy == "flat_fill":
+        if (
+            str(plan.cleanup_backend or "").strip().lower() in {"lama_pt", "lama_onnx"}
+            and plan.region_class in {"speech_bubble", "caption_box"}
+            and _try_external_inpaint_backend(img_cv, result, mask, plan)
+        ):
+            _guard_flat_bubble_smear(img_cv, result, mask, plan)
+            plan.debug_metrics["retry_used"] = False
+            plan.debug_metrics["final_cleanup_decision"] = {
+                "strategy": plan.cleanup_strategy,
+                "inpaint_method": plan.inpaint_method,
+                "skip_reason": plan.skip_reason,
+                "retry_used": False,
+            }
+            plan.debug_metrics["final_cleanup_mask_px"] = int(np.count_nonzero(plan.cleanup_mask)) if plan.cleanup_mask is not None else 0
+            _save_cleanup_debug_artifacts(img_cv, result, plan)
+            return
+        if _external_inpaint_blocked(plan):
+            _save_cleanup_debug_artifacts(img_cv, result, plan)
+            return
         _execute_flat_fill(img_cv, result, mask, plan)
         _guard_flat_bubble_smear(img_cv, result, mask, plan)
         residual = _score_cleanup_residual(img_cv, result, plan, mask)
@@ -5803,7 +6348,7 @@ def _cleanup_debug_meta(
     if bool(plan.debug_metrics.get("manual_mask_used", False)):
         backend_label = "manual_mask"
     elif plan.cleanup_strategy not in ("skip", "review") and plan.cleanup_mask is not None:
-        backend_label = "future-LaMa placeholder" if cleanup_backend == "lama" else "CV-only"
+        backend_label = "lama-onnx" if cleanup_backend == "lama_onnx" else "CV-only"
     meta = {
         "page_index": int(plan.page_index),
         "region_id": str(plan.region_id or ""),
@@ -6284,14 +6829,30 @@ def _execute_gradient_idw(
     )
 
 
+def _normalize_inpaint_mask(mask: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+    mask_u8 = np.asarray(mask)
+    if mask_u8.ndim == 3:
+        mask_u8 = cv2.cvtColor(mask_u8, cv2.COLOR_BGR2GRAY)
+    if mask_u8.shape[:2] != shape:
+        raise ValueError(f"inpaint mask shape {mask_u8.shape[:2]} does not match image shape {shape}")
+    if mask_u8.dtype != np.uint8:
+        mask_u8 = mask_u8.astype(np.uint8)
+    if mask_u8.max(initial=0) <= 1:
+        mask_u8 = mask_u8 * 255
+    else:
+        mask_u8 = (mask_u8 > 0).astype(np.uint8) * 255
+    return np.ascontiguousarray(mask_u8)
+
+
 def _execute_telea(
     result: np.ndarray,
     mask: np.ndarray,
     radius: int = 5,
 ) -> None:
     """TELEA inpaint over mask; write-back only within mask."""
-    inpainted        = cv2.inpaint(result, mask, radius, cv2.INPAINT_TELEA)
-    result[mask > 0] = inpainted[mask > 0]
+    mask_u8 = _normalize_inpaint_mask(mask, result.shape[:2])
+    inpainted           = cv2.inpaint(result, mask_u8, radius, cv2.INPAINT_TELEA)
+    result[mask_u8 > 0] = inpainted[mask_u8 > 0]
 
 
 def _execute_ns(
@@ -6300,8 +6861,9 @@ def _execute_ns(
     radius: int = 5,
 ) -> None:
     """OpenCV Navier-Stokes inpaint over mask; write-back only within mask."""
-    inpainted        = cv2.inpaint(result, mask, radius, cv2.INPAINT_NS)
-    result[mask > 0] = inpainted[mask > 0]
+    mask_u8 = _normalize_inpaint_mask(mask, result.shape[:2])
+    inpainted           = cv2.inpaint(result, mask_u8, radius, cv2.INPAINT_NS)
+    result[mask_u8 > 0] = inpainted[mask_u8 > 0]
 
 
 def _try_external_inpaint_backend(
@@ -6310,8 +6872,11 @@ def _try_external_inpaint_backend(
     mask: np.ndarray,
     plan: CleanupPlan,
 ) -> bool:
+    override_mode = str(plan.debug_metrics.get("cleanup_override_mode", "") or "").strip().lower()
+    if override_mode in {"force_telea", "force_ns"}:
+        return False
     backend = (plan.cleanup_backend or "opencv").strip().lower()
-    if backend not in {"iopaint", "lama"}:
+    if backend not in {"iopaint", "lama_onnx", "lama_pt"}:
         return False
     if backend == "iopaint" and not (plan.iopaint_url or "").strip():
         plan.debug_metrics["cleanup_backend_fallback"] = "iopaint_fallback:no_url"
@@ -6321,9 +6886,118 @@ def _try_external_inpaint_backend(
             plan.inpaint_method = "skip"
             plan.skip_reason = "iopaint_required_unavailable:no_url"
         return False
-    if backend == "lama":
-        plan.debug_metrics["cleanup_backend_fallback"] = "lama_fallback:not_configured"
-        return False
+    if backend == "lama_onnx":
+        model_path = (plan.lama_model_path or "").strip()
+        if not model_path:
+            plan.debug_metrics["cleanup_backend_fallback"] = "lama_onnx_fallback:no_model_path"
+            if bool(plan.debug_metrics.get("model_inpaint_required", False)):
+                plan.debug_metrics["external_inpaint_blocked"] = True
+                plan.cleanup_strategy = "review"
+                plan.inpaint_method   = "skip"
+                plan.skip_reason      = "lama_onnx_required_unavailable:no_model_path"
+            return False
+        try:
+            engine = AIManager.get_lama(model_path)
+            if engine is None:
+                raise RuntimeError("model_load_failed")
+
+            # Resolve safe tile size with VRAM guard
+            tile_size = _compute_safe_tile_size(
+                default_tile=int(plan.max_tile_size or 1024),
+                min_tile=256,
+            )
+
+            # LaMa expects RGB; img_cv is BGR
+            img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+            tiler   = LamaTilingEngine(engine, max_tile_size=tile_size)
+            out_rgb = tiler.inpaint(img_rgb, mask)
+            out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+
+            result[mask > 0] = out_bgr[mask > 0]
+            plan.debug_metrics["lama_tile_size"] = tile_size
+            plan.debug_metrics["lama_device"]    = engine.device
+            debug_print(
+                f"lama_onnx_inpaint: region={plan.region_id} "
+                f"tile_size={tile_size} device={engine.device} "
+                f"mask_px={int(np.count_nonzero(mask))}"
+            )
+            return True
+        except Exception as exc:
+            plan.debug_metrics["cleanup_backend_fallback"] = f"lama_onnx_fallback:{exc}"
+            if bool(plan.debug_metrics.get("model_inpaint_required", False)):
+                plan.debug_metrics["external_inpaint_blocked"] = True
+                plan.cleanup_strategy = "review"
+                plan.inpaint_method   = "skip"
+                plan.skip_reason      = f"lama_onnx_required_unavailable:{exc}"
+            debug_print(
+                f"lama_onnx_inpaint: fallback_to_opencv region={plan.region_id} reason={exc}"
+            )
+            return False
+    if backend == "lama_pt":
+        try:
+            from simple_lama_inpainting import SimpleLama  # type: ignore[import]
+            from PIL import Image as _PILImage             # type: ignore[import]
+            import torch                                  # type: ignore[import]
+        except ImportError:
+            plan.debug_metrics["cleanup_backend_fallback"] = "lama_pt_fallback:simple_lama_inpainting_not_installed"
+            if bool(plan.debug_metrics.get("model_inpaint_required", False)):
+                plan.debug_metrics["external_inpaint_blocked"] = True
+                plan.cleanup_strategy = "review"
+                plan.inpaint_method   = "skip"
+                plan.skip_reason      = "lama_pt_required_unavailable:not_installed"
+            return False
+        try:
+            # Lazy singleton so the model is only loaded once per process
+            if not hasattr(_try_external_inpaint_backend, "_simple_lama"):
+                torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+                if hasattr(os, "add_dll_directory") and os.path.isdir(torch_lib):
+                    try:
+                        os.add_dll_directory(torch_lib)
+                    except Exception:
+                        pass
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                try:
+                    _try_external_inpaint_backend._simple_lama = SimpleLama(device=device)
+                except Exception as cuda_exc:
+                    if device.type != "cuda":
+                        raise
+                    debug_print(f"lama_pt_inpaint: CUDA init failed ({cuda_exc}), falling back to CPU")
+                    _try_external_inpaint_backend._simple_lama = SimpleLama(device=torch.device("cpu"))
+
+            _sl = _try_external_inpaint_backend._simple_lama
+
+            # Convert bgr→rgb numpy → PIL
+            img_rgb  = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+            pil_img  = _PILImage.fromarray(img_rgb)
+            pil_mask = _PILImage.fromarray(mask).convert("L")
+
+            pil_out  = _sl(pil_img, pil_mask)
+            out_bgr  = cv2.cvtColor(np.array(pil_out), cv2.COLOR_RGB2BGR)
+            if out_bgr.shape[:2] != img_cv.shape[:2]:
+                h_img, w_img = img_cv.shape[:2]
+                out_bgr = out_bgr[:h_img, :w_img]
+                if out_bgr.shape[:2] != img_cv.shape[:2]:
+                    raise RuntimeError(
+                        f"lama_pt_output_shape_mismatch:{out_bgr.shape[:2]}!={img_cv.shape[:2]}"
+                    )
+
+            result[mask > 0] = out_bgr[mask > 0]
+            debug_print(
+                f"lama_pt_inpaint: region={plan.region_id} "
+                f"mask_px={int(np.count_nonzero(mask))}"
+            )
+            return True
+        except Exception as exc:
+            plan.debug_metrics["cleanup_backend_fallback"] = f"lama_pt_fallback:{exc}"
+            if bool(plan.debug_metrics.get("model_inpaint_required", False)):
+                plan.debug_metrics["external_inpaint_blocked"] = True
+                plan.cleanup_strategy = "review"
+                plan.inpaint_method   = "skip"
+                plan.skip_reason      = f"lama_pt_required_unavailable:{exc}"
+            debug_print(
+                f"lama_pt_inpaint: fallback_to_opencv region={plan.region_id} reason={exc}"
+            )
+            return False
     try:
         ok_img, img_buf = cv2.imencode(".png", img_cv)
         ok_mask, mask_buf = cv2.imencode(".png", mask)
@@ -6439,6 +7113,12 @@ def erase_text_region_planned(
         )
         plan.cleanup_backend = cleanup_backend or "opencv"
         plan.iopaint_url = iopaint_url or ""
+        if model_config is not None:
+            plan.lama_model_path = str(getattr(model_config, "lama_model_path", "") or "")
+            try:
+                plan.max_tile_size = int(getattr(model_config, "max_tile_size", plan.max_tile_size) or plan.max_tile_size)
+            except (TypeError, ValueError):
+                pass
         if (
             _cleanup_override_mode(block) == "force_iopaint"
             or plan.debug_metrics.get("cleanup_fallback_backend") == "iopaint"

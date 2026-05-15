@@ -420,7 +420,7 @@ _SFX_LIKE_KINDS = {"SFX_OVER_ART", "DIALOGUE_OVER_ART"}
 # `DIALOGUE_OVER_ART` here because those can legitimately be dialogue that
 # the user still wants translated. YOLO class ids 2=sfx and 3=shout are
 # treated as pipeline SFX when the master toggle is off.
-_PIPELINE_SFX_ROLES = {"sfx", "sound", "sound_effect", "impact", "shout"}
+_PIPELINE_SFX_ROLES = {"sfx", "sound", "sound_effect", "impact", "shout", "onomatopoeia", "soundfx"}
 _PIPELINE_SFX_KINDS = {"SFX_OVER_ART"}
 
 
@@ -447,10 +447,9 @@ def _is_pipeline_sfx(block: Any) -> bool:
 def _cleanup_override_allows_pipeline_sfx(block: Any) -> bool:
     override = getattr(block, "override", None)
     mode = str(getattr(override, "cleanup_override_mode", "") or "").strip().lower()
-    region_class = str(getattr(override, "cleanup_region_class", "") or "").strip().lower()
     return mode in {
         "force_allow", "force_solid", "force_telea", "force_ns", "force_iopaint"
-    } or region_class == "sfx"
+    }
 
 
 _CLEANUP_FORCE_ALLOW_MODES = {"force_allow", "force_solid", "force_telea", "force_ns", "force_iopaint"}
@@ -851,14 +850,24 @@ class LocalizerEngine:
             self._raw_cv = None
         self._regions      = page.regions
         self._translations = page.translations
+        self._sync_translation_slots()
 
     def _flush_working_state_to_page(self) -> None:
         """Write working state back to the current ChapterPage."""
         page = self.chapter_mgr.current_page
         if page is None:
             return
+        self._sync_translation_slots()
         page.regions      = self._regions
         page.translations = self._translations
+
+    def _sync_translation_slots(self) -> None:
+        """Keep translations index-aligned with the current region list."""
+        n = len(self._regions or [])
+        if len(self._translations) > n:
+            self._translations = list(self._translations[:n])
+        elif len(self._translations) < n:
+            self._translations = list(self._translations) + [""] * (n - len(self._translations))
 
     def _current_page_detected(self) -> bool:
         page = self.chapter_mgr.current_page
@@ -891,7 +900,18 @@ class LocalizerEngine:
         _near("container_bbox", getattr(block, "bubble_bbox", None))
         _near("cleanup_container_bbox", getattr(block, "cleanup_container_bbox", None))
 
+        block_bbox = block.bbox() if hasattr(block, "bbox") else None
+        mask_can_touch_page_edge = False
+        if block_bbox:
+            _x, by, _bw, bh = [int(v) for v in block_bbox]
+            mask_can_touch_page_edge = (
+                (edge == "top" and by <= threshold)
+                or (edge == "bottom" and by + bh >= ih - threshold)
+            )
+
         for label in ("text_mask", "safe_text_mask", "bubble_mask"):
+            if not mask_can_touch_page_edge:
+                continue
             mask = getattr(block, label, None)
             if mask is None or not isinstance(mask, np.ndarray) or mask.size == 0:
                 continue
@@ -920,6 +940,50 @@ class LocalizerEngine:
                 pass
 
         return ",".join(reasons)
+
+    def _cross_page_local_seam_valid(self, block: Any, owner_idx: Optional[int] = None, threshold: int = 64) -> bool:
+        local = getattr(block, "page_local_bboxes", {}) or {}
+        pages = [int(v) for v in (getattr(block, "cross_page_pages", []) or [])]
+        if not bool(getattr(block, "cross_page", False)) or not isinstance(local, dict) or len(local) < 2:
+            return False
+        if len(pages) < 2:
+            try:
+                pages = sorted(int(k) for k in local.keys())
+            except Exception:
+                return False
+        pages = sorted(set(int(v) for v in pages))
+        if len(pages) != 2 or pages[1] != pages[0] + 1:
+            return False
+        if owner_idx is not None and int(owner_idx) != pages[0]:
+            return False
+        try:
+            first = tuple(int(v) for v in (local.get(pages[0]) or local.get(str(pages[0]))))
+            second = tuple(int(v) for v in (local.get(pages[1]) or local.get(str(pages[1]))))
+        except Exception:
+            return False
+        if len(first) != 4 or len(second) != 4:
+            return False
+        pages_obj = getattr(self.chapter_mgr, "pages", []) or []
+        if not (0 <= pages[0] < len(pages_obj) and 0 <= pages[1] < len(pages_obj)):
+            return False
+        first_img = self._raw_cv if pages[0] == int(getattr(self.chapter_mgr, "current_idx", 0) or 0) else cv2.imread(pages_obj[pages[0]].image_path)
+        if first_img is None:
+            return False
+        first_h = int(first_img.shape[0])
+        return first[1] + first[3] >= first_h - threshold and second[1] <= threshold
+
+    def _clear_cross_page_metadata(self, block: Any) -> None:
+        block.cross_page = False
+        block.cross_page_group_id = None
+        block.cross_page_pages = []
+        block.composite_bbox = None
+        block.page_local_bboxes = {}
+        for attr in ("cleanup_meta", "typeset_meta"):
+            meta = getattr(block, attr, None)
+            if isinstance(meta, dict):
+                meta.pop("cross_page_secondary", None)
+                meta.pop("cross_page_cleanup_limited", None)
+                meta.pop("cross_page_typeset_limited", None)
 
     def _log_cross_page_candidates(
         self,
@@ -1139,6 +1203,87 @@ class LocalizerEngine:
         if not isinstance(getattr(block, "typeset_meta", None), dict):
             block.typeset_meta = {}
 
+    def _recompute_cross_page_from_local_bboxes(self, block: Any) -> bool:
+        local_meta = getattr(block, "page_local_bboxes", {}) or {}
+        if not isinstance(local_meta, dict) or len(local_meta) < 2:
+            return False
+        pages = sorted(int(k) for k in local_meta.keys())
+        composite, offsets = self._build_stitched_context(pages)
+        if composite is None:
+            return False
+        comp_boxes: Dict[int, Tuple[int, int, int, int]] = {}
+        for raw_key, raw_box in local_meta.items():
+            try:
+                pidx = int(raw_key)
+                if pidx not in offsets:
+                    continue
+                x, y, w, h = [int(v) for v in raw_box]
+                if w <= 0 or h <= 0:
+                    continue
+                comp_boxes[pidx] = (x, y + int(offsets[pidx]), w, h)
+            except Exception:
+                continue
+        if len(comp_boxes) < 2:
+            return False
+        x1 = min(x for x, _y, _w, _h in comp_boxes.values())
+        y1 = min(y for _x, y, _w, _h in comp_boxes.values())
+        x2 = max(x + w for x, _y, w, _h in comp_boxes.values())
+        y2 = max(y + h for _x, y, _w, h in comp_boxes.values())
+        owner_page = int(getattr(self.chapter_mgr, "current_idx", 0) or 0)
+        owner_box = local_meta.get(owner_page) or local_meta.get(str(owner_page))
+        if not owner_box:
+            owner_page = pages[0]
+            owner_box = local_meta.get(owner_page) or local_meta.get(str(owner_page))
+        if owner_box:
+            owner_tuple = tuple(int(v) for v in owner_box)
+            block.bbox_override = owner_tuple
+            block.bubble_bbox = owner_tuple
+            block.bubble_mask = build_ellipse_mask(max(1, owner_tuple[2]), max(1, owner_tuple[3]), inset=4)
+        block.cross_page = True
+        block.cross_page_pages = pages
+        block.composite_bbox = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+        block.page_local_bboxes = {int(k): tuple(int(v) for v in val) for k, val in local_meta.items()}
+        block.manually_adjusted = True
+        block.text_mask = None
+        block.safe_text_mask = None
+        block.safe_center = None
+        block.safe_rect = None
+        return True
+
+    def _touch_cross_page_segment_geometry(
+        self,
+        block: OCRBlock,
+        edit_page_idx: int,
+        bbox: Tuple[int, int, int, int],
+    ) -> None:
+        local = dict(getattr(block, "page_local_bboxes", {}) or {})
+        current = tuple(int(v) for v in (local.get(edit_page_idx) or local.get(str(edit_page_idx)) or bbox))
+        bbox = tuple(int(v) for v in bbox)
+        dx = bbox[0] - current[0]
+        dy = bbox[1] - current[1]
+        same_size = bbox[2] == current[2] and bbox[3] == current[3]
+        if same_size and (dx or dy):
+            pages = getattr(self.chapter_mgr, "pages", []) or []
+            for raw_pidx, raw_box in list(local.items()):
+                pidx = int(raw_pidx)
+                x, y, w, h = [int(v) for v in raw_box]
+                page_img = None
+                if 0 <= pidx < len(pages):
+                    page_img = self._raw_cv if pidx == int(getattr(self.chapter_mgr, "current_idx", 0) or 0) else cv2.imread(pages[pidx].image_path)
+                if page_img is not None:
+                    ph, pw = page_img.shape[:2]
+                    x = max(0, min(x + dx, max(0, pw - w)))
+                    y = max(0, min(y + dy, max(0, ph - h)))
+                else:
+                    x += dx
+                    y += dy
+                local[pidx] = (int(x), int(y), int(w), int(h))
+        else:
+            local[int(edit_page_idx)] = bbox
+        block.page_local_bboxes = {int(k): tuple(int(v) for v in val) for k, val in local.items()}
+        if not self._recompute_cross_page_from_local_bboxes(block):
+            self._touch_region_geometry(block, bbox)
+
     def _ocr_composite_crop(self, crop: np.ndarray, group_id: str) -> str:
         if crop.size == 0:
             return ""
@@ -1209,69 +1354,9 @@ class LocalizerEngine:
         if self._raw_cv is None or not (0 <= page_idx < len(pages)):
             return
         current = self._log_cross_page_candidates(page_idx, self._regions, self._raw_cv)
-        if page_idx > 0 and current["top"]:
-            prev_page = pages[page_idx - 1]
-            prev_raw = cv2.imread(prev_page.image_path)
-            if prev_raw is not None:
-                prev = self._log_cross_page_candidates(page_idx - 1, getattr(prev_page, "regions", []) or [], prev_raw)
-                for curr_idx, curr_block, _ in current["top"]:
-                    curr_bbox = curr_block.bbox()
-                    curr_center = curr_bbox[0] + curr_bbox[2] / 2.0
-                    best_prev: Optional[Tuple[int, Any, Tuple[int, int, int, int], float]] = None
-                    for prev_idx, prev_block, _ in prev["bottom"]:
-                        prev_bbox = prev_block.bbox()
-                        prev_center = prev_bbox[0] + prev_bbox[2] / 2.0
-                        overlap = self._bbox_x_overlap_ratio(prev_bbox, curr_bbox)
-                        center_close = abs(prev_center - curr_center) <= max(prev_bbox[2], curr_bbox[2], 80) * 0.65
-                        if (overlap < 0.35 and not center_close) or not self._cross_page_roles_compatible(prev_block, curr_block):
-                            continue
-                        score = overlap + (0.5 if center_close else 0.0)
-                        if best_prev is None or score > best_prev[3]:
-                            best_prev = (prev_idx, prev_block, prev_bbox, score)
-                    if best_prev is None:
-                        continue
-                    prev_idx, _prev_block, prev_bbox, _score = best_prev
-                    group_id = f"cp-{page_idx - 1}-{prev_idx}-{page_idx}-{curr_idx}"
-                    if str(getattr(curr_block, "text", "") or "").strip():
-                        debug_print(
-                            f"[CROSS_PAGE_MERGE_SKIP] pages={[page_idx - 1, page_idx]} "
-                            f"regions={[f'r{prev_idx + 1}', f'r{curr_idx + 1}']} "
-                            "reason=current_region_has_ocr_text"
-                        )
-                        curr_block.cross_page = False
-                        curr_block.cross_page_group_id = None
-                        curr_block.cross_page_pages = []
-                        curr_block.composite_bbox = None
-                        curr_block.page_local_bboxes = {}
-                        for attr in ("cleanup_meta", "typeset_meta"):
-                            meta = getattr(curr_block, attr, {}) or {}
-                            if isinstance(meta, dict):
-                                meta.pop("cross_page_secondary", None)
-                                meta.pop("cross_page_cleanup_limited", None)
-                                meta.pop("cross_page_typeset_limited", None)
-                        continue
-                    debug_print(
-                        f"[CROSS_PAGE_MERGE] pages={[page_idx - 1, page_idx]} "
-                        f"regions={[f'r{prev_idx + 1}', f'r{curr_idx + 1}']} secondary_only=True"
-                    )
-                    curr_block.cross_page = True
-                    curr_block.cross_page_group_id = group_id
-                    curr_block.cross_page_pages = [page_idx - 1, page_idx]
-                    curr_block.page_local_bboxes = {
-                        page_idx - 1: tuple(int(v) for v in prev_bbox),
-                        page_idx: tuple(int(v) for v in curr_bbox),
-                    }
-                    if not isinstance(getattr(curr_block, "cleanup_meta", None), dict):
-                        curr_block.cleanup_meta = {}
-                    if not isinstance(getattr(curr_block, "typeset_meta", None), dict):
-                        curr_block.typeset_meta = {}
-                    curr_block.cleanup_meta["cross_page_secondary"] = True
-                    curr_block.cleanup_meta["cross_page_cleanup_limited"] = True
-                    curr_block.typeset_meta["cross_page_secondary"] = True
-                    curr_block.typeset_meta["cross_page_typeset_limited"] = True
-                    curr_block.text = ""
-                    if curr_idx < len(self._translations):
-                        self._translations[curr_idx] = ""
+        # Backward-looking geometry-only secondary marking caused stale/duplicate
+        # translations during Run All. Only the forward stitched-OCR path below
+        # is allowed to mutate cross-page ownership.
         if page_idx >= len(pages) - 1:
             return
         next_page = pages[page_idx + 1]
@@ -1283,10 +1368,18 @@ class LocalizerEngine:
             return
 
         for curr_idx, curr_block, _ in current["bottom"]:
+            if bool(getattr(curr_block, "cross_page", False)):
+                continue
+            if self._is_cross_page_secondary(curr_block):
+                continue
             curr_bbox = curr_block.bbox()
             curr_center = curr_bbox[0] + curr_bbox[2] / 2.0
             best: Optional[Tuple[int, Any, Tuple[int, int, int, int], float]] = None
             for next_idx, next_block, _ in nxt["top"]:
+                if bool(getattr(next_block, "cross_page", False)):
+                    continue
+                if self._is_cross_page_secondary(next_block):
+                    continue
                 next_bbox = next_block.bbox()
                 next_center = next_bbox[0] + next_bbox[2] / 2.0
                 overlap = self._bbox_x_overlap_ratio(curr_bbox, next_bbox)
@@ -1313,6 +1406,7 @@ class LocalizerEngine:
                 continue
             group_id = f"cp-{page_idx}-{curr_idx}-{page_idx + 1}-{next_idx}"
             debug_print(f"[CROSS_PAGE_MERGE] pages={[page_idx, page_idx + 1]} regions={[f'r{curr_idx + 1}', f'r{next_idx + 1}']}")
+            text = ""
             try:
                 text = self._ocr_composite_crop(composite[y1:y2, x1:x2], group_id)
                 if text:
@@ -1320,6 +1414,16 @@ class LocalizerEngine:
                     curr_block.ocr_confidence = max(float(getattr(curr_block, "ocr_confidence", 0.0) or 0.0), 0.5)
             except Exception as exc:
                 debug_print(f"[CROSS_PAGE_OCR] group={group_id} failed={exc}")
+            if not str(text or "").strip():
+                try:
+                    curr_block.flag("cross_page_ocr_empty", {"group_id": group_id, "pages": [page_idx, page_idx + 1]})
+                except Exception:
+                    pass
+                debug_print(
+                    f"[CROSS_PAGE_MERGE_SKIP] pages={[page_idx, page_idx + 1]} "
+                    f"regions={[f'r{curr_idx + 1}', f'r{next_idx + 1}']} reason=stitched_ocr_empty"
+                )
+                continue
             curr_block.cross_page = True
             curr_block.cross_page_group_id = group_id
             curr_block.cross_page_pages = [page_idx, page_idx + 1]
@@ -1346,6 +1450,12 @@ class LocalizerEngine:
             _next_block.text = ""
             if next_idx < len(getattr(next_page, "translations", []) or []):
                 next_page.translations[next_idx] = ""
+            next_page.typeset_pil = None
+            next_page.render_dirty = True
+            try:
+                next_page.bump_render_version()
+            except Exception:
+                pass
 
     def _push_undo_snapshot(self) -> None:
         """Store a page-local editor snapshot before a mutating edit."""
@@ -4033,8 +4143,15 @@ class LocalizerEngine:
                 if block_now is not None and self._is_cross_page_secondary(block_now):
                     debug_print(
                         f"[CROSS_PAGE_SKIP_BYPASS] stage=ocr idx={idx} "
-                        "reason=ocr_allowed_for_inspector_text"
+                        "reason=secondary_owned_by_primary"
                     )
+                    block_now.text = ""
+                    block_now.ocr_status = "skipped_cross_page_secondary"
+                    block_now.ocr_status_reason = "secondary_owned_by_primary"
+                    if idx < len(self._translations):
+                        self._translations[idx] = ""
+                    self._notify(f"OCR region {idx+1}/{total} (cross-page secondary skipped)", idx + 1, total, region_idx=idx, region_total=total)
+                    continue
                 if not process_sfx and block_now is not None and _is_pipeline_sfx(block_now):
                     block_now.ocr_status = "skipped_sfx"
                     block_now.ocr_status_reason = "process_sfx_regions_disabled"
@@ -4558,6 +4675,7 @@ class LocalizerEngine:
                 self._notify("Translate skipped - no regions.", 1, 1, updated_pages=[page_idx])
                 return self.get_bootstrap()
             raise RuntimeError("Run Detect first.")
+        self._sync_translation_slots()
         self._consistency_warnings = []
         self._memory_hits = {}
         self._last_batch_ctx = None
@@ -4569,14 +4687,10 @@ class LocalizerEngine:
         sfx_mask: List[bool] = []
         for b in self._regions:
             if self._is_cross_page_secondary(b):
-                if str(getattr(b, "text", "") or "").strip():
-                    debug_print("[CROSS_PAGE_SKIP_BYPASS] stage=translate reason=secondary_has_existing_text")
-                    sfx_mask.append(False)
-                    texts.append(b.text or "")
-                else:
-                    b.text = ""
-                    sfx_mask.append(True)
-                    texts.append("")
+                debug_print("[CROSS_PAGE_SKIP] stage=translate reason=secondary_owned_by_primary")
+                b.text = ""
+                sfx_mask.append(True)
+                texts.append("")
                 continue
             is_sfx = (not process_sfx) and _is_pipeline_sfx(b)
             sfx_mask.append(is_sfx)
@@ -5224,6 +5338,7 @@ class LocalizerEngine:
         page = self.chapter_mgr.current_page
         if page is None:
             raise RuntimeError("No current page.")
+        self._sync_translation_slots()
         page_idx = int(getattr(self.chapter_mgr, "current_idx", 0) or 0)
         self._set_progress(stage="typeset", page_idx=page_idx, page_total=self.chapter_mgr.total_pages())
 
@@ -5260,6 +5375,7 @@ class LocalizerEngine:
             process_sfx = _config_bool(getattr(self.model_config, "process_sfx_regions", False))
             has_typeset_candidate = any(
                 getattr(block, "visible", True)
+                and (getattr(block, "text", "") or "").strip()
                 and not self._is_cross_page_secondary(block)
                 and (process_sfx or not _is_pipeline_sfx(block))
                 and not (
@@ -5963,8 +6079,26 @@ class LocalizerEngine:
 
         return pil_img
 
-    def get_region_preview_sprite(self, region_idx: int, draft: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def get_region_preview_sprite(
+        self,
+        region_idx: int,
+        draft: Optional[Dict[str, Any]] = None,
+        page_idx: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """Render one region's English text as a transparent PNG without mutating state."""
+        if page_idx is not None:
+            requested_page = int(page_idx)
+            current_page = int(getattr(self.chapter_mgr, "current_idx", 0) or 0)
+            if requested_page != current_page:
+                self._flush_working_state_to_page()
+                try:
+                    self.chapter_mgr.go_to(requested_page)
+                    self._load_page_into_working_state()
+                    return self.get_region_preview_sprite(region_idx, draft, None)
+                finally:
+                    self._flush_working_state_to_page()
+                    self.chapter_mgr.go_to(current_page)
+                    self._load_page_into_working_state()
         if not (0 <= region_idx < len(self._regions)):
             raise IndexError(f"No region at index {region_idx}")
         page = self.chapter_mgr.current_page
@@ -5972,6 +6106,8 @@ class LocalizerEngine:
             raise RuntimeError("No page loaded.")
 
         block = copy.deepcopy(self._regions[region_idx])
+        if self._is_cross_page_secondary(block):
+            return _empty_preview_response("cross_page_secondary")
         trans = self._translations[region_idx] if region_idx < len(self._translations) else ""
         draft = draft or {}
         if "tl" in draft:
@@ -6472,22 +6608,19 @@ class LocalizerEngine:
             start_page_idx = 0
             if hasattr(self.chapter_mgr, "clear_run_all_checkpoint"):
                 self.chapter_mgr.clear_run_all_checkpoint()
-        start_phase_pos = phases.index(start_phase)
         start_page_idx = max(0, min(total - 1, int(start_page_idx or 0)))
         self._set_progress(running=True, job="run_all", stage=start_phase, page_idx=start_page_idx, page_total=total, updated_pages=[])
         self._begin_active_operation("run_all")
         try:
-            def mark_checkpoint(phase: str, idx: int, next_phase: Optional[str] = None) -> None:
-                if next_phase is None:
-                    next_phase = phase
-                    next_idx = min(total - 1, idx + 1)
-                    if idx + 1 >= total:
-                        phase_pos = phases.index(phase)
-                        next_phase = phases[min(len(phases) - 1, phase_pos + 1)]
-                        next_idx = 0
+            def mark_checkpoint(phase: str, idx: int) -> None:
+                phase_pos = phases.index(phase)
+                if phase_pos + 1 < len(phases):
+                    next_phase = phases[phase_pos + 1]
+                    next_idx = idx
                 else:
-                    next_idx = 0
-                if phase == "typeset" and idx + 1 >= total:
+                    next_phase = "detect"
+                    next_idx = idx + 1
+                if next_idx >= total:
                     return
                 if hasattr(self.chapter_mgr, "save_run_all_checkpoint"):
                     self.chapter_mgr.save_run_all_checkpoint({
@@ -6498,11 +6631,9 @@ class LocalizerEngine:
                         "message": f"Continue Run All from {next_phase} page {next_idx + 1}/{total}",
                     })
 
-            def phase_start(phase: str) -> int:
-                return start_page_idx if phases.index(phase) == start_phase_pos else 0
-
-            if start_phase_pos <= phases.index("detect"):
-                for idx in range(phase_start("detect"), total):
+            for idx in range(start_page_idx, total):
+                first_phase = phases.index(start_phase) if idx == start_page_idx else 0
+                if first_phase <= phases.index("detect"):
                     self._set_progress(running=True, job="run_all", stage="detect", page_idx=idx, page_total=total, updated_pages=[])
                     self._notify(f"Run All Detect: Page {idx + 1}/{total}...", idx, total)
                     self.go_to_page(idx)
@@ -6510,8 +6641,7 @@ class LocalizerEngine:
                     self._notify(f"Run All Detect: checkpointing page {idx + 1}/{total}...", idx + 1, total)
                     self.chapter_mgr.save_state()
                     mark_checkpoint("detect", idx)
-            if start_phase_pos <= phases.index("ocr"):
-                for idx in range(phase_start("ocr"), total):
+                if first_phase <= phases.index("ocr"):
                     self._set_progress(running=True, job="run_all", stage="ocr", page_idx=idx, page_total=total, updated_pages=[])
                     self._notify(f"Run All OCR: Page {idx + 1}/{total}...", idx, total)
                     self.go_to_page(idx)
@@ -6519,8 +6649,7 @@ class LocalizerEngine:
                     self._notify(f"Run All OCR: checkpointing page {idx + 1}/{total}...", idx + 1, total)
                     self.chapter_mgr.save_state()
                     mark_checkpoint("ocr", idx)
-            if start_phase_pos <= phases.index("translate"):
-                for idx in range(phase_start("translate"), total):
+                if first_phase <= phases.index("translate"):
                     self._set_progress(running=True, job="run_all", stage="translate", page_idx=idx, page_total=total, updated_pages=[])
                     self._notify(f"Run All Translate: Page {idx + 1}/{total}...", idx, total)
                     self.go_to_page(idx)
@@ -6528,15 +6657,13 @@ class LocalizerEngine:
                     self._notify(f"Run All Translate: checkpointing page {idx + 1}/{total}...", idx + 1, total)
                     self.chapter_mgr.save_state()
                     mark_checkpoint("translate", idx)
-            if start_phase_pos <= phases.index("cleanup"):
-                for idx in range(phase_start("cleanup"), total):
+                if first_phase <= phases.index("cleanup"):
                     self._set_progress(running=True, job="run_all", stage="cleanup", page_idx=idx, page_total=total, updated_pages=[])
                     self._notify(f"Run All Cleanup: Page {idx + 1}/{total}...", idx, total)
                     self.go_to_page(idx)
                     self.cleanup_current_page()
                     mark_checkpoint("cleanup", idx)
-            if start_phase_pos <= phases.index("typeset"):
-                for idx in range(phase_start("typeset"), total):
+                if first_phase <= phases.index("typeset"):
                     self._set_progress(running=True, job="run_all", stage="typeset", page_idx=idx, page_total=total, updated_pages=[])
                     self._notify(f"Run All Typeset: Page {idx + 1}/{total}...", idx, total)
                     self.go_to_page(idx)
@@ -6883,19 +7010,21 @@ class LocalizerEngine:
         self.chapter_mgr.request_save_state()
         return self.get_bootstrap()
 
-    def update_region_bbox(self, region_idx: int, x: Any, y: Any, w: Any, h: Any) -> dict:
+    def update_region_bbox(self, region_idx: int, x: Any, y: Any, w: Any, h: Any, page_idx: Optional[Any] = None) -> dict:
         self._begin_active_operation("mutate")
         try:
-            return self._update_region_bbox_active(region_idx, x, y, w, h)
+            return self._update_region_bbox_active(region_idx, x, y, w, h, page_idx)
         finally:
             self._end_active_operation("mutate")
 
-    def _update_region_bbox_active(self, region_idx: int, x: Any, y: Any, w: Any, h: Any) -> dict:
+    def _update_region_bbox_active(self, region_idx: int, x: Any, y: Any, w: Any, h: Any, page_idx: Optional[Any] = None) -> dict:
         if not (0 <= region_idx < len(self._regions)):
             raise IndexError(f"No region at index {region_idx}")
         bbox = self._clamp_bbox(x, y, w, h)
         block = self._regions[region_idx]
-        current_bbox = tuple(int(v) for v in block.bbox())
+        edit_page_idx = int(page_idx) if page_idx is not None else int(getattr(self.chapter_mgr, "current_idx", 0) or 0)
+        local = getattr(block, "page_local_bboxes", {}) or {}
+        current_bbox = tuple(int(v) for v in (local.get(edit_page_idx) or local.get(str(edit_page_idx)) or block.bbox()))
         if current_bbox == bbox:
             render_debug(
                 "mutation",
@@ -6908,9 +7037,24 @@ class LocalizerEngine:
             return self.get_bootstrap()
         self._push_undo_snapshot()
         before_style = self._debug_region_style(block)
-        self._touch_region_geometry(block, bbox)
+        if bool(getattr(block, "cross_page", False)) and not self._is_cross_page_secondary(block) and isinstance(local, dict) and len(local) >= 2:
+            self._touch_cross_page_segment_geometry(block, edit_page_idx, bbox)
+        else:
+            self._touch_region_geometry(block, bbox)
         self._bump_region_mutation_version()
         self._invalidate_page_outputs(preserve_cleanup=True)
+        if bool(getattr(block, "cross_page", False)):
+            for pidx in getattr(block, "cross_page_pages", []) or []:
+                try:
+                    page = self.chapter_mgr.pages[int(pidx)]
+                except Exception:
+                    continue
+                page.typeset_pil = None
+                page.render_dirty = True
+                try:
+                    page.bump_render_version()
+                except Exception:
+                    pass
         render_debug(
             "mutation",
             action="update_region_bbox",
@@ -8102,6 +8246,106 @@ class LocalizerEngine:
 
     # ── Bootstrap serialiser (ported from bridge.py _build_bootstrap_on_ui) ─
 
+    def _bootstrap_region_entry(
+        self,
+        page_idx: int,
+        idx: int,
+        block: Any,
+        tl: str,
+        cleanup_patch_by_region: Optional[Dict[str, Dict[str, Any]]] = None,
+        memory_hits: Optional[List[Dict[str, Any]]] = None,
+        bbox_override: Optional[Tuple[int, int, int, int]] = None,
+    ) -> Dict[str, Any]:
+        x, y, w, h = bbox_override if bbox_override is not None else block.bbox()
+        rid = f"r{idx+1}"
+        font_name = getattr(block, "font_name", "") or getattr(block, "bubble_role", "dialog") or "auto"
+        style = block.effective_style() if hasattr(block, "effective_style") else None
+        process_sfx = _config_bool(getattr(self.model_config, "process_sfx_regions", False))
+        return {
+            "id":      rid,
+            "label":   f"R-{idx+1:02d}",
+            "idx":     idx,
+            "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+            "src":     getattr(block, "text", "") or "",
+            "tl":      tl,
+            "conf":    int(round(float(getattr(block, "confidence", 0.0) or 0.0) * 100)),
+            "font":    font_name,
+            "size":    int(getattr(block, "font_size", 0) or 0),
+            "leading": 1.15,
+            "fg":      _hex_color(getattr(style, "fg_color", None) if style else getattr(block, "fg_color", None), "#111111"),
+            "bg":      _hex_color(getattr(block, "bg_color", None), "#ffffff"),
+            "outline": _hex_color(getattr(style, "outline_color", None) if style else getattr(block, "outline_color", None), "#ffffff"),
+            "outline_width": int((getattr(style, "outline_width", None) if style else None) or getattr(block, "outline_width", 1) or 1),
+            "shadow":  _hex_color(getattr(style, "shadow_color", None), "#000000"),
+            "shadow_on": bool(getattr(style, "shadow_on", False)),
+            "align":   getattr(block, "align", "center") or "center",
+            "visible": bool(getattr(block, "visible", True)),
+            "locked":  bool(getattr(block, "locked", False)),
+            "detector_source": getattr(block, "detector_source", "ocr") or "ocr",
+            "manually_adjusted": bool(getattr(block, "manually_adjusted", False)),
+            "role":              (getattr(block, "bubble_role", None) or "dialog"),
+            "pipeline_disabled": bool(
+                (not process_sfx)
+                and _is_pipeline_sfx(block)
+                and not _cleanup_override_allows_pipeline_sfx(block)
+            ),
+            "detector_confidence": float(getattr(block, "confidence", 0.0) or 0.0),
+            "ocr_confidence":      float(getattr(block, "ocr_confidence", 0.0) or 0.0),
+            "yolo_kind":           getattr(block, "yolo_kind", None),
+            "yolo_class_id":       (int(getattr(block, "yolo_class_id", -1))
+                                     if getattr(block, "yolo_class_id", None) is not None else None),
+            "yolo_train_class_id": (int(getattr(block, "yolo_train_class_id", -1))
+                                    if getattr(block, "yolo_train_class_id", None) is not None else None),
+            "cleanup_tier":        int(getattr(block, "cleanup_tier", 0) or 0),
+            "cleanup_status":      str(getattr(block, "cleanup_status", "") or ""),
+            "cleanup_reason":      str(getattr(block, "cleanup_reason", "") or ""),
+            "cleanup_patch":       (cleanup_patch_by_region or {}).get(rid),
+            "cleanup_container_confidence": float(getattr(block, "cleanup_container_confidence", 0.0) or 0.0),
+            "cleanup_safe_rect_confidence": float(getattr(block, "cleanup_safe_rect_confidence", 0.0) or 0.0),
+            "detector_text_bbox":  [int(v) for v in getattr(block, "detector_text_bbox", None)] if getattr(block, "detector_text_bbox", None) else None,
+            "bbox_override":       [int(v) for v in getattr(block, "bbox_override", None)] if getattr(block, "bbox_override", None) else None,
+            "cleanup_container_bbox": [int(v) for v in getattr(block, "cleanup_container_bbox", None)] if getattr(block, "cleanup_container_bbox", None) else None,
+            "container_bbox":      [int(v) for v in getattr(block, "bubble_bbox", None)] if getattr(block, "bubble_bbox", None) else None,
+            "cross_page":          bool(getattr(block, "cross_page", False)),
+            "cross_page_group_id": getattr(block, "cross_page_group_id", None),
+            "cross_page_pages":    [int(v) for v in (getattr(block, "cross_page_pages", []) or [])],
+            "composite_bbox":      [int(v) for v in getattr(block, "composite_bbox", None)] if getattr(block, "composite_bbox", None) else None,
+            "page_local_bboxes":   {
+                str(int(k)): [int(vv) for vv in v]
+                for k, v in (getattr(block, "page_local_bboxes", {}) or {}).items()
+                if isinstance(v, (list, tuple)) and len(v) == 4
+            },
+            "cross_page_secondary": bool(self._is_cross_page_secondary(block)),
+            "source_page_idx":      int(page_idx),
+            "typeset_status":      str(getattr(block, "typeset_status", "") or ""),
+            "typeset_reason":      str(getattr(block, "typeset_reason", "") or ""),
+            "translation_status":  (
+                "skipped_sfx" if (
+                    (not process_sfx)
+                    and _is_pipeline_sfx(block)
+                    and not _cleanup_override_allows_pipeline_sfx(block)
+                )
+                else ("flagged" if getattr(block, "is_flagged", False)
+                      else ("ok" if (tl or "").strip()
+                            else "pending"))
+            ),
+            "cleanup_strategy": getattr(block, "cleanup_strategy", "auto") or "auto",
+            "cleanup_override": (
+                block.override.to_dict()
+                if getattr(block, "override", None) is not None
+                else {}
+            ),
+            "region_kind":      (getattr(block.region_kind, "name", None)
+                                 if getattr(block, "region_kind", None) is not None
+                                 else None),
+            "memory_hits":      memory_hits or [],
+            "layers": [
+                {"id": f"{rid}-region",  "type": "region",  "name": f"Region - {idx+1}",  "vis": True,  "locked": False},
+                {"id": f"{rid}-text",    "type": "text",    "name": f"Text - {idx+1}",    "vis": bool(getattr(block, "visible", True)), "locked": bool(getattr(block, "locked", False))},
+                {"id": f"{rid}-cleanup", "type": "cleanup", "name": f"Cleanup - {idx+1}", "vis": True,  "locked": False},
+            ],
+        }
+
     def get_bootstrap(self) -> dict:
         chapter_mgr = self.chapter_mgr
         pages       = chapter_mgr.pages or []
@@ -8180,6 +8424,18 @@ class LocalizerEngine:
                     "progress": progress,
                     "status":   status,
                 })
+
+        # Earlier cross-page detection used local masks without page-position
+        # checks, which could persist false seam metadata. Do not let stale
+        # non-seam ownership keep hiding or duplicating unrelated regions.
+        for pidx, page in enumerate(pages):
+            for block in getattr(page, "regions", []) or []:
+                if not bool(getattr(block, "cross_page", False)) and not self._is_cross_page_secondary(block):
+                    continue
+                local_pages = [int(v) for v in (getattr(block, "cross_page_pages", []) or [])]
+                owner_idx = min(local_pages) if local_pages else pidx
+                if not self._cross_page_local_seam_valid(block, owner_idx):
+                    self._clear_cross_page_metadata(block)
 
         # ── Page summaries ──────────────────────────────────────────────────
         page_summaries: List[Dict[str, Any]] = []
@@ -8287,6 +8543,8 @@ class LocalizerEngine:
                     for k, v in (getattr(block, "page_local_bboxes", {}) or {}).items()
                     if isinstance(v, (list, tuple)) and len(v) == 4
                 },
+                "cross_page_secondary": bool(self._is_cross_page_secondary(block)),
+                "source_page_idx":      active_page_idx,
                 "typeset_status":      str(getattr(block, "typeset_status", "") or ""),
                 "typeset_reason":      str(getattr(block, "typeset_reason", "") or ""),
                 "translation_status":  (
@@ -8348,6 +8606,68 @@ class LocalizerEngine:
                     "page":   active_page_idx + 1,
                 })
 
+        regions_by_page: Dict[str, List[Dict[str, Any]]] = {}
+        for pidx, page in enumerate(pages):
+            page_patches: Dict[str, Dict[str, Any]] = {}
+            for patch in getattr(page, "cleanup_patches", []) or []:
+                rid = str(patch.get("region_id", "") or "")
+                if rid:
+                    page_patches[rid] = self._cleanup_patch_summary(patch)
+            page_regions = getattr(page, "regions", []) or []
+            page_trans = getattr(page, "translations", []) or []
+            entries = [
+                self._bootstrap_region_entry(
+                    pidx,
+                    ridx,
+                    block,
+                    page_trans[ridx] if ridx < len(page_trans) else "",
+                    page_patches,
+                    self._memory_hits.get(ridx, []) if pidx == active_page_idx else [],
+                )
+                for ridx, block in enumerate(page_regions)
+            ]
+            regions_by_page[str(pidx)] = entries
+
+        # Expose the primary owner on every page touched by a cross-page seam so
+        # the editor can present one logical object while preserving page-local
+        # geometry. The actual secondary remains serialized too, but the
+        # frontend filters it from editable lists via cross_page_secondary.
+        for owner_idx, page in enumerate(pages):
+            page_regions = getattr(page, "regions", []) or []
+            page_trans = getattr(page, "translations", []) or []
+            for ridx, block in enumerate(page_regions):
+                local = getattr(block, "page_local_bboxes", {}) or {}
+                if (
+                    not bool(getattr(block, "cross_page", False))
+                    or self._is_cross_page_secondary(block)
+                    or not isinstance(local, dict)
+                    or not self._cross_page_local_seam_valid(block, owner_idx)
+                ):
+                    continue
+                for raw_pidx, raw_bbox in local.items():
+                    try:
+                        pidx = int(raw_pidx)
+                    except Exception:
+                        continue
+                    if pidx == owner_idx or pidx not in range(len(pages)):
+                        continue
+                    if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
+                        continue
+                    entry = self._bootstrap_region_entry(
+                        owner_idx,
+                        ridx,
+                        block,
+                        page_trans[ridx] if ridx < len(page_trans) else "",
+                        {},
+                        [],
+                        bbox_override=tuple(int(v) for v in raw_bbox),
+                    )
+                    entry["source_page_idx"] = int(owner_idx)
+                    entry["id"] = f"p{owner_idx}-r{ridx+1}"
+                    entry["primary_region_id"] = f"r{ridx+1}"
+                    entry["primary_region_idx"] = int(ridx)
+                    regions_by_page.setdefault(str(pidx), []).append(entry)
+
         if not region_entries:
             issues.append({
                 "id": "no-regions", "sev": "info",
@@ -8369,6 +8689,7 @@ class LocalizerEngine:
             "chapters": chapters_by_series,
             "pages":    page_summaries,
             "regions":  region_entries,
+            "regionsByPage": regions_by_page,
             "issues":   issues,
             "memory":   self.list_series_memory(),
             "meta": {

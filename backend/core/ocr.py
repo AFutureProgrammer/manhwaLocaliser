@@ -9,6 +9,14 @@ import cv2
 import numpy as np
 
 try:
+    import torch as _torch  # type: ignore[import]
+    _torch_lib = os.path.join(os.path.dirname(_torch.__file__), "lib")
+    if hasattr(os, "add_dll_directory") and os.path.isdir(_torch_lib):
+        os.add_dll_directory(_torch_lib)
+except Exception:  # pragma: no cover - optional runtime
+    pass
+
+try:
     import onnxruntime as ort  # type: ignore
 except Exception:  # pragma: no cover - optional runtime
     ort = None

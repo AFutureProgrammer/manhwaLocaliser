@@ -316,18 +316,18 @@ class PywebviewAPI:
         except Exception as exc:
             return self._err(exc)
 
-    def update_region_bbox(self, region_idx: int, x: int, y: int, w: int, h: int) -> dict:
+    def update_region_bbox(self, region_idx: int, x: int, y: int, w: int, h: int, page_idx: Optional[int] = None) -> dict:
         if self._engine.busy:
             return self._err(RuntimeError("Already running — wait for the current step to finish."))
         try:
-            bootstrap = self._engine.update_region_bbox(int(region_idx), x, y, w, h)
+            bootstrap = self._engine.update_region_bbox(int(region_idx), x, y, w, h, page_idx)
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
 
-    def get_region_preview_sprite(self, region_idx: int, draft: Optional[dict] = None) -> dict:
+    def get_region_preview_sprite(self, region_idx: int, draft: Optional[dict] = None, page_idx: Optional[int] = None) -> dict:
         try:
-            return self._ok(**self._engine.get_region_preview_sprite(int(region_idx), draft or {}))
+            return self._ok(**self._engine.get_region_preview_sprite(int(region_idx), draft or {}, page_idx))
         except Exception as exc:
             return self._err(exc)
 

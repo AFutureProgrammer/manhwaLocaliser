@@ -486,6 +486,35 @@ const isBboxOnlyDraft = (draft?: RegionDraft) => {
   return keys.length > 0 && keys.every(k => k === "x" || k === "y" || k === "w" || k === "h");
 };
 const clampNumber = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const isCrossPageSecondary = (r: Region) => Boolean((r as any).cross_page_secondary);
+const regionOwnerPage = (r: Region, fallbackPage: number) =>
+  typeof r.source_page_idx === "number" ? r.source_page_idx : fallbackPage;
+const regionSegmentForPage = (r: Region, pageIdx: number): Region => {
+  const local = r.page_local_bboxes?.[String(pageIdx)];
+  if (r.cross_page && local?.length === 4) {
+    const [x, y, w, h] = local.map(Number);
+    if ([x, y, w, h].every(Number.isFinite) && w > 0 && h > 0) {
+      return { ...r, x, y, w, h };
+    }
+  }
+  return r;
+};
+const editorRegionId = (r: Region, pageIdx: number) => {
+  const ownerPage = regionOwnerPage(r, pageIdx);
+  const ownerRegionIdx = typeof r.primary_region_idx === "number" ? r.primary_region_idx : r.idx;
+  return `p${ownerPage}-r${ownerRegionIdx + 1}`;
+};
+const editorRegionsForPage = (data: Bootstrap, pageIdx: number): Region[] => {
+  const byPageMap = data.regionsByPage as unknown as Record<string, Region[]> | undefined;
+  const byPage = byPageMap?.[String(pageIdx)];
+  const source = byPage ?? (pageIdx === data.meta.activePageIdx ? data.regions : []);
+  return source
+    .filter(r => !isCrossPageSecondary(r))
+    .map(r => {
+      const segmented = regionSegmentForPage(r, pageIdx);
+      return { ...segmented, id: editorRegionId(segmented, pageIdx) };
+    });
+};
 
 /* ── Empty bootstrap ─────────────────────────────────────────────────────── */
 const EMPTY_BOOTSTRAP: Bootstrap = {
@@ -1119,6 +1148,7 @@ const ContinuousPage = ({
   selectedRegion,
   regionDrafts,
   showEnglishOverlay,
+  showOverlayBoxes,
   zoom,
   showMarker,
   totalPages,
@@ -1136,6 +1166,7 @@ const ContinuousPage = ({
   selectedRegion: Region | null;
   regionDrafts: Record<string, RegionDraft>;
   showEnglishOverlay: boolean;
+  showOverlayBoxes: boolean;
   zoom: number;
   showMarker: boolean;
   totalPages: number;
@@ -1158,7 +1189,7 @@ const ContinuousPage = ({
     startBox: RegionBBox;
     currentBox: RegionBBox;
   } | null>(null);
-  const [nearView, setNearView] = useState(idx < 3);
+  const [nearView, setNearView] = useState(idx < 2);
   const cacheKey = `${chapterDir}:page:${idx}:${imageMode}:${pageRevision}`;
   const rawCacheKey = `${chapterDir}:page:${idx}:raw:${pageRevision}`;
   const [src, setSrc] = useState<string | null>(() => PAGE_IMAGE_CACHE.get(cacheKey) ?? PAGE_IMAGE_CACHE.get(rawCacheKey) ?? null);
@@ -1175,7 +1206,7 @@ const ContinuousPage = ({
         setNearView(true);
         observer.disconnect();
       }
-    }, { rootMargin: "900px 0px" });
+    }, { rootMargin: "450px 0px" });
     observer.observe(node);
     return () => observer.disconnect();
   }, [nearView]);
@@ -1212,11 +1243,12 @@ const ContinuousPage = ({
   }, [chapterDir, idx, imageMode, nearView, cacheKey, rawCacheKey]);
 
   useEffect(() => {
-    if (!active || !chapterDir || !showEnglishOverlay || naturalSize.w <= 0 || naturalSize.h <= 0) return;
+    if (!active || !chapterDir || !showOverlayBoxes || !showEnglishOverlay || naturalSize.w <= 0 || naturalSize.h <= 0) return;
     if (dragRef.current) return;
     let cancelled = false;
     regions.forEach(region => {
       if (!region.visible || !region.tl) return;
+      if (regionOwnerPage(region, idx) !== idx) return;
       const draft = {
         ...(regionDrafts[region.id] ?? {}),
       };
@@ -1228,7 +1260,7 @@ const ContinuousPage = ({
       if (cached?.styleKey === styleKey && cached.b64) return;
       if (pendingSpriteKeysRef.current.has(requestKey)) return;
       pendingSpriteKeysRef.current.add(requestKey);
-      api.getRegionPreviewSprite(region.idx, draft).then(resp => {
+      api.getRegionPreviewSprite(region.idx, draft, idx).then(resp => {
         pendingSpriteKeysRef.current.delete(requestKey);
         if (cancelled || !resp.ok || !resp.b64) return;
         setPreviewSprites(prev => ({
@@ -1246,7 +1278,7 @@ const ContinuousPage = ({
       });
     });
     return () => { cancelled = true; };
-  }, [active, chapterDir, showEnglishOverlay, naturalSize.w, naturalSize.h, idx, regions, regionDrafts]);
+  }, [active, chapterDir, showOverlayBoxes, showEnglishOverlay, naturalSize.w, naturalSize.h, idx, regions, regionDrafts]);
 
   const clampContinuousBox = (box: RegionBBox): RegionBBox => {
     const minW = 8;
@@ -1372,7 +1404,7 @@ const ContinuousPage = ({
             draggable={false}
             onLoad={e => setNaturalSize({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
           />
-          {active && naturalSize.w > 0 && naturalSize.h > 0 && regions.map(region => {
+          {showOverlayBoxes && naturalSize.w > 0 && naturalSize.h > 0 && regions.map(region => {
             const draft = regionDrafts[region.id] ?? {};
             const r = {
               ...region,
@@ -1403,7 +1435,7 @@ const ContinuousPage = ({
                 <div className={`region-label ${isSelected ? "gold" : "teal"}`}>
                   {r.label}{r.locked ? " · LOCK" : ""}
                 </div>
-                {showEnglishOverlay && r.visible && r.tl && sprite?.b64 ? (
+                {showOverlayBoxes && showEnglishOverlay && r.visible && r.tl && sprite?.b64 ? (
                   <img
                     className="translation-bitmap-preview"
                     src={`data:image/png;base64,${sprite.b64}`}
@@ -1416,7 +1448,7 @@ const ContinuousPage = ({
                       height: `${(sprite.h / sprite.sourceBox.h) * 100}%`,
                     }}
                   />
-                ) : showEnglishOverlay && r.visible && r.tl && (
+                ) : showOverlayBoxes && showEnglishOverlay && r.visible && r.tl && (
                   <div
                     className="translation-overlay"
                     style={{
@@ -1454,6 +1486,7 @@ const ContinuousReader = ({
   selectedRegion,
   regionDrafts,
   showEnglishOverlay,
+  showOverlayBoxes,
   imageMode,
   pageVersions,
   zoom,
@@ -1470,6 +1503,7 @@ const ContinuousReader = ({
   selectedRegion: Region | null;
   regionDrafts: Record<string, RegionDraft>;
   showEnglishOverlay: boolean;
+  showOverlayBoxes: boolean;
   imageMode: ImageMode;
   pageVersions: Record<number, number>;
   zoom: number;
@@ -1547,10 +1581,11 @@ const ContinuousReader = ({
           chapterDir={data.meta.chapterDir}
           imageMode={imageMode}
           pageRevision={`rv${pg.render_version ?? 0}:${pageVersions[pg.idx] ?? 0}:${pg.status.join("")}:${pg.dirty ? 1 : 0}`}
-          regions={activePage === pg.idx ? data.regions : []}
+          regions={editorRegionsForPage(data, pg.idx)}
           selectedRegion={selectedRegion}
           regionDrafts={regionDrafts}
           showEnglishOverlay={showEnglishOverlay}
+          showOverlayBoxes={showOverlayBoxes}
           zoom={zoom}
           showMarker={showMarkers}
           totalPages={data.pages.length}
@@ -1620,6 +1655,7 @@ const CanvasArea = ({
   const previewTimers = useRef<Record<string, number>>({});
   const previewCallCounts = useRef<Record<string, number>>({});
   const bboxCommitCount = useRef(0);
+  const activePageGuardRef = useRef(activePage);
   const prevKey = useRef<string>("");
   const cleanedKey = useRef<string>("");
   const imageRef = useRef<HTMLImageElement | null>(null);
@@ -1645,6 +1681,10 @@ const CanvasArea = ({
   const previewSpriteMatches = (sprite: BackendPreviewSprite | undefined, region: Region & RegionDraft) =>
     Boolean(sprite?.b64 && sprite.styleKey === regionPreviewSpriteKey({ ...region, ...sprite.sourceBox }));
 
+  useEffect(() => {
+    activePageGuardRef.current = activePage;
+  }, [activePage]);
+
   // Load image whenever the page changes
   useEffect(() => {
     // Only fetch if a chapter is loaded
@@ -1661,13 +1701,13 @@ const CanvasArea = ({
 
     let cancelled = false;
     api.getPageImage(activePage, displayImageMode).then(async resp => {
-      if (cancelled) return;
+      if (cancelled || prevKey.current !== fetchKey) return;
       if (resp.ok && resp.b64) {
         setImageSrc(`data:image/png;base64,${resp.b64}`);
         return;
       }
       const rawResp = await api.getPageImage(activePage, "raw");
-      if (cancelled) return;
+      if (cancelled || prevKey.current !== fetchKey) return;
       if (rawResp.ok && rawResp.b64) {
         setImageSrc(`data:image/png;base64,${rawResp.b64}`);
         return;
@@ -1695,7 +1735,7 @@ const CanvasArea = ({
 
     let cancelled = false;
     api.getPageImage(activePage, "cleaned").then(resp => {
-      if (cancelled) return;
+      if (cancelled || cleanedKey.current !== fetchKey) return;
       setCleanedImageSrc(resp.ok && resp.b64 ? `data:image/png;base64,${resp.b64}` : null);
     }).catch(() => {
       if (!cancelled) setCleanedImageSrc(null);
@@ -1709,6 +1749,12 @@ const CanvasArea = ({
       setCssPreviewFallbacks({});
     }
   }, [activePage, pageStatusKey, displayImageMode, isTypesetDone, isRenderDirty]);
+
+  useEffect(() => {
+    setBackendPreviewSprites({});
+    setCssPreviewFallbacks({});
+    setDragPreview(null);
+  }, [activePage, pageStatusKey, showOverlayBoxes, selectedRegion?.id]);
 
   const onImgLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
     const img = e.currentTarget;
@@ -1903,28 +1949,37 @@ const CanvasArea = ({
     });
   };
 
-  const regions = data.regions.map(r => ({
+  const regions = editorRegionsForPage(data, activePage).map(r => ({
     ...r,
     ...(regionDrafts[r.id] ?? {}),
     ...(dragPreview?.id === r.id ? dragPreview.bbox : {}),
   }));
   const requestPreviewSprite = (region: Region | (Region & RegionDraft), draft: RegionDraft, reason: string, debounceMs = 0) => {
-    if (!data.meta.chapterDir || !region.visible || !region.tl || dragRef.current?.region.id === region.id) return;
+    if (!data.meta.chapterDir || !showOverlayBoxes || !region.visible || !region.tl || dragRef.current?.region.id === region.id) return;
     const slot = spriteSlot(region.id);
     if (previewTimers.current[slot]) window.clearTimeout(previewTimers.current[slot]);
     previewTimers.current[slot] = window.setTimeout(() => {
+      const requestPage = activePage;
+      const ownerPage = regionOwnerPage(region as Region, requestPage);
       previewCallCounts.current[reason] = (previewCallCounts.current[reason] ?? 0) + 1;
       renderDebug("preview.sprite.request", {
-        page: activePage,
+        page: requestPage,
+        ownerPage,
         region: region.idx,
         reason,
         count: previewCallCounts.current[reason],
         key: regionPreviewSpriteKey(region),
       });
-      api.getRegionPreviewSprite(region.idx, draft).then(resp => {
+      const requestStyleKey = regionPreviewSpriteKey(region);
+      api.getRegionPreviewSprite(region.idx, draft, ownerPage).then(resp => {
+        const latest = editorRegionsForPage(data, requestPage).find(r => r.id === region.id);
+        if (requestPage !== activePageGuardRef.current || !showOverlayBoxes || !latest || regionPreviewSpriteKey({ ...latest, ...(regionDrafts[region.id] ?? {}) }) !== requestStyleKey) {
+          return;
+        }
         if (resp.ok && resp.b64) {
           renderDebug("preview.sprite.backend", {
-            page: activePage,
+            page: requestPage,
+            ownerPage,
             region: region.idx,
             reason,
             font: resp.font,
@@ -1938,7 +1993,7 @@ const CanvasArea = ({
             ...prev,
             [slot]: {
               ...resp,
-              styleKey: regionPreviewSpriteKey(region),
+              styleKey: requestStyleKey,
               sourceBox: { x: region.x, y: region.y, w: region.w, h: region.h },
               reason,
             },
@@ -1951,7 +2006,8 @@ const CanvasArea = ({
           });
         } else {
           renderDebug("preview.sprite.fallback", {
-            page: activePage,
+            page: requestPage,
+            ownerPage,
             region: region.idx,
             reason,
             path: "css",
@@ -1968,13 +2024,13 @@ const CanvasArea = ({
     }, debounceMs);
   };
 
-  const activeBackendSprites = regions.reduce<BackendPreviewSprite[]>((acc, r) => {
+  const activeBackendSprites = showOverlayBoxes ? regions.reduce<BackendPreviewSprite[]>((acc, r) => {
     const sprite = backendPreviewSprites[spriteSlot(r.id)];
     if (previewSpriteMatches(sprite, r) && (dragPreview?.id === r.id || regionDrafts[r.id] || isRenderDirty || !isTypesetDone)) {
       acc.push(sprite);
     }
     return acc;
-  }, []);
+  }, []) : [];
   const hasBitmapPreview = activeBackendSprites.length > 0;
   const cleanedPatchBoxes = activeBackendSprites.map(sprite => {
       const x1 = Math.min(sprite.sourceBox.x, sprite.x);
@@ -1988,22 +2044,22 @@ const CanvasArea = ({
     const onSpriteRequest = (ev: Event) => {
       const detail = (ev as CustomEvent<{ page: number; regionId: string; reason: string; draft?: RegionDraft }>).detail;
       if (!detail || detail.page !== activePage) return;
-      const region = data.regions.find(r => r.id === detail.regionId);
+      const region = editorRegionsForPage(data, detail.page).find(r => r.id === detail.regionId);
       if (!region) return;
       const draft = detail.draft ?? regionDrafts[region.id] ?? {};
       requestPreviewSprite({ ...region, ...draft }, draft, detail.reason, 160);
     };
     window.addEventListener("ml:preview-sprite-request", onSpriteRequest);
     return () => window.removeEventListener("ml:preview-sprite-request", onSpriteRequest);
-  }, [activePage, data.regions, regionDrafts, data.meta.chapterDir]);
+  }, [activePage, data, regionDrafts, data.meta.chapterDir]);
 
   useEffect(() => {
-    if (!data.meta.chapterDir || !showEnglishOverlay || dragRef.current) return;
+    if (!data.meta.chapterDir || !showOverlayBoxes || !showEnglishOverlay || dragRef.current) return;
     if (imageMode === "best" && isTypesetDone && !isRenderDirty) return;
-    data.regions.forEach(region => {
+    regions.forEach(region => {
       if (region.visible && region.tl) requestPreviewSprite(region, {}, "overlay_restore", 0);
     });
-  }, [activePage, pageStatusKey, data.meta.chapterDir, isTypesetDone, isRenderDirty, imageMode, showEnglishOverlay]);
+  }, [activePage, pageStatusKey, data.meta.chapterDir, isTypesetDone, isRenderDirty, imageMode, showEnglishOverlay, showOverlayBoxes]);
 
   const overlayFontSize = (r: Region) => {
     if (r.size && r.size > 0) return Math.max(8, Math.min(72, r.size)) * scale;
@@ -2170,7 +2226,7 @@ const CanvasArea = ({
           className={`btn-ghost ${showOverlayBoxes ? "active" : ""}`}
           style={{ padding: "4px 7px", fontSize: 10 }}
           onClick={() => setShowOverlayBoxes(!showOverlayBoxes)}
-          title="Show/hide region boxes, labels and handles. Does NOT affect rendered text or export."
+          title="Show/hide editor overlays: boxes, labels, handles, debug boxes, and live preview text. Does not affect the base image or exported output."
         >
           Boxes
         </button>
@@ -2211,6 +2267,7 @@ const CanvasArea = ({
             selectedRegion={selectedRegion}
             regionDrafts={regionDrafts}
             showEnglishOverlay={showEnglishOverlay}
+            showOverlayBoxes={showOverlayBoxes}
             imageMode={displayImageMode}
             pageVersions={pageVersions}
             zoom={zoom}
@@ -2275,7 +2332,7 @@ const CanvasArea = ({
               </div>
             ))}
 
-            {cleanupDebug && (
+            {showOverlayBoxes && cleanupDebug && (
               <>
                 {renderDebugMask("textMask", "text_mask", "rgba(64,130,255,0.74)")}
                 {renderDebugMask("cleanupMask", "cleanup_mask", "rgba(255,0,220,0.74)")}
@@ -2290,7 +2347,7 @@ const CanvasArea = ({
             )}
 
             {/* Region overlays (positioned in original image coordinates, displayed at current zoom) */}
-            {imageSrc && regions.map(r => {
+            {imageSrc && showOverlayBoxes && regions.map(r => {
               if (!r.visible && selectedRegion?.id !== r.id) return null;
               // Pass 4: hide SFX regions entirely when the master toggle is OFF.
               if (r.pipeline_disabled && selectedRegion?.id !== r.id) return null;
@@ -2311,10 +2368,7 @@ const CanvasArea = ({
                 : null;
               const expectsBackendSprite = r.visible && Boolean(r.tl) && wantsPreviewText;
               const allowCssFallback = !expectsBackendSprite || Boolean(cssPreviewFallbacks[spriteSlot(r.id)]);
-              // Pass 5: overlay chrome visibility — force chrome on when the
-              // region is currently selected so the user can still find/edit
-              // their selection even with Boxes OFF.
-              const showChrome = showOverlayBoxes || isSelected;
+              const showChrome = showOverlayBoxes;
               const liveBox = dragPreview?.id === r.id ? dragPreview.bbox : r;
               return (
                 <div
@@ -2655,13 +2709,17 @@ const InspectorTab = ({
   const sam2BackendUrl = String(sam2Settings?.sam2_backend_url ?? "").trim();
   const sam2StatusInfo = sam2Settings?.sam2_status ?? {};
   const sam2BackendMode = sam2BackendUrl ? "service" : "embedded";
+  const settingBool = (value: unknown) => {
+    if (typeof value === "boolean") return value;
+    return String(value ?? "").trim().toLowerCase() === "true";
+  };
   const sam2StatusLabel = String(
     sam2StatusInfo.status
-      ?? (sam2Settings?.sam2_enabled ? (sam2BackendUrl ? "service" : "available") : "disabled")
+      ?? (settingBool(sam2Settings?.sam2_enabled) ? (sam2BackendUrl ? "service" : "available") : "disabled")
   );
   const sam2StatusError = String(sam2StatusInfo.error ?? "");
-  const sam2Enabled = Boolean(sam2Settings?.sam2_enabled);
-  const sam2DisabledReason = !sam2Settings?.sam2_enabled
+  const sam2Enabled = settingBool(sam2Settings?.sam2_enabled);
+  const sam2DisabledReason = !sam2Enabled
     ? "SAM2 disabled in settings"
     : sam2Settings?.sam2_mask_mode === "manual_only"
       ? "SAM2 mask mode is manual_only"
@@ -3975,8 +4033,13 @@ export default function App() {
       if (progressRefreshTimerRef.current !== null) return;
       progressRefreshTimerRef.current = window.setTimeout(() => {
         progressRefreshTimerRef.current = null;
+        const visiblePage = activePageRef.current;
+        suppressBackendPageSyncRef.current = true;
         api.getBootstrap().then(resp => {
           if (resp.ok) applyBootstrapRef.current(resp as unknown as Bootstrap);
+          setActivePage(visiblePage);
+        }).finally(() => {
+          suppressBackendPageSyncRef.current = false;
         });
       }, 450);
     };
@@ -4042,7 +4105,8 @@ export default function App() {
     setSelectedSeries(nextSeries);
     if (b.meta.activeChapterId) setActiveChapter(b.meta.activeChapterId);
     if (!suppressBackendPageSyncRef.current && typeof b.meta.activePageIdx === "number") setActivePage(b.meta.activePageIdx);
-    setSelectedRegion(prev => prev ? (b.regions.find(r => r.id === prev.id) ?? null) : null);
+    const selectionPage = suppressBackendPageSyncRef.current ? activePageRef.current : (b.meta.activePageIdx ?? activePageRef.current);
+    setSelectedRegion(prev => prev ? (editorRegionsForPage(b, selectionPage).find(r => r.id === prev.id) ?? null) : null);
     setLiveStatus(b.meta.status || "");
     // Pass 4: keep modelConfig in sync with backend settings so the settings
     // panel always reflects current state (e.g. process_sfx_regions) without
@@ -4325,12 +4389,25 @@ export default function App() {
 
   const handleUpdateRegion = useCallback(async (idx: number, field: string, value: unknown) => {
     renderDebug("backend.mutation", { action: "updateRegion", page: activePage, region: idx, field, value });
-    const resp = await api.updateRegion(idx, field, value);
+    const ownerPage = selectedRegion?.idx === idx ? regionOwnerPage(selectedRegion, activePage) : activePage;
+    let resp: any = { ok: false };
+    suppressBackendPageSyncRef.current = true;
+    try {
+      if (ownerPage !== activePage) await api.goToPage(ownerPage);
+      resp = await api.updateRegion(idx, field, value);
+      if (ownerPage !== activePage) {
+        const back = await api.goToPage(activePage);
+        if (back.ok) resp = back;
+      }
+    } finally {
+      suppressBackendPageSyncRef.current = false;
+    }
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
+      setActivePage(activePage);
       showToast(field === "translation" ? "Translation saved" : field === "text" ? "Source saved" : "Region updated");
     }
-  }, [activePage]);
+  }, [activePage, selectedRegion]);
 
   const handlePreviewRegion = useCallback((regionId: string, patch: RegionDraft, options?: { requestSprite?: boolean; reason?: string }) => {
     renderDebug("local.previewMutation", { action: "previewRegion", page: activePage, regionId, patch });
@@ -4358,7 +4435,7 @@ export default function App() {
   }, [activePage]);
 
   const handleCommitBBox = useCallback(async (region: Region, bbox: RegionBBox) => {
-    const baseRegion = data.regions.find(r => r.id === region.id);
+    const baseRegion = editorRegionsForPage(data, activePage).find(r => r.id === region.id);
     const pendingStyle: Array<[string, unknown]> = [];
     if (baseRegion) {
       if (region.font !== baseRegion.font) pendingStyle.push(["font_name", region.font]);
@@ -4392,9 +4469,22 @@ export default function App() {
       beforeStyle: regionStyleDebug(region),
     });
     renderDebug("api.updateRegionBBox", { page: activePage, region: region.idx, bbox: cleanBbox });
-    const resp = await api.updateRegionBBox(region.idx, cleanBbox.x, cleanBbox.y, cleanBbox.w, cleanBbox.h);
+    const ownerPage = regionOwnerPage(region, activePage);
+    let resp: any = { ok: false };
+    suppressBackendPageSyncRef.current = true;
+    try {
+      if (ownerPage !== activePage) await api.goToPage(ownerPage);
+      resp = await api.updateRegionBBox(region.idx, cleanBbox.x, cleanBbox.y, cleanBbox.w, cleanBbox.h, activePage);
+      if (ownerPage !== activePage) {
+        const back = await api.goToPage(activePage);
+        if (back.ok) resp = back;
+      }
+    } finally {
+      suppressBackendPageSyncRef.current = false;
+    }
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
+      setActivePage(activePage);
       showToast("Region updated; cleanup/typeset may need refresh");
       return true;
     }
@@ -4414,43 +4504,69 @@ export default function App() {
     }
   }, []);
 
+  const runForRegionOwner = useCallback(async <T,>(region: Region, fn: () => Promise<T>): Promise<T> => {
+    const ownerPage = regionOwnerPage(region, activePage);
+    suppressBackendPageSyncRef.current = true;
+    try {
+      if (ownerPage !== activePage) await api.goToPage(ownerPage);
+      const result = await fn();
+      if (ownerPage !== activePage) await api.goToPage(activePage);
+      return result;
+    } finally {
+      suppressBackendPageSyncRef.current = false;
+    }
+  }, [activePage]);
+
   const handleDeleteRegion = useCallback(async (idx: number, yoloRejectReason = "") => {
-    const resp = await api.deleteRegion(idx, yoloRejectReason);
+    const region = selectedRegion?.idx === idx ? selectedRegion : null;
+    const resp = region
+      ? await runForRegionOwner(region, () => api.deleteRegion(idx, yoloRejectReason))
+      : await api.deleteRegion(idx, yoloRejectReason);
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
+      setActivePage(activePage);
       showToast(yoloRejectReason ? "Region deleted and saved as YOLO correction" : "Region deleted");
     }
-  }, []);
+  }, [activePage, runForRegionOwner, selectedRegion]);
 
   const handleSetYoloTrainClass = useCallback(async (region: Region, classId: number) => {
-    const resp = await api.setYoloTrainClass(region.idx, classId);
+    const resp = await runForRegionOwner(region, () => api.setYoloTrainClass(region.idx, classId));
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
+      setActivePage(activePage);
       const label = ["dialogue", "caption", "sfx", "shout"][classId] ?? String(classId);
       showToast(`YOLO positive label saved: ${label}`);
     } else {
       showToast(`YOLO label failed: ${resp.error ?? "unknown error"}`);
     }
-  }, []);
+  }, [activePage, runForRegionOwner]);
 
   const handleOcrRegion = useCallback(async (idx: number) => {
-    const resp = await api.ocrRegion(idx);
+    const region = selectedRegion?.idx === idx ? selectedRegion : null;
+    const resp = region
+      ? await runForRegionOwner(region, () => api.ocrRegion(idx))
+      : await api.ocrRegion(idx);
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
+      setActivePage(activePage);
       showToast("OCR updated");
     }
-  }, []);
+  }, [activePage, runForRegionOwner, selectedRegion]);
 
   const handleTranslateRegion = useCallback(async (idx: number) => {
-    const resp = await api.translateRegion(idx);
+    const region = selectedRegion?.idx === idx ? selectedRegion : null;
+    const resp = region
+      ? await runForRegionOwner(region, () => api.translateRegion(idx))
+      : await api.translateRegion(idx);
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
+      setActivePage(activePage);
       showToast("Translation saved");
     }
-  }, []);
+  }, [activePage, runForRegionOwner, selectedRegion]);
 
   const handlePreviewCleanup = useCallback(async (region: Region, manualMask?: CleanupMaskPayload) => {
-    const resp = await api.previewRegionCleanup(region.idx, manualMask ?? null);
+    const resp = await runForRegionOwner(region, () => api.previewRegionCleanup(region.idx, manualMask ?? null));
     if (resp.ok) {
       setCleanupPreview({ ...resp, regionId: region.id });
       showToast("Cleanup preview ready");
@@ -4459,36 +4575,36 @@ export default function App() {
       showToast(`Preview failed: ${resp.error ?? "unknown error"}`);
     }
     return null;
-  }, []);
+  }, [runForRegionOwner]);
 
   const handleSuggestSam2Mask = useCallback(async (region: Region, prompt: Record<string, unknown>) => {
-    const resp = await api.proposeCleanupMaskSam2(region.idx, prompt);
+    const resp = await runForRegionOwner(region, () => api.proposeCleanupMaskSam2(region.idx, prompt));
     if (resp.ok) {
       showToast("SAM2 mask suggested");
       return resp as Sam2MaskResponse;
     }
     showToast(`SAM2 unavailable: ${resp.error ?? resp.status ?? "unknown error"}`);
     return resp as Sam2MaskResponse;
-  }, []);
+  }, [runForRegionOwner]);
 
   const handleRefreshCleanupDebug = useCallback(async (region: Region, manualMask?: CleanupMaskPayload) => {
-    const resp = await api.getRegionCleanupDebug(region.idx, manualMask ?? null);
+    const resp = await runForRegionOwner(region, () => api.getRegionCleanupDebug(region.idx, manualMask ?? null));
     if (resp.ok) {
       setCleanupDebug({ ...resp, regionId: region.id });
       return resp;
     }
     showToast(`Debug overlays failed: ${resp.error ?? "unknown error"}`);
     return null;
-  }, []);
+  }, [runForRegionOwner]);
 
   const handleRecordMaskQaLabel = useCallback(async (region: Region, label: string) => {
-    const resp = await api.recordMaskQaLabel(region.idx, label);
+    const resp = await runForRegionOwner(region, () => api.recordMaskQaLabel(region.idx, label));
     if (resp.ok) {
       showToast(`Mask QA label saved: ${resp.label ?? label}`);
     } else {
       showToast(`Mask QA label failed: ${resp.error ?? "unknown error"}`);
     }
-  }, []);
+  }, [runForRegionOwner]);
 
   const handleTrainMaskQaModel = useCallback(async () => {
     const resp = await api.trainMaskQaModel();
@@ -4504,7 +4620,7 @@ export default function App() {
   const handleCompareCleanupCandidates = useCallback(async (region: Region, manualMask?: CleanupMaskPayload) => {
     setCleanupCompareLoading(true);
     try {
-      const resp = await api.compareRegionCleanupCandidates(region.idx, manualMask ?? null);
+      const resp = await runForRegionOwner(region, () => api.compareRegionCleanupCandidates(region.idx, manualMask ?? null));
       if (resp.ok) {
         setCleanupCandidates({ ...resp, regionId: region.id });
         const first = (resp.candidates ?? []).find(c => c.candidate_id === resp.recommended_candidate_id && c.is_available)
@@ -4518,7 +4634,7 @@ export default function App() {
     } finally {
       setCleanupCompareLoading(false);
     }
-  }, []);
+  }, [runForRegionOwner]);
 
   const handleDebugOverlayChange = useCallback((key: DebugOverlayKey, value: boolean) => {
     setDebugOverlays(prev => ({ ...prev, [key]: value }));
@@ -4545,58 +4661,74 @@ export default function App() {
   }, []);
 
   const handleApplyCleanupCandidate = useCallback(async (idx: number, candidateId: string, manualMask?: CleanupMaskPayload) => {
-    const resp = await api.applyRegionCleanupCandidate(idx, candidateId, manualMask ?? null);
+    const region = selectedRegion?.idx === idx ? selectedRegion : null;
+    const resp = region
+      ? await runForRegionOwner(region, () => api.applyRegionCleanupCandidate(idx, candidateId, manualMask ?? null))
+      : await api.applyRegionCleanupCandidate(idx, candidateId, manualMask ?? null);
     if (resp.ok) {
       setCleanupPreview(null);
       setCleanupDebug(null);
       setCleanupCandidates(null);
       setSelectedCandidateId("");
       applyBootstrap(resp as unknown as Bootstrap);
+      setActivePage(activePage);
       bumpPageImageVersions([activePageRef.current]);
       showToast("Cleanup candidate applied");
     } else {
       showToast(`Candidate apply failed: ${resp.error ?? "unknown error"}`);
     }
-  }, []);
+  }, [activePage, runForRegionOwner, selectedRegion]);
 
   const handleApplyCleanup = useCallback(async (idx: number, manualMask?: CleanupMaskPayload) => {
-    const resp = await api.applyRegionCleanup(idx, manualMask ?? null);
+    const region = selectedRegion?.idx === idx ? selectedRegion : null;
+    const resp = region
+      ? await runForRegionOwner(region, () => api.applyRegionCleanup(idx, manualMask ?? null))
+      : await api.applyRegionCleanup(idx, manualMask ?? null);
     if (resp.ok) {
       setCleanupPreview(null);
       setCleanupDebug(null);
       setCleanupCandidates(null);
       setSelectedCandidateId("");
       applyBootstrap(resp as unknown as Bootstrap);
+      setActivePage(activePage);
       bumpPageImageVersions([activePageRef.current]);
       showToast("Cleanup applied");
     }
-  }, []);
+  }, [activePage, runForRegionOwner, selectedRegion]);
 
   const handleRerunCleanup = useCallback(async (idx: number, manualMask?: CleanupMaskPayload) => {
-    const resp = await api.rerunRegionCleanup(idx, manualMask ?? null);
+    const region = selectedRegion?.idx === idx ? selectedRegion : null;
+    const resp = region
+      ? await runForRegionOwner(region, () => api.rerunRegionCleanup(idx, manualMask ?? null))
+      : await api.rerunRegionCleanup(idx, manualMask ?? null);
     if (resp.ok) {
       setCleanupPreview(null);
       setCleanupDebug(null);
       setCleanupCandidates(null);
       setSelectedCandidateId("");
       applyBootstrap(resp as unknown as Bootstrap);
+      setActivePage(activePage);
       bumpPageImageVersions([activePageRef.current]);
       showToast("Cleanup rerun");
     }
-  }, []);
+  }, [activePage, runForRegionOwner, selectedRegion]);
 
   const handleDeleteCleanup = useCallback(async (idx: number) => {
-    const resp = await api.deleteRegionCleanup(idx);
+    const region = selectedRegion?.idx === idx ? selectedRegion : null;
+    const resp = region
+      ? await runForRegionOwner(region, () => api.deleteRegionCleanup(idx))
+      : await api.deleteRegionCleanup(idx);
     if (resp.ok) {
       setCleanupPreview(null);
       setCleanupDebug(null);
       setCleanupCandidates(null);
       setSelectedCandidateId("");
       applyBootstrap(resp as unknown as Bootstrap);
+      setActivePage(activePage);
       bumpPageImageVersions([activePageRef.current]);
       showToast("Cleanup patch removed");
     }
-  }, []);
+  }, [activePage, runForRegionOwner, selectedRegion]);
 
   const handleUndo = useCallback(async () => {
     const resp = await api.undo();
@@ -4641,6 +4773,7 @@ export default function App() {
   const canContinueRunAll = Boolean(runAllCheckpoint?.active);
   const continueTitle = runAllCheckpoint?.message
     || `Continue Run All from ${runAllCheckpoint?.phase ?? "saved"} page ${((runAllCheckpoint?.page_idx ?? 0) + 1)} / ${runAllCheckpoint?.page_total ?? data.pages.length}`;
+  const visiblePageData: Bootstrap = { ...data, regions: editorRegionsForPage(data, activePage) };
 
   return (
     <>
@@ -4735,7 +4868,7 @@ export default function App() {
           style={{ width: rightOpen ? rightWidth : 0 }}
         >
           <RightPanel
-            data={data}
+            data={visiblePageData}
             region={selectedRegion}
             issues={data.issues}
             pageIndex={activePage}
@@ -4784,7 +4917,7 @@ export default function App() {
       </div>
 
       <StatusBar
-        data={data}
+        data={visiblePageData}
         activePage={activePage}
         selectedRegion={selectedRegion}
         pipeRunning={pipeRunning}

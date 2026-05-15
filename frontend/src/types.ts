@@ -66,6 +66,10 @@ export interface Region {
   cross_page_pages?: number[];
   composite_bbox?: number[] | null;
   page_local_bboxes?: Record<string, number[]>;
+  cross_page_secondary?: boolean;
+  primary_region_id?: string | null;
+  primary_region_idx?: number | null;
+  source_page_idx?: number;
   typeset_status?: string;
   typeset_reason?: string;
   /** Derived: "ok" | "flagged" | "skipped_sfx" | "pending". No fake numeric confidence. */
@@ -406,6 +410,7 @@ export interface Bootstrap {
   chapters: Record<string, Chapter[]>;
   pages:    PageSummary[];
   regions:  Region[];
+  regionsByPage?: Record<number, Region[]>;
   issues:   Issue[];
   memory:   SeriesMemory;
   meta:     Meta;

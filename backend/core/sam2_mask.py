@@ -142,11 +142,8 @@ def _prepare_import_path(model_path: pathlib.Path) -> None:
 def _select_device(torch: Any, requested: str) -> str:
     device = str(requested or "auto").strip().lower()
     if device == "auto":
-        if bool(getattr(torch.cuda, "is_available", lambda: False)()):
-            return "cuda"
-        mps = getattr(getattr(torch, "backends", None), "mps", None)
-        if mps is not None and bool(getattr(mps, "is_available", lambda: False)()):
-            return "mps"
+        # Avoid probing CUDA on auto. On Windows, torch.cuda.is_available() can
+        # load incompatible cuDNN DLLs before Python can catch a clean fallback.
         return "cpu"
     if device == "cuda" and not bool(getattr(torch.cuda, "is_available", lambda: False)()):
         raise RuntimeError("SAM2 device is set to cuda, but CUDA is not available to torch.")
@@ -157,6 +154,11 @@ def _select_device(torch: Any, requested: str) -> str:
     if device not in {"cpu", "cuda", "mps"}:
         raise RuntimeError(f"Unsupported SAM2 device: {requested!r}. Use auto, cpu, cuda, or mps.")
     return device
+
+
+def _is_cuda_runtime_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(token in text for token in ("cuda", "cudnn", "cublas", "cufft", "nvrtc"))
 
 
 def _config_for_checkpoint(checkpoint_path: pathlib.Path) -> str:
@@ -260,7 +262,14 @@ def load(config: Any) -> Dict[str, Any]:
                     _STATUS.update({"status": "import_failed", "error": _sam2_import_error(exc)})
                     return dict(_STATUS)
             device = _select_device(torch, requested_device)
-            sam_model = build_mod.build_sam2(_config_for_checkpoint(checkpoint_path), str(checkpoint_path), device=device)
+            try:
+                sam_model = build_mod.build_sam2(_config_for_checkpoint(checkpoint_path), str(checkpoint_path), device=device)
+            except Exception as exc:
+                if requested_device == "auto" and device == "cuda" and _is_cuda_runtime_error(exc):
+                    device = "cpu"
+                    sam_model = build_mod.build_sam2(_config_for_checkpoint(checkpoint_path), str(checkpoint_path), device=device)
+                else:
+                    raise
             _PREDICTOR = predictor_mod.SAM2ImagePredictor(sam_model)
             _CACHE_KEY = key
             _STATUS = {
