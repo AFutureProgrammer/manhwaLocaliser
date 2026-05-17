@@ -49,6 +49,7 @@ import datetime
 import hashlib
 import io
 import json
+import math
 import os
 import pathlib
 import re
@@ -66,7 +67,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 EDITOR_DEBUG = os.environ.get("MANHWA_RENDER_DEBUG", "1").strip().lower() not in {"0", "false", "off", "no"}
 
@@ -232,6 +233,7 @@ class ComicFontLibrary:
         self._cache:  Dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
         # stem → path mapping for get_by_name()
         self._stem_to_path: Dict[str, str] = {}
+        self.used_system_fallback = False
         self._scan()
 
     def _scan(self) -> None:
@@ -287,6 +289,8 @@ class ComicFontLibrary:
                     continue
 
         font = choose_system_font(size)
+        self.used_system_fallback = True
+        debug_print(f"ComicFontLibrary.get: role={requested_role!r} effective_role={role!r} size={size} -> system font fallback")
         self._cache[key] = font
         return font
 
@@ -836,6 +840,390 @@ class LocalizerEngine:
             "detector_source": getattr(block, "detector_source", "ocr") or "ocr",
         }
 
+    @staticmethod
+    def _style_to_raw_summary(style: TextStyle, status: str, ignored: Optional[List[str]] = None) -> Dict[str, Any]:
+        parts = [f"{_hex_color(style.fg_color, '#111111')} fill"]
+        matched = ["fill"]
+        if int(getattr(style, "outline_width", 0) or 0) > 0:
+            parts.append(f"{_hex_color(style.outline_color, '#ffffff')} outline")
+            matched.append("outline")
+        if getattr(style, "shadow_on", False):
+            parts.append(f"{_hex_color(style.shadow_color, '#000000')} shadow")
+            matched.append("shadow")
+        if getattr(style, "glow_on", False):
+            parts.append(f"{_hex_color(style.glow_color, '#ffffff')} glow")
+            matched.append("glow")
+        if getattr(style, "gradient_on", False):
+            parts.append("linear gradient")
+            matched.append("gradient")
+        ignored = ignored or []
+        return {
+            "status": status,
+            "summary": ", ".join(parts),
+            "matched": matched,
+            "ignored": ignored,
+            "style": style.to_dict(),
+        }
+
+    @staticmethod
+    def _style_allows_raw_auto(block: OCRBlock) -> bool:
+        style = getattr(block, "style", None)
+        if style is None:
+            return True
+        source = str(getattr(style, "source", "") or "")
+        return source in {"", "auto", "raw:auto", "raw:proposal"}
+
+    @staticmethod
+    def _raw_auto_role_allowed(block: OCRBlock) -> bool:
+        role = str(getattr(block, "bubble_role", "") or "dialog").lower()
+        if role in {"sfx", "sound"}:
+            return False
+        kind = str(getattr(getattr(block, "region_kind", None), "name", "") or "")
+        if kind in {"SFX_OVER_ART", "DIALOGUE_OVER_ART"}:
+            return False
+        return role in {"dialog", "dialogue", "caption", "narration", ""}
+
+    def _auto_apply_raw_style_if_safe(self, block: OCRBlock, *, force_analysis: bool = False) -> bool:
+        match = self._analyze_raw_style_for_block(block, force=force_analysis)
+        if match.get("status") != "high":
+            return False
+        if not self._raw_auto_role_allowed(block):
+            return False
+        if not self._style_allows_raw_auto(block):
+            return False
+        style_data = match.get("style")
+        if not isinstance(style_data, dict):
+            return False
+        block.style = TextStyle.from_dict(style_data)
+        block.style.source = "raw:auto"
+        match["auto_applied"] = True
+        block.raw_style_match = match
+        return True
+
+    def _analyze_raw_style_for_block(self, block: OCRBlock, force: bool = False) -> Dict[str, Any]:
+        existing = getattr(block, "raw_style_match", {}) or {}
+        if existing and not force:
+            return existing
+        if self._raw_cv is None:
+            match = {"status": "fallback", "summary": "RAW unavailable; using readable defaults", "matched": [], "ignored": ["raw image unavailable"], "downgrade_reasons": ["raw_unavailable"]}
+            block.raw_style_match = match
+            return match
+
+        try:
+            mask = build_text_mask_for_block(self._raw_cv.shape, block, pad=0)
+            x, y, w, h = block.bbox()
+            x1 = max(0, int(x)); y1 = max(0, int(y))
+            x2 = min(self._raw_cv.shape[1], int(x + w)); y2 = min(self._raw_cv.shape[0], int(y + h))
+            crop = self._raw_cv[y1:y2, x1:x2]
+            local_mask = mask[y1:y2, x1:x2] if y2 > y1 and x2 > x1 else None
+            style = copy.deepcopy(block.effective_style())
+            ignored: List[str] = []
+            downgrade_reasons: List[str] = []
+            confidence: Dict[str, str] = {
+                "fill_confidence": "low",
+                "outline_confidence": "low",
+                "shadow_confidence": "low",
+                "glow_confidence": "low",
+                "gradient_confidence": "low",
+                "overall_confidence": "fallback",
+            }
+            status = "fallback"
+
+            if crop.size and local_mask is not None and int(np.count_nonzero(local_mask)) >= 12:
+                candidate = local_mask > 0
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                candidate_u8 = candidate.astype(np.uint8) * 255
+                outer = cv2.dilate(candidate_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)), iterations=1)
+                outer = cv2.subtract(outer, candidate_u8)
+                bg_pixels = crop[outer > 0]
+                if bg_pixels.size == 0:
+                    border = np.zeros(candidate.shape, dtype=bool)
+                    border[:2, :] = True; border[-2:, :] = True; border[:, :2] = True; border[:, -2:] = True
+                    bg_pixels = crop[border]
+                bg_bgr = np.median(bg_pixels, axis=0) if bg_pixels.size else np.median(crop.reshape(-1, 3), axis=0)
+                bg_luma = float(0.114 * bg_bgr[0] + 0.587 * bg_bgr[1] + 0.299 * bg_bgr[2])
+
+                diff = np.abs(crop.astype(np.int16) - bg_bgr.astype(np.int16)[None, None, :]).sum(axis=2)
+                cand_diff = diff[candidate]
+                diff_threshold = max(28.0, float(np.percentile(cand_diff, 68)) * 0.72) if cand_diff.size else 40.0
+                glyph_mask = candidate & (diff >= diff_threshold)
+                if int(np.count_nonzero(glyph_mask)) < 12 and cand_diff.size:
+                    glyph_mask = candidate & (diff >= max(18.0, float(np.percentile(cand_diff, 82)) * 0.55))
+                glyph_u8 = (glyph_mask.astype(np.uint8) * 255)
+                if int(np.count_nonzero(glyph_u8)) >= 12:
+                    glyph_u8 = cv2.morphologyEx(glyph_u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)))
+                    if int(np.count_nonzero(glyph_u8)) < 12:
+                        glyph_u8 = glyph_mask.astype(np.uint8) * 255
+                glyph_mask = glyph_u8 > 0
+                text_px = int(np.count_nonzero(glyph_mask))
+                if text_px < 12:
+                    downgrade_reasons.append("insufficient_glyph_pixels")
+                    ignored.append("fill: insufficient glyph pixels")
+                else:
+                    pixels = crop[glyph_mask]
+                    med_bgr = np.median(pixels, axis=0)
+                    fill = (int(med_bgr[2]), int(med_bgr[1]), int(med_bgr[0]))
+                    style.fg_color = fill
+                    fill_std = float(np.mean(np.std(pixels.astype(np.float32), axis=0)))
+                    fill_bg_delta = float(np.abs(med_bgr.astype(np.float32) - bg_bgr.astype(np.float32)).sum())
+                    confidence["fill_confidence"] = "high" if fill_bg_delta > 95 or (fill_std < 70 and fill_bg_delta > 45) else "medium"
+                    status = "high" if confidence["fill_confidence"] == "high" else "medium"
+
+                    quant = (pixels[:, ::-1] // 48).astype(np.int16)
+                    if quant.shape[0] >= 36:
+                        clusters, counts = np.unique(quant, axis=0, return_counts=True)
+                        order = np.argsort(counts)[::-1]
+                        if order.size >= 2:
+                            a = clusters[order[0]].astype(np.float32) * 48
+                            b = clusters[order[1]].astype(np.float32) * 48
+                            if counts[order[1]] / max(1, counts[order[0]]) > 0.32 and float(np.linalg.norm(a - b)) > 70:
+                                downgrade_reasons.append("mixed_styles")
+                                ignored.append("style: mixed_styles")
+
+                    outline_candidates: List[Tuple[int, float, np.ndarray, float]] = []
+                    prev = glyph_u8.copy()
+                    fill_bgr = np.array([fill[2], fill[1], fill[0]], dtype=np.float32)
+                    for radius in range(1, 7):
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+                        dilated = cv2.dilate(glyph_u8, kernel, iterations=1)
+                        ring = cv2.subtract(dilated, prev)
+                        prev = dilated
+                        ring_pixels = crop[ring > 0]
+                        if ring_pixels.size == 0:
+                            continue
+                        ring_med = np.median(ring_pixels, axis=0)
+                        fill_delta = float(np.abs(ring_med.astype(np.float32) - fill_bgr).sum())
+                        bg_delta = float(np.abs(ring_med.astype(np.float32) - bg_bgr.astype(np.float32)).sum())
+                        coverage = int(np.count_nonzero(ring)) / max(1, text_px)
+                        if fill_delta > 42 and bg_delta > 24 and coverage > 0.025:
+                            outline_candidates.append((radius, fill_delta, ring_med, bg_delta))
+                    if outline_candidates:
+                        best_radius = max(item[0] for item in outline_candidates)
+                        best = max(outline_candidates, key=lambda item: item[1] + item[3])
+                        outline = (int(best[2][2]), int(best[2][1]), int(best[2][0]))
+                        style.outline_color = outline
+                        style.outline_width = int(np.clip(best_radius, 1, 8))
+                        confidence["outline_confidence"] = "high" if len(outline_candidates) >= 2 or best[1] > 95 else "medium"
+                    else:
+                        style.outline_width = 0
+                        ignored.append("outline: no distinct outline ring")
+
+                    text_density = text_px / max(1, int(candidate.size))
+                    style.raw_weight = "bold" if text_density > 0.20 else ("light" if text_density < 0.055 else "regular")  # type: ignore[attr-defined]
+                    confidence["weight_confidence"] = "medium"
+
+                    ys, xs = np.where(glyph_mask)
+                    text_rgb = pixels[:, ::-1].astype(np.float32)
+                    if text_rgb.shape[0] >= 30 and xs.size >= 30:
+                        x_norm = (xs.astype(np.float32) - float(xs.mean())) / max(1.0, float(np.ptp(xs)))
+                        y_norm = (ys.astype(np.float32) - float(ys.mean())) / max(1.0, float(np.ptp(ys)))
+                        design = np.column_stack([x_norm, y_norm, np.ones_like(x_norm)])
+                        coeff, *_ = np.linalg.lstsq(design, text_rgb, rcond=None)
+                        pred = design @ coeff
+                        residual = float(np.mean((text_rgb - pred) ** 2))
+                        total = float(np.mean((text_rgb - np.mean(text_rgb, axis=0)) ** 2)) + 1e-6
+                        r2 = max(0.0, 1.0 - residual / total)
+                        trend_vec = coeff[:2, :].T
+                        trend_mag = float(np.linalg.norm(trend_vec, axis=1).mean())
+                        if trend_mag > 34 and r2 > 0.22 and "mixed_styles" not in downgrade_reasons:
+                            luma_vec = np.array([
+                                0.299 * coeff[0, 0] + 0.587 * coeff[0, 1] + 0.114 * coeff[0, 2],
+                                0.299 * coeff[1, 0] + 0.587 * coeff[1, 1] + 0.114 * coeff[1, 2],
+                            ])
+                            if float(np.linalg.norm(luma_vec)) < 1e-3:
+                                color_vec = np.mean(trend_vec, axis=0)
+                                luma_vec = np.array([float(color_vec[0]), float(color_vec[1])])
+                            angle = (math.degrees(math.atan2(float(luma_vec[1]), float(luma_vec[0]))) + 360.0) % 360.0
+                            projection = x_norm * float(luma_vec[0]) + y_norm * float(luma_vec[1])
+                            lo = text_rgb[projection <= np.percentile(projection, 20)]
+                            hi = text_rgb[projection >= np.percentile(projection, 80)]
+                            if lo.size and hi.size and float(np.abs(np.median(lo, axis=0) - np.median(hi, axis=0)).sum()) > 58:
+                                style.gradient_on = True
+                                style.gradient_start = tuple(int(v) for v in np.clip(np.median(lo, axis=0), 0, 255))  # type: ignore[assignment]
+                                style.gradient_end = tuple(int(v) for v in np.clip(np.median(hi, axis=0), 0, 255))  # type: ignore[assignment]
+                                style.gradient_angle = int(round(angle)) % 360
+                                confidence["gradient_confidence"] = "high" if trend_mag > 58 and r2 > 0.34 else "medium"
+                            else:
+                                ignored.append("gradient: weak_gradient")
+                                downgrade_reasons.append("weak_gradient")
+                        else:
+                            ignored.append("gradient: weak_gradient")
+                            if trend_mag > 20:
+                                downgrade_reasons.append("weak_gradient")
+
+                    glyph_d1 = cv2.dilate(glyph_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+                    bg_gray_delta = gray.astype(np.float32) - bg_luma
+                    dark_residual = (bg_gray_delta < -24) & (glyph_d1 == 0)
+                    bright_residual = (bg_gray_delta > 24) & (glyph_d1 == 0)
+
+                    def _shift_mask(src: np.ndarray, dx: int, dy: int) -> np.ndarray:
+                        out = np.zeros_like(src)
+                        h_, w_ = src.shape
+                        sx1 = max(0, -dx); sx2 = min(w_, w_ - dx)
+                        sy1 = max(0, -dy); sy2 = min(h_, h_ - dy)
+                        dx1 = max(0, dx); dx2 = dx1 + max(0, sx2 - sx1)
+                        dy1 = max(0, dy); dy2 = dy1 + max(0, sy2 - sy1)
+                        if sx2 > sx1 and sy2 > sy1:
+                            out[dy1:dy2, dx1:dx2] = src[sy1:sy2, sx1:sx2]
+                        return out
+
+                    best_shadow: Optional[Tuple[float, int, int, np.ndarray]] = None
+                    for dy in range(-8, 9):
+                        for dx in range(-8, 9):
+                            if dx == 0 and dy == 0:
+                                continue
+                            shifted = _shift_mask(glyph_u8, dx, dy)
+                            area = (shifted > 0) & (glyph_d1 == 0)
+                            area_count = int(np.count_nonzero(area))
+                            if area_count < max(8, text_px // 14):
+                                continue
+                            hit = int(np.count_nonzero(area & dark_residual))
+                            score = hit / max(1, area_count)
+                            if score <= 0:
+                                continue
+                            if best_shadow is None or score > best_shadow[0]:
+                                best_shadow = (score, dx, dy, area)
+                    if best_shadow and best_shadow[0] > 0.16:
+                        area = best_shadow[3] & dark_residual
+                        dark = crop[area]
+                        if dark.size:
+                            med = np.median(dark, axis=0)
+                            style.shadow_on = True
+                            style.shadow_color = (int(med[2]), int(med[1]), int(med[0]))
+                            style.shadow_offset = (int(best_shadow[1]), int(best_shadow[2]))
+                            shadow_luma = float(np.median(gray[area]))
+                            style.shadow_opacity = float(np.clip((bg_luma - shadow_luma) / 170.0, 0.18, 0.88))
+                            falloff = []
+                            shifted = _shift_mask(glyph_u8, best_shadow[1], best_shadow[2])
+                            prev_shadow = shifted
+                            for radius in range(1, 7):
+                                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+                                band = cv2.subtract(cv2.dilate(shifted, kernel, iterations=1), prev_shadow)
+                                prev_shadow = cv2.dilate(shifted, kernel, iterations=1)
+                                if int(np.count_nonzero(band)) == 0:
+                                    continue
+                                falloff.append(float(np.count_nonzero((band > 0) & dark_residual)) / max(1, int(np.count_nonzero(band))))
+                            style.shadow_blur = float(np.clip(sum(1 for v in falloff if v > 0.07) * 0.8, 0.0, 8.0))
+                            confidence["shadow_confidence"] = "high" if best_shadow[0] > 0.24 and (abs(best_shadow[1]) + abs(best_shadow[2])) >= 2 else "medium"
+                    else:
+                        ignored.append("shadow: no consistent offset")
+
+                    halo_scores: List[Tuple[int, float]] = []
+                    prev_halo = glyph_d1
+                    for radius in range(2, 13, 2):
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+                        dilated = cv2.dilate(glyph_u8, kernel, iterations=1)
+                        band = cv2.subtract(dilated, prev_halo)
+                        prev_halo = dilated
+                        band_count = int(np.count_nonzero(band))
+                        if band_count <= 0:
+                            continue
+                        bright_ratio = float(np.count_nonzero((band > 0) & bright_residual)) / band_count
+                        halo_scores.append((radius, bright_ratio))
+                    peak = max(halo_scores, key=lambda item: item[1]) if halo_scores else None
+                    if peak and peak[1] > 0.10:
+                        radius = max(r for r, score in halo_scores if score > 0.06)
+                        halo_mask = cv2.dilate(glyph_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)), iterations=1)
+                        halo_mask = (halo_mask > 0) & (glyph_d1 == 0) & bright_residual
+                        bright = crop[halo_mask]
+                        if bright.size:
+                            med = np.median(bright, axis=0)
+                            chroma = float(np.max(med) - np.min(med))
+                            if chroma > 16 or float(np.median(gray[halo_mask])) > bg_luma + 38:
+                                style.glow_on = True
+                                style.glow_color = (int(med[2]), int(med[1]), int(med[0]))
+                                style.glow_radius = int(np.clip(round(radius / 2), 2, 16))
+                                style.glow_intensity = float(np.clip((float(np.median(gray[halo_mask])) - bg_luma) / 180.0, 0.20, 0.80))
+                                confidence["glow_confidence"] = "high" if peak[1] > 0.18 and radius >= 4 else "medium"
+                            else:
+                                ignored.append("glow: likely compression blur")
+                                downgrade_reasons.append("shadow_glow_ambiguous")
+                    else:
+                        ignored.append("glow: no consistent halo")
+
+                    if style.shadow_on and style.glow_on:
+                        shadow_strength = 1.0 if confidence["shadow_confidence"] == "high" else 0.5
+                        glow_strength = 1.0 if confidence["glow_confidence"] == "high" else 0.5
+                        if abs(shadow_strength - glow_strength) < 0.35:
+                            downgrade_reasons.append("shadow_glow_ambiguous")
+                            ignored.append("effects: shadow_glow_ambiguous")
+
+                    if bg_pixels.size:
+                        bg_gray_vals = cv2.cvtColor(bg_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY).reshape(-1)
+                        bg_std = float(np.std(bg_gray_vals))
+                    else:
+                        bg_std = float(np.std(gray[outer > 0])) if int(np.count_nonzero(outer)) else float(np.std(gray))
+                    if bg_std > 52:
+                        downgrade_reasons.append("noisy_background")
+                        ignored.append("background: noisy_background")
+                    fg_luma = float(0.299 * style.fg_color[0] + 0.587 * style.fg_color[1] + 0.114 * style.fg_color[2])
+                    if abs(fg_luma - bg_luma) < 48 and confidence["outline_confidence"] != "high" and confidence["shadow_confidence"] != "high":
+                        downgrade_reasons.append("low_contrast")
+                        ignored.append("readability: low_contrast")
+            else:
+                style = TextStyle(
+                    fg_color=getattr(block, "fg_color", (0, 0, 0)) or (0, 0, 0),
+                    outline_color=getattr(block, "outline_color", (255, 255, 255)) or (255, 255, 255),
+                    outline_width=max(1, int(getattr(block, "outline_width", 1) or 1)),
+                    source="auto",
+                )
+                ignored.append("glyph pixels: insufficient_glyph_pixels")
+                downgrade_reasons.append("insufficient_glyph_pixels")
+
+            role = str(getattr(block, "bubble_role", "dialog") or "dialog").lower()
+            unsafe_role = role in {"sfx", "sound"} or _is_visual_sfx_like(block) or not self._raw_auto_role_allowed(block)
+            if unsafe_role:
+                status = "medium" if status == "high" else status
+                ignored.append("SFX/text-over-art: proposal only")
+                downgrade_reasons.append("unsafe_role")
+            hard_downgrades = {"insufficient_glyph_pixels", "mixed_styles", "noisy_background", "low_contrast", "shadow_glow_ambiguous", "unsafe_role"}
+            if status == "high" and any(reason in hard_downgrades for reason in downgrade_reasons):
+                status = "medium"
+            if confidence["fill_confidence"] == "low":
+                status = "fallback"
+            if status == "high":
+                if confidence["outline_confidence"] != "high":
+                    style.outline_width = 0
+                if confidence["shadow_confidence"] != "high":
+                    style.shadow_on = False
+                if confidence["glow_confidence"] != "high":
+                    style.glow_on = False
+                if confidence["gradient_confidence"] != "high":
+                    style.gradient_on = False
+            elif status == "medium":
+                if confidence["shadow_confidence"] == "low":
+                    style.shadow_on = False
+                if confidence["glow_confidence"] == "low":
+                    style.glow_on = False
+                if confidence["gradient_confidence"] == "low":
+                    style.gradient_on = False
+                if confidence["outline_confidence"] == "low":
+                    style.outline_width = 0
+            confidence["overall_confidence"] = status
+            style.source = "raw:auto" if status == "high" else "raw:proposal"
+            match = self._style_to_raw_summary(style, status, ignored)
+            match["role"] = role
+            match["confidence"] = confidence
+            match["downgrade_reasons"] = sorted(set(downgrade_reasons))
+            match["auto_applied"] = False
+            block.raw_style_match = match
+            return match
+        except Exception as exc:
+            match = {"status": "fallback", "summary": "RAW style match failed; using readable defaults", "matched": [], "ignored": [str(exc)], "downgrade_reasons": ["analysis_error"]}
+            block.raw_style_match = match
+            return match
+
+    def _apply_raw_style_match(self, block: OCRBlock) -> bool:
+        match = self._analyze_raw_style_for_block(block, force=False)
+        style_data = match.get("style") if isinstance(match, dict) else None
+        if not isinstance(style_data, dict):
+            return False
+        block.style = TextStyle.from_dict(style_data)
+        block.style.source = "manual"
+        match["auto_applied"] = False
+        block.raw_style_match = match
+        return True
+
     def _load_page_into_working_state(self) -> None:
         """Sync self._raw_cv/_regions/_translations from chapter_mgr.current_page."""
         page = self.chapter_mgr.current_page
@@ -860,6 +1248,30 @@ class LocalizerEngine:
         self._sync_translation_slots()
         page.regions      = self._regions
         page.translations = self._translations
+
+    def _with_page_context(self, page_idx: Optional[Any], fn: Callable[[], Any], *, bootstrap_after: bool = False) -> Any:
+        """Run a region operation against a specific page without changing UI page state."""
+        if page_idx is None:
+            return fn()
+        target_idx = int(page_idx)
+        pages = getattr(self.chapter_mgr, "pages", []) or []
+        if not (0 <= target_idx < len(pages)):
+            raise IndexError(f"No page at index {target_idx}")
+        current_idx = int(getattr(self.chapter_mgr, "current_idx", 0) or 0)
+        if target_idx == current_idx:
+            return fn()
+
+        self._flush_working_state_to_page()
+        result: Any = None
+        try:
+            self.chapter_mgr.go_to(target_idx)
+            self._load_page_into_working_state()
+            result = fn()
+        finally:
+            self._flush_working_state_to_page()
+            self.chapter_mgr.go_to(current_idx)
+            self._load_page_into_working_state()
+        return self.get_bootstrap() if bootstrap_after else result
 
     def _sync_translation_slots(self) -> None:
         """Keep translations index-aligned with the current region list."""
@@ -2247,7 +2659,17 @@ class LocalizerEngine:
             "manual_mask_used": manual_mask_used,
         }
 
-    def preview_region_cleanup(self, region_idx: int, manual_mask: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def preview_region_cleanup(
+        self,
+        region_idx: int,
+        manual_mask: Optional[Dict[str, Any]] = None,
+        page_idx: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        if page_idx is not None:
+            return self._with_page_context(
+                page_idx,
+                lambda: self.preview_region_cleanup(region_idx, manual_mask, None),
+            )
         run = self._run_selected_region_cleanup(int(region_idx), mutate_block=False, manual_mask=manual_mask)
         plan = run["plan"]
         mask = getattr(plan, "cleanup_mask", None)
@@ -2688,13 +3110,19 @@ class LocalizerEngine:
         self,
         region_idx: int,
         manual_mask: Optional[Dict[str, Any]] = None,
+        page_idx: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        if page_idx is not None:
+            return self._with_page_context(
+                page_idx,
+                lambda: self.compare_region_cleanup_candidates(region_idx, manual_mask, None),
+            )
         region_idx = int(region_idx)
         start = time.monotonic()
         try:
-            timeout = max(1.0, float(getattr(self.model_config, "cleanup_candidate_timeout_sec", 8) or 8))
+            timeout = max(1.0, float(getattr(self.model_config, "cleanup_candidate_timeout_sec", 30) or 30))
         except (TypeError, ValueError):
-            timeout = 8.0
+            timeout = 30.0
         candidates = [
             ("default", "Current/default plan"),
             ("solid_fill", "Safe solid fill"),
@@ -2761,7 +3189,14 @@ class LocalizerEngine:
         region_idx: int,
         candidate_id: str,
         manual_mask: Optional[Dict[str, Any]] = None,
+        page_idx: Optional[Any] = None,
     ) -> dict:
+        if page_idx is not None:
+            return self._with_page_context(
+                page_idx,
+                lambda: self.apply_region_cleanup_candidate(region_idx, candidate_id, manual_mask, None),
+                bootstrap_after=True,
+            )
         page = self.chapter_mgr.current_page
         if page is None:
             raise RuntimeError("No current page.")
@@ -2927,7 +3362,17 @@ class LocalizerEngine:
         self._notify("Cleanup candidate applied.", 1, 1, updated_pages=[int(getattr(self.chapter_mgr, "current_idx", 0) or 0)])
         return self.get_bootstrap()
 
-    def propose_cleanup_mask_sam2(self, region_idx: int, prompt: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def propose_cleanup_mask_sam2(
+        self,
+        region_idx: int,
+        prompt: Optional[Dict[str, Any]] = None,
+        page_idx: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        if page_idx is not None:
+            return self._with_page_context(
+                page_idx,
+                lambda: self.propose_cleanup_mask_sam2(region_idx, prompt, None),
+            )
         prompt = prompt if isinstance(prompt, dict) else {}
         if not _config_bool(getattr(self.model_config, "sam2_enabled", False)):
             return {"ok": False, "status": "disabled", "error": "SAM2 mask assist is disabled in settings."}
@@ -3061,7 +3506,17 @@ class LocalizerEngine:
         state = sam2_mask.load(self.model_config) if bool(load) else sam2_mask.status(self.model_config)
         return {"ok": True, **state}
 
-    def get_region_cleanup_debug(self, region_idx: int, manual_mask: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def get_region_cleanup_debug(
+        self,
+        region_idx: int,
+        manual_mask: Optional[Dict[str, Any]] = None,
+        page_idx: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        if page_idx is not None:
+            return self._with_page_context(
+                page_idx,
+                lambda: self.get_region_cleanup_debug(region_idx, manual_mask, None),
+            )
         if self._raw_cv is None:
             raise RuntimeError("No image loaded.")
         if not (0 <= int(region_idx) < len(self._regions)):
@@ -3184,7 +3639,18 @@ class LocalizerEngine:
         }
         return key if key in allowed else ""
 
-    def record_mask_qa_label(self, region_idx: int, label: str, notes: str = "") -> Dict[str, Any]:
+    def record_mask_qa_label(
+        self,
+        region_idx: int,
+        label: str,
+        notes: str = "",
+        page_idx: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        if page_idx is not None:
+            return self._with_page_context(
+                page_idx,
+                lambda: self.record_mask_qa_label(region_idx, label, notes, None),
+            )
         label_key = self._normalize_mask_qa_label(label)
         if not label_key:
             raise ValueError(f"Unknown mask QA label: {label!r}")
@@ -3262,7 +3728,19 @@ class LocalizerEngine:
             model = {}
         return {"ok": True, "model_path": model_path, "log": log_path, "records": int(model.get("records", 0) or 0), "labels": model.get("centroids", {})}
 
-    def apply_region_cleanup(self, region_idx: int, rerun: bool = False, manual_mask: Optional[Dict[str, Any]] = None) -> dict:
+    def apply_region_cleanup(
+        self,
+        region_idx: int,
+        rerun: bool = False,
+        manual_mask: Optional[Dict[str, Any]] = None,
+        page_idx: Optional[Any] = None,
+    ) -> dict:
+        if page_idx is not None:
+            return self._with_page_context(
+                page_idx,
+                lambda: self.apply_region_cleanup(region_idx, rerun, manual_mask, None),
+                bootstrap_after=True,
+            )
         page = self.chapter_mgr.current_page
         if page is None:
             raise RuntimeError("No current page.")
@@ -3418,10 +3896,16 @@ class LocalizerEngine:
         self._notify("Region cleanup applied.", 1, 1, updated_pages=[int(getattr(self.chapter_mgr, "current_idx", 0) or 0)])
         return self.get_bootstrap()
 
-    def rerun_region_cleanup(self, region_idx: int) -> dict:
-        return self.apply_region_cleanup(region_idx, rerun=True)
+    def rerun_region_cleanup(self, region_idx: int, manual_mask: Optional[Dict[str, Any]] = None, page_idx: Optional[Any] = None) -> dict:
+        return self.apply_region_cleanup(region_idx, rerun=True, manual_mask=manual_mask, page_idx=page_idx)
 
-    def delete_region_cleanup(self, region_idx: int) -> dict:
+    def delete_region_cleanup(self, region_idx: int, page_idx: Optional[Any] = None) -> dict:
+        if page_idx is not None:
+            return self._with_page_context(
+                page_idx,
+                lambda: self.delete_region_cleanup(region_idx, None),
+                bootstrap_after=True,
+            )
         page = self.chapter_mgr.current_page
         if page is None:
             raise RuntimeError("No current page.")
@@ -4698,6 +5182,21 @@ class LocalizerEngine:
         page_idx = int(getattr(self.chapter_mgr, "current_idx", 0) or 0)
         self._set_progress(stage="translate", page_idx=page_idx, page_total=self.chapter_mgr.total_pages())
         active_count = sum(1 for sk in sfx_mask if not sk)
+        active_text_count = sum(
+            1
+            for text, skipped in zip(texts, sfx_mask)
+            if not skipped and (text or "").strip()
+        )
+        if active_text_count == 0:
+            self._translations = ["" for _ in texts]
+            self._flush_working_state_to_page()
+            self._notify(
+                "Translate skipped - no translatable regions.",
+                1,
+                1,
+                updated_pages=[page_idx],
+            )
+            return self.get_bootstrap()
         self._notify(
             f"Translating {active_count} region(s)…"
             + (f" ({len(texts) - active_count} SFX skipped)" if (len(texts) - active_count) else ""),
@@ -4710,6 +5209,39 @@ class LocalizerEngine:
             for i, is_sfx in enumerate(sfx_mask):
                 if is_sfx and i < len(results):
                     results[i] = ""
+            while len(results) < len(texts):
+                results.append("")
+            attempted = [
+                i for i, source in enumerate(texts)
+                if (source or "").strip() and i < len(sfx_mask) and not sfx_mask[i]
+            ]
+            empty_results = [
+                i for i in attempted
+                if i >= len(results) or not str(results[i] or "").strip()
+            ]
+            if empty_results:
+                for i in empty_results:
+                    repaired = self._translate_single_region_text(texts[i], i, self._last_batch_ctx)
+                    if repaired:
+                        results[i] = repaired
+                empty_results = [
+                    i for i in attempted
+                    if i >= len(results) or not str(results[i] or "").strip()
+                ]
+            if empty_results:
+                self._notify(
+                    f"Translation failed - {len(empty_results)}/{len(attempted)} OCR line(s) returned no translation.",
+                    len(results),
+                    len(results),
+                    updated_pages=[page_idx],
+                    region_idx=len(results),
+                    region_total=len(results),
+                )
+                missing = ", ".join(str(i + 1) for i in empty_results[:8])
+                suffix = "" if len(empty_results) <= 8 else f", +{len(empty_results) - 8} more"
+                raise RuntimeError(
+                    f"Translation failed: OCR text exists but translation is empty for region(s) {missing}{suffix}."
+                )
             for i, t in enumerate(results):
                 cleaned = (t or "").strip()
                 # Pass 4: for SFX slots, explicitly overwrite any previously
@@ -4728,14 +5260,6 @@ class LocalizerEngine:
                     self._translations[i] = cleaned
                 else:
                     self._translations.append(cleaned)
-            attempted = [
-                i for i, source in enumerate(texts)
-                if (source or "").strip() and i < len(sfx_mask) and not sfx_mask[i]
-            ]
-            empty_results = [
-                i for i in attempted
-                if i < len(results) and not str(results[i] or "").strip()
-            ]
             self._flag_translations(list(range(len(results))))
             self._post_translate(texts, results, self._last_batch_ctx, page_idx)
             self._invalidate_page_outputs(preserve_cleanup=True)
@@ -4838,6 +5362,49 @@ class LocalizerEngine:
 
         return results
 
+    def _translate_single_region_text(self, kr: str, region_idx: int, batch_ctx: Any = None) -> str:
+        kr = str(kr or "")
+        if not kr.strip():
+            return ""
+        heuristic = heuristic_localize_line(kr)
+        if heuristic:
+            return heuristic
+        region_prefix = self._build_region_prefix(
+            batch_ctx if batch_ctx is not None else self._last_batch_ctx,
+            region_idx,
+        )
+        try:
+            if hasattr(self.client, "chat_raw"):
+                raw = self.client.chat_raw(
+                    model=self.model_config.translate_model,
+                    prompt=(
+                        f"{region_prefix}"
+                        f"Translate this Korean manhwa dialogue to natural English. "
+                        f"Output only the English translation, nothing else.\n\n{kr}"
+                    ),
+                    keep_alive=self.model_config.keep_alive,
+                )
+                return sanitize_final_translation(kr, raw)
+            if hasattr(self.client, "chat_json"):
+                resp = self.client.chat_json(
+                    model=self.model_config.translate_model,
+                    prompt=(
+                        f"{region_prefix}"
+                        f"Translate this Korean manhwa dialogue to natural English.\n"
+                        f"Output JSON with a 'translation' string field.\n\n{kr}"
+                    ),
+                    schema={
+                        "type": "object",
+                        "properties": {"translation": {"type": "string"}},
+                        "required": ["translation"],
+                    },
+                    keep_alive=self.model_config.keep_alive,
+                )
+                return sanitize_final_translation(kr, str(resp.get("translation", "") or ""))
+        except Exception as exc:
+            debug_print(f"[translate] repair region={region_idx} failed={exc}")
+        return ""
+
     def _translate_texts_deepseek(self, texts: List[str], page_idx: int = 0) -> List[str]:
         """Translate via the DeepSeek HTTP API.  Falls back to Ollama on error
         if model_config.deepseek_fallback_to_ollama is True (default).
@@ -4924,7 +5491,7 @@ class LocalizerEngine:
         for i, kr in enumerate(texts):
             self._notify(f"Translating {i+1}/{len(texts)}…", i, len(texts))
             try:
-                region_prefix = self._build_region_prefix(i, batch_ctx=self._last_batch_ctx)
+                region_prefix = self._build_region_prefix(self._last_batch_ctx, i)
                 prompt = (
                     f"{prompt_prefix}{region_prefix}"
                     f"Translate to natural English manga dialogue. "
@@ -5156,6 +5723,11 @@ class LocalizerEngine:
         self._begin_active_operation("cleanup")
         try:
             debug_print(f'cleanup_route="planned" page={page_idx} action="cleanup_current_page"')
+            for block in self._regions:
+                if not getattr(block, "raw_style_match", None):
+                    self._auto_apply_raw_style_if_safe(block, force_analysis=False)
+                else:
+                    self._auto_apply_raw_style_if_safe(block, force_analysis=False)
             # Pass 4: hide SFX from cleanup when the master toggle is OFF.
             process_sfx = _config_bool(getattr(self.model_config, "process_sfx_regions", False))
             cleanup_indices = [
@@ -5334,6 +5906,71 @@ class LocalizerEngine:
             block.typeset_reason = ""
         return sorted(set(updated))
 
+    def _has_auto_typeset_candidate(self) -> bool:
+        process_sfx = _config_bool(getattr(self.model_config, "process_sfx_regions", False))
+        for block in self._regions:
+            if bool(getattr(block, "cross_page", False)):
+                continue
+            if self._is_cross_page_secondary(block):
+                continue
+            if not getattr(block, "visible", True):
+                continue
+            if not (getattr(block, "text", "") or "").strip():
+                continue
+            if not process_sfx and _is_pipeline_sfx(block):
+                continue
+            if not _has_explicit_typeset_override(block) and _is_visual_sfx_like(block):
+                continue
+            if hasattr(block, "effective_skip_typeset") and block.effective_skip_typeset():
+                continue
+            erase_only = (
+                block.effective_erase_only()
+                if hasattr(block, "effective_erase_only")
+                else getattr(block, "erase_only", False)
+            )
+            if erase_only:
+                continue
+            return True
+        return False
+
+    def _missing_required_translation_indices(self) -> List[int]:
+        model_config = getattr(self, "model_config", None)
+        process_sfx = _config_bool(getattr(model_config, "process_sfx_regions", False))
+        missing: List[int] = []
+        for idx, block in enumerate(getattr(self, "_regions", []) or []):
+            if bool(getattr(block, "cross_page", False)):
+                continue
+            if self._is_cross_page_secondary(block):
+                continue
+            if not getattr(block, "visible", True):
+                continue
+            if not (getattr(block, "text", "") or "").strip():
+                continue
+            if not process_sfx and _is_pipeline_sfx(block):
+                continue
+            if not _has_explicit_typeset_override(block) and _is_visual_sfx_like(block):
+                continue
+            if hasattr(block, "effective_skip_typeset") and block.effective_skip_typeset():
+                continue
+            erase_only = (
+                block.effective_erase_only()
+                if hasattr(block, "effective_erase_only")
+                else getattr(block, "erase_only", False)
+            )
+            if erase_only:
+                continue
+            if idx >= len(self._translations) or not (self._translations[idx] or "").strip():
+                missing.append(idx)
+        return missing
+
+    def _raise_missing_required_translation(self, page_idx: int, missing: List[int]) -> None:
+        region_list = ", ".join(str(i + 1) for i in missing[:8])
+        suffix = "" if len(missing) <= 8 else f", +{len(missing) - 8} more"
+        raise RuntimeError(
+            f"Run All stopped: Page {page_idx + 1} has OCR text but no translation "
+            f"for region(s) {region_list}{suffix}."
+        )
+
     def typeset_current_page(self) -> dict:
         page = self.chapter_mgr.current_page
         if page is None:
@@ -5372,18 +6009,7 @@ class LocalizerEngine:
         if base_cv is None:
             raise RuntimeError("No image loaded.")
         if not any(t and t.strip() for t in self._translations):
-            process_sfx = _config_bool(getattr(self.model_config, "process_sfx_regions", False))
-            has_typeset_candidate = any(
-                getattr(block, "visible", True)
-                and (getattr(block, "text", "") or "").strip()
-                and not self._is_cross_page_secondary(block)
-                and (process_sfx or not _is_pipeline_sfx(block))
-                and not (
-                    hasattr(block, "effective_skip_typeset")
-                    and block.effective_skip_typeset()
-                )
-                for block in self._regions
-            )
+            has_typeset_candidate = self._has_auto_typeset_candidate()
             if not has_typeset_candidate:
                 if page.typeset_pil is not None:
                     self._notify("Typeset skipped - no eligible regions.", 1, 1, updated_pages=[page_idx])
@@ -5400,6 +6026,8 @@ class LocalizerEngine:
         self._begin_active_operation("typeset")
         self._notify("Rendering translations…", 0, 1)
         try:
+            for block in self._regions:
+                self._auto_apply_raw_style_if_safe(block, force_analysis=False)
             pil_out = self._typeset_image(base_cv)
             page.typeset_pil = pil_out
             page.render_dirty = False
@@ -5810,6 +6438,149 @@ class LocalizerEngine:
                 },
             )
 
+    @staticmethod
+    def _block_rotation_angle(block: Any) -> float:
+        try:
+            return float(getattr(block, "rotation_angle", 0.0) or 0.0) % 360.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _style_reflection_on(style: Any) -> bool:
+        return bool(getattr(style, "reflection_on", False)) and float(getattr(style, "reflection_opacity", 0.0) or 0.0) > 0.0
+
+    @staticmethod
+    def _render_effect_extra(style: Any, outline_w: int) -> int:
+        shadow = getattr(style, "shadow_offset", (0, 0)) if getattr(style, "shadow_on", False) else (0, 0)
+        shadow_blur = float(getattr(style, "shadow_blur", 0.0) or 0.0) if getattr(style, "shadow_on", False) else 0.0
+        glow_extra = int(getattr(style, "glow_radius", 0) or 0) * 4 if getattr(style, "glow_on", False) else 0
+        return max(
+            4,
+            int(outline_w) * 3,
+            abs(int(shadow[0])) + int(math.ceil(shadow_blur * 3.0)) + 4,
+            abs(int(shadow[1])) + int(math.ceil(shadow_blur * 3.0)) + 4,
+            glow_extra,
+        )
+
+    @staticmethod
+    def _clip_box_to_image(box: Tuple[int, int, int, int], size: Tuple[int, int]) -> Tuple[int, int, int, int]:
+        x1, y1, x2, y2 = box
+        w, h = size
+        return max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+
+    @classmethod
+    def _expanded_text_crop_box(
+        cls,
+        actual_union: Tuple[int, int, int, int],
+        style: Any,
+        outline_w: int,
+        size: Tuple[int, int],
+    ) -> Tuple[int, int, int, int]:
+        extra = cls._render_effect_extra(style, outline_w)
+        return cls._clip_box_to_image(
+            (
+                int(actual_union[0]) - extra,
+                int(actual_union[1]) - extra,
+                int(actual_union[2]) + extra,
+                int(actual_union[3]) + extra,
+            ),
+            size,
+        )
+
+    @staticmethod
+    def _paste_rgba_clipped(dest: Image.Image, sprite: Image.Image, x: int, y: int) -> None:
+        if sprite.width <= 0 or sprite.height <= 0:
+            return
+        cx1 = max(0, int(x)); cy1 = max(0, int(y))
+        cx2 = min(dest.width, int(x) + sprite.width); cy2 = min(dest.height, int(y) + sprite.height)
+        if cx1 >= cx2 or cy1 >= cy2:
+            return
+        region = sprite.crop((cx1 - int(x), cy1 - int(y), cx2 - int(x), cy2 - int(y)))
+        dest.paste(region, (cx1, cy1), region)
+
+    @classmethod
+    def _add_reflection_to_layer(
+        cls,
+        layer: Image.Image,
+        crop_box: Tuple[int, int, int, int],
+        style: Any,
+    ) -> Tuple[int, int, int, int]:
+        if not cls._style_reflection_on(style):
+            return crop_box
+        x1, y1, x2, y2 = cls._clip_box_to_image(crop_box, layer.size)
+        if x1 >= x2 or y1 >= y2:
+            return crop_box
+        source = layer.crop((x1, y1, x2, y2))
+        if source.getchannel("A").getbbox() is None:
+            return crop_box
+        reflected = source.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+        alpha = np.array(reflected.getchannel("A"), dtype=np.float32)
+        opacity = float(np.clip(getattr(style, "reflection_opacity", 0.32), 0.0, 1.0))
+        fade = float(np.clip(getattr(style, "reflection_fade", 0.78), 0.0, 1.0))
+        if alpha.shape[0] > 1:
+            ramp = np.linspace(opacity, opacity * (1.0 - fade), alpha.shape[0], dtype=np.float32)[:, None]
+            alpha = alpha * ramp
+        else:
+            alpha = alpha * opacity
+        reflected.putalpha(Image.fromarray(np.clip(alpha, 0, 255).astype(np.uint8), mode="L"))
+        blur = float(getattr(style, "reflection_blur", 1.5) or 0.0)
+        if blur > 0.0:
+            reflected = reflected.filter(ImageFilter.GaussianBlur(radius=blur))
+        px = int(x1)
+        py = int(y2 + int(getattr(style, "reflection_offset", 4) or 0))
+        cls._paste_rgba_clipped(layer, reflected, px, py)
+        return cls._clip_box_to_image(
+            (
+                min(x1, px),
+                min(y1, py),
+                max(x2, px + reflected.width),
+                max(y2, py + reflected.height),
+            ),
+            layer.size,
+        )
+
+    @classmethod
+    def _rotated_sprite_from_layer(
+        cls,
+        layer: Image.Image,
+        crop_box: Tuple[int, int, int, int],
+        angle: float,
+        anchor: Tuple[float, float],
+    ) -> Tuple[Image.Image, int, int]:
+        x1, y1, x2, y2 = cls._clip_box_to_image(crop_box, layer.size)
+        crop = layer.crop((x1, y1, x2, y2))
+        if crop.width <= 0 or crop.height <= 0:
+            return crop, x1, y1
+        normalized = ((float(angle) + 180.0) % 360.0) - 180.0
+        if abs(normalized) < 0.001:
+            return crop, x1, y1
+        ax, ay = float(anchor[0]), float(anchor[1])
+        rel_x = ax - x1
+        rel_y = ay - y1
+        radius_x = max(1, int(math.ceil(max(rel_x, crop.width - rel_x, 1.0))))
+        radius_y = max(1, int(math.ceil(max(rel_y, crop.height - rel_y, 1.0))))
+        canvas = Image.new("RGBA", (radius_x * 2, radius_y * 2), (0, 0, 0, 0))
+        paste_x = int(round(radius_x - rel_x))
+        paste_y = int(round(radius_y - rel_y))
+        canvas.alpha_composite(crop, (paste_x, paste_y))
+        resample = getattr(Image, "Resampling", Image).BICUBIC
+        rotated = canvas.rotate(-normalized, resample=resample, expand=True)
+        out_x = int(round(ax - rotated.width / 2.0))
+        out_y = int(round(ay - rotated.height / 2.0))
+        return rotated, out_x, out_y
+
+    @classmethod
+    def _composite_transformed_region_layer(
+        cls,
+        dest: Image.Image,
+        layer: Image.Image,
+        crop_box: Tuple[int, int, int, int],
+        angle: float,
+        anchor: Tuple[float, float],
+    ) -> None:
+        sprite, x, y = cls._rotated_sprite_from_layer(layer, crop_box, angle, anchor)
+        cls._paste_rgba_clipped(dest, sprite, x, y)
+
     def _typeset_image(self, base_cv: np.ndarray) -> Image.Image:
         """Draw all translations onto base_cv and return PIL image.
 
@@ -5890,6 +6661,10 @@ class LocalizerEngine:
                 s.gradient_on = False; s.shadow_on = False; s.plate_on = False
                 s.gradient_start = fg; s.gradient_end = fg; s.gradient_angle = 90
                 s.shadow_color = (0,0,0); s.shadow_offset = (1,2); s.shadow_opacity = 0.55
+                s.shadow_blur = 0.0
+                s.glow_on = False; s.glow_color = (255,255,255); s.glow_radius = 4; s.glow_intensity = 0.45
+                s.reflection_on = False; s.reflection_opacity = 0.32; s.reflection_offset = 4
+                s.reflection_blur = 1.5; s.reflection_fade = 0.78
                 s.plate_color = (255,255,255); s.plate_opacity = 0.78; s.plate_pad = 4
                 s.source = "auto"
                 style = s  # type: ignore
@@ -5901,6 +6676,10 @@ class LocalizerEngine:
                 style.shadow_color = (0, 0, 0)
 
             outline_w = int(style.outline_width) if style.outline_width else 1
+            rotation_angle = self._block_rotation_angle(block)
+            needs_region_layer = abs((((rotation_angle + 180.0) % 360.0) - 180.0)) > 0.001 or self._style_reflection_on(style)
+            render_target = Image.new("RGBA", pil_img.size, (0, 0, 0, 0)) if needs_region_layer else pil_img
+            render_draw = ImageDraw.Draw(render_target)
 
             # Compute content area BEFORE fitting
             pad_x     = max(8, int(round(bw * 0.06)))
@@ -5995,11 +6774,16 @@ class LocalizerEngine:
                 approx_x2 = content_x + used_w + pad
                 approx_y2 = cursor_y  + used_h + pad
                 _render_plate(
-                    pil_img,
+                    render_target,
                     approx_x1, approx_y1, approx_x2, approx_y2,
                     getattr(style, 'plate_color', (255,255,255)),
                     getattr(style, 'plate_opacity', 0.78),
                 )
+                if needs_region_layer:
+                    actual_union = (
+                        int(approx_x1), int(approx_y1),
+                        int(approx_x2), int(approx_y2),
+                    )
             elif getattr(style, 'plate_on', False):
                 render_debug(
                     "typeset",
@@ -6033,6 +6817,16 @@ class LocalizerEngine:
             eff.shadow_color   = getattr(style, 'shadow_color',   (0,0,0))
             eff.shadow_offset  = getattr(style, 'shadow_offset',  (1,2))
             eff.shadow_opacity = getattr(style, 'shadow_opacity',  0.55)
+            eff.shadow_blur    = getattr(style, 'shadow_blur',     0.0)
+            eff.glow_on        = getattr(style, 'glow_on',        False)
+            eff.glow_color     = getattr(style, 'glow_color',     (255,255,255))
+            eff.glow_radius    = getattr(style, 'glow_radius',    4)
+            eff.glow_intensity = getattr(style, 'glow_intensity', 0.45)
+            eff.reflection_on      = getattr(style, 'reflection_on', False)
+            eff.reflection_opacity = getattr(style, 'reflection_opacity', 0.32)
+            eff.reflection_offset  = getattr(style, 'reflection_offset', 4)
+            eff.reflection_blur    = getattr(style, 'reflection_blur', 1.5)
+            eff.reflection_fade    = getattr(style, 'reflection_fade', 0.78)
 
             align       = getattr(block, 'align', 'center') or 'center'
             actual_union = None
@@ -6064,10 +6858,21 @@ class LocalizerEngine:
 
                 # Phase 3: full line render (shadow + outline + fill/gradient)
                 _draw_line_with_style(
-                    pil_img, draw, line_text, x_pos, y_pos, font,
+                    render_target, render_draw, line_text, x_pos, y_pos, font,
                     eff, outline_w,  # type: ignore[arg-type]
                 )
                 cursor_y += line_h
+
+            if needs_region_layer and actual_union is not None:
+                crop_box = self._expanded_text_crop_box(actual_union, eff, outline_w, pil_img.size)
+                crop_box = self._add_reflection_to_layer(render_target, crop_box, eff)
+                self._composite_transformed_region_layer(
+                    pil_img,
+                    render_target,
+                    crop_box,
+                    rotation_angle,
+                    (bx + bw / 2.0, by + bh / 2.0),
+                )
 
             debug_print(
                 f"[TYPESET_DRAW] idx={idx} role={role} text={trans!r} "
@@ -6125,6 +6930,8 @@ class LocalizerEngine:
             block.bubble_bbox = bbox
             block.bubble_mask = build_ellipse_mask(bbox[2], bbox[3], inset=4)
             block.safe_rect = None
+        if "rotation_angle" in draft:
+            block.rotation_angle = float(draft.get("rotation_angle") or 0.0) % 360.0
         if "font" in draft:
             block.font_name = str(draft.get("font") or "")
         if "size" in draft:
@@ -6154,6 +6961,75 @@ class LocalizerEngine:
             if block.style is None:
                 block.style = block.effective_style()
             block.style.shadow_on = bool(draft.get("shadow_on"))
+        if "shadow_offset_x" in draft or "shadow_offset_y" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            ox, oy = getattr(block.style, "shadow_offset", (1, 2))
+            if "shadow_offset_x" in draft:
+                ox = max(-24, min(24, int(float(draft.get("shadow_offset_x") or 0))))
+            if "shadow_offset_y" in draft:
+                oy = max(-24, min(24, int(float(draft.get("shadow_offset_y") or 0))))
+            block.style.shadow_offset = (ox, oy)
+        if "shadow_opacity" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.shadow_opacity = max(0.0, min(1.0, float(draft.get("shadow_opacity") or 0)))
+        if "shadow_blur" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.shadow_blur = max(0.0, min(32.0, float(draft.get("shadow_blur") or 0)))
+        if "gradient_on" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.gradient_on = bool(draft.get("gradient_on"))
+        if "gradient_start" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.gradient_start = self._parse_hex_color(draft.get("gradient_start"))
+        if "gradient_end" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.gradient_end = self._parse_hex_color(draft.get("gradient_end"))
+        if "gradient_angle" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.gradient_angle = int(float(draft.get("gradient_angle") or 0)) % 360
+        if "glow_on" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.glow_on = bool(draft.get("glow_on"))
+        if "glow" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.glow_color = self._parse_hex_color(draft.get("glow"))
+        if "glow_radius" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.glow_radius = max(0, min(32, int(float(draft.get("glow_radius") or 0))))
+        if "glow_intensity" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.glow_intensity = max(0.0, min(1.0, float(draft.get("glow_intensity") or 0)))
+        if "reflection_on" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.reflection_on = bool(draft.get("reflection_on"))
+        if "reflection_opacity" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.reflection_opacity = max(0.0, min(1.0, float(draft.get("reflection_opacity") or 0)))
+        if "reflection_offset" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.reflection_offset = max(-64, min(128, int(float(draft.get("reflection_offset") or 0))))
+        if "reflection_blur" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.reflection_blur = max(0.0, min(32.0, float(draft.get("reflection_blur") or 0)))
+        if "reflection_fade" in draft:
+            if block.style is None:
+                block.style = block.effective_style()
+            block.style.reflection_fade = max(0.0, min(1.0, float(draft.get("reflection_fade") or 0)))
         if "visible" in draft:
             block.visible = bool(draft.get("visible"))
 
@@ -6335,6 +7211,16 @@ class LocalizerEngine:
         eff.shadow_color = getattr(style, 'shadow_color', (0, 0, 0))
         eff.shadow_offset = getattr(style, 'shadow_offset', (1, 2))
         eff.shadow_opacity = getattr(style, 'shadow_opacity', 0.55)
+        eff.shadow_blur = getattr(style, 'shadow_blur', 0.0)
+        eff.glow_on = getattr(style, 'glow_on', False)
+        eff.glow_color = getattr(style, 'glow_color', (255, 255, 255))
+        eff.glow_radius = getattr(style, 'glow_radius', 4)
+        eff.glow_intensity = getattr(style, 'glow_intensity', 0.45)
+        eff.reflection_on = getattr(style, 'reflection_on', False)
+        eff.reflection_opacity = getattr(style, 'reflection_opacity', 0.32)
+        eff.reflection_offset = getattr(style, 'reflection_offset', 4)
+        eff.reflection_blur = getattr(style, 'reflection_blur', 1.5)
+        eff.reflection_fade = getattr(style, 'reflection_fade', 0.78)
 
         align = getattr(block, 'align', 'center') or 'center'
         for line_text in fit.lines:
@@ -6362,22 +7248,23 @@ class LocalizerEngine:
 
         if actual_union is None:
             return {"b64": None, "x": 0, "y": 0, "w": 0, "h": 0}
-        shadow = getattr(eff, 'shadow_offset', (0, 0)) if getattr(eff, 'shadow_on', False) else (0, 0)
-        extra = max(4, outline_w * 3, abs(int(shadow[0])) + 4, abs(int(shadow[1])) + 4)
-        x1 = max(0, int(actual_union[0]) - extra)
-        y1 = max(0, int(actual_union[1]) - extra)
-        x2 = min(layer.width, int(actual_union[2]) + extra)
-        y2 = min(layer.height, int(actual_union[3]) + extra)
-        if x1 >= x2 or y1 >= y2:
+        crop_box = self._expanded_text_crop_box(actual_union, eff, outline_w, layer.size)
+        crop_box = self._add_reflection_to_layer(layer, crop_box, eff)
+        sprite, sprite_x, sprite_y = self._rotated_sprite_from_layer(
+            layer,
+            crop_box,
+            self._block_rotation_angle(block),
+            (bx + bw / 2.0, by + bh / 2.0),
+        )
+        if sprite.width <= 0 or sprite.height <= 0:
             return {"b64": None, "x": 0, "y": 0, "w": 0, "h": 0}
 
-        sprite = layer.crop((x1, y1, x2, y2))
         buf = io.BytesIO()
         sprite.save(buf, format="PNG", optimize=False)
         font_name = getattr(font, "path", "") or (override_name or role)
         return {
             "b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
-            "x": int(x1), "y": int(y1 - sprite_y_offset), "w": int(x2 - x1), "h": int(y2 - y1),
+            "x": int(sprite_x), "y": int(sprite_y - sprite_y_offset), "w": int(sprite.width), "h": int(sprite.height),
             "bbox": [int(bx), int(by - sprite_y_offset), int(bw), int(bh)],
             "resolved_font_size": int(fit.font_size),
             "line_count": int(len(fit.lines)),
@@ -6389,6 +7276,20 @@ class LocalizerEngine:
             "outline_width": int(outline_w),
             "shadow": _hex_color(getattr(eff, 'shadow_color', None), "#000000"),
             "shadow_on": bool(getattr(eff, 'shadow_on', False)),
+            "shadow_offset_x": int(getattr(eff, 'shadow_offset', (1, 2))[0]),
+            "shadow_offset_y": int(getattr(eff, 'shadow_offset', (1, 2))[1]),
+            "shadow_opacity": float(getattr(eff, 'shadow_opacity', 0.55)),
+            "shadow_blur": float(getattr(eff, 'shadow_blur', 0.0)),
+            "glow": _hex_color(getattr(eff, 'glow_color', None), "#ffffff"),
+            "glow_on": bool(getattr(eff, 'glow_on', False)),
+            "glow_radius": int(getattr(eff, 'glow_radius', 4)),
+            "glow_intensity": float(getattr(eff, 'glow_intensity', 0.45)),
+            "reflection_on": bool(getattr(eff, 'reflection_on', False)),
+            "reflection_opacity": float(getattr(eff, 'reflection_opacity', 0.32)),
+            "reflection_offset": int(getattr(eff, 'reflection_offset', 4)),
+            "reflection_blur": float(getattr(eff, 'reflection_blur', 1.5)),
+            "reflection_fade": float(getattr(eff, 'reflection_fade', 0.78)),
+            "rotation_angle": float(self._block_rotation_angle(block)),
             "align": str(align),
         }
 
@@ -6654,6 +7555,9 @@ class LocalizerEngine:
                     self._notify(f"Run All Translate: Page {idx + 1}/{total}...", idx, total)
                     self.go_to_page(idx)
                     self.translate_current_page()
+                    missing_translations = self._missing_required_translation_indices()
+                    if missing_translations:
+                        self._raise_missing_required_translation(idx, missing_translations)
                     self._notify(f"Run All Translate: checkpointing page {idx + 1}/{total}...", idx + 1, total)
                     self.chapter_mgr.save_state()
                     mark_checkpoint("translate", idx)
@@ -6667,6 +7571,33 @@ class LocalizerEngine:
                     self._set_progress(running=True, job="run_all", stage="typeset", page_idx=idx, page_total=total, updated_pages=[])
                     self._notify(f"Run All Typeset: Page {idx + 1}/{total}...", idx, total)
                     self.go_to_page(idx)
+                    page = getattr(self.chapter_mgr, "current_page", None)
+                    if page is None and hasattr(self.chapter_mgr, "pages"):
+                        try:
+                            page = self.chapter_mgr.pages[idx]
+                        except Exception:
+                            page = None
+                    translations = getattr(self, "_translations", None)
+                    if page is not None and translations is not None and not any(t and t.strip() for t in translations):
+                        missing_translations = self._missing_required_translation_indices()
+                        if missing_translations:
+                            self._raise_missing_required_translation(idx, missing_translations)
+                        base_cv = page.cleaned_cv if page.cleaned_cv is not None else self._raw_cv
+                        if base_cv is not None:
+                            page.typeset_pil = Image.fromarray(cv2.cvtColor(base_cv, cv2.COLOR_BGR2RGB))
+                            page.render_dirty = False
+                            page.bump_render_version()
+                            self._flush_working_state_to_page()
+                            self.chapter_mgr.save_state()
+                            updated_pages.append(idx)
+                            mark_checkpoint("typeset", idx)
+                            self._notify(
+                                f"Run All Typeset skipped: Page {idx + 1}/{total} has no translated text.",
+                                idx + 1,
+                                total,
+                                updated_pages=[idx],
+                            )
+                            continue
                     self.typeset_current_page()
                     updated_pages.append(idx)
                     mark_checkpoint("typeset", idx)
@@ -6818,10 +7749,14 @@ class LocalizerEngine:
             except Exception as exc:
                 debug_print(f"region geometry refresh failed: {exc}")
 
-    def update_region_field(self, region_idx: int, field: str, value: Any) -> dict:
+    def update_region_field(self, region_idx: int, field: str, value: Any, page_idx: Optional[Any] = None) -> dict:
         self._begin_active_operation("mutate")
         try:
-            return self._update_region_field_active(region_idx, field, value)
+            return self._with_page_context(
+                page_idx,
+                lambda: self._update_region_field_active(region_idx, field, value),
+                bootstrap_after=page_idx is not None,
+            )
         finally:
             self._end_active_operation("mutate")
 
@@ -6854,9 +7789,22 @@ class LocalizerEngine:
             next_value = str(value or "")
             if field == "align":
                 next_value = next_value if next_value in {"left", "center", "right"} else "center"
-        elif field in {"visible", "locked", "shadow_on"}:
+        elif field in {"visible", "locked"}:
             existing = bool(getattr(block, field, False))
             next_value = bool(value)
+        elif field in {"shadow_on", "gradient_on", "glow_on", "reflection_on"}:
+            style = block.effective_style() if hasattr(block, "effective_style") else getattr(block, "style", None)
+            existing = bool(getattr(style, field, False))
+            next_value = bool(value)
+        elif field == "style_preset":
+            existing = ""
+            next_value = str(value or "")
+        elif field in {"reset_style", "rematch_raw_style", "apply_raw_match", "reset_rotation", "reset_transform"}:
+            existing = object()
+            next_value = str(value)
+        elif field == "rotation_angle":
+            existing = round(float(getattr(block, "rotation_angle", 0.0) or 0.0) % 360.0, 3)
+            next_value = round(float(value or 0.0) % 360.0, 3)
         else:
             existing = object()
             next_value = None
@@ -6946,7 +7894,39 @@ class LocalizerEngine:
             )
             block.typeset_override = bool(raw_value.strip())
             self._invalidate_page_outputs(preserve_cleanup=True)
-        elif field in {"text", "font_name", "font_size", "align", "visible", "locked", "fg_color", "bg_color", "outline_color", "outline_width", "shadow_color", "shadow_on"}:
+        elif field == "reset_style":
+            block.reset_style()
+            block.raw_style_match = {}
+            self._invalidate_page_outputs(preserve_cleanup=True)
+        elif field == "rematch_raw_style":
+            self._analyze_raw_style_for_block(block, force=True)
+            self._invalidate_page_outputs(preserve_cleanup=True)
+        elif field == "apply_raw_match":
+            if not self._apply_raw_style_match(block):
+                self._analyze_raw_style_for_block(block, force=True)
+                self._apply_raw_style_match(block)
+            self._invalidate_page_outputs(preserve_cleanup=True)
+        elif field == "style_preset":
+            preset = str(value or "")
+            if preset == "reset_auto":
+                block.reset_style()
+            elif preset:
+                block.apply_preset(preset)
+            self._invalidate_page_outputs(preserve_cleanup=True)
+        elif field == "rotation_angle":
+            block.rotation_angle = float(value or 0.0) % 360.0
+            self._invalidate_page_outputs(preserve_cleanup=True)
+        elif field in {"reset_rotation", "reset_transform"}:
+            block.rotation_angle = 0.0
+            self._invalidate_page_outputs(preserve_cleanup=True)
+        elif field in {
+            "text", "font_name", "font_size", "align", "visible", "locked",
+            "fg_color", "bg_color", "outline_color", "outline_width",
+            "shadow_color", "shadow_on", "shadow_offset_x", "shadow_offset_y", "shadow_opacity", "shadow_blur",
+            "gradient_on", "gradient_start", "gradient_end", "gradient_angle",
+            "glow_color", "glow_on", "glow_radius", "glow_intensity",
+            "reflection_on", "reflection_opacity", "reflection_offset", "reflection_blur", "reflection_fade",
+        }:
             if field == "bg_color" and getattr(getattr(block, "region_kind", None), "name", "") != "CAPTION_BOX":
                 render_debug(
                     "style_migration",
@@ -6961,12 +7941,27 @@ class LocalizerEngine:
                 block.font_size = max(0, min(96, int(float(value or 0))))
             elif field in {"visible", "locked"}:
                 setattr(block, field, bool(value))
-            elif field in {"fg_color", "bg_color", "outline_color", "shadow_color"}:
+            elif field in {"fg_color", "bg_color", "outline_color", "shadow_color", "gradient_start", "gradient_end", "glow_color"}:
                 color = self._parse_hex_color(value)
                 if field == "shadow_color":
                     if block.style is None:
                         block.style = block.effective_style()
                     block.style.shadow_color = color
+                    block.style.source = "manual"
+                elif field == "gradient_start":
+                    if block.style is None:
+                        block.style = block.effective_style()
+                    block.style.gradient_start = color
+                    block.style.source = "manual"
+                elif field == "gradient_end":
+                    if block.style is None:
+                        block.style = block.effective_style()
+                    block.style.gradient_end = color
+                    block.style.source = "manual"
+                elif field == "glow_color":
+                    if block.style is None:
+                        block.style = block.effective_style()
+                    block.style.glow_color = color
                     block.style.source = "manual"
                 else:
                     setattr(block, field, color)
@@ -6985,6 +7980,66 @@ class LocalizerEngine:
                 if block.style is None:
                     block.style = block.effective_style()
                 block.style.shadow_on = bool(value)
+                block.style.source = "manual"
+            elif field in {"gradient_on", "glow_on", "reflection_on"}:
+                if block.style is None:
+                    block.style = block.effective_style()
+                setattr(block.style, field, bool(value))
+                block.style.source = "manual"
+            elif field in {"shadow_offset_x", "shadow_offset_y"}:
+                if block.style is None:
+                    block.style = block.effective_style()
+                ox, oy = getattr(block.style, "shadow_offset", (1, 2))
+                if field == "shadow_offset_x":
+                    ox = max(-24, min(24, int(float(value or 0))))
+                else:
+                    oy = max(-24, min(24, int(float(value or 0))))
+                block.style.shadow_offset = (ox, oy)
+                block.style.source = "manual"
+            elif field == "shadow_opacity":
+                if block.style is None:
+                    block.style = block.effective_style()
+                block.style.shadow_opacity = max(0.0, min(1.0, float(value or 0)))
+                block.style.source = "manual"
+            elif field == "shadow_blur":
+                if block.style is None:
+                    block.style = block.effective_style()
+                block.style.shadow_blur = max(0.0, min(32.0, float(value or 0)))
+                block.style.source = "manual"
+            elif field == "gradient_angle":
+                if block.style is None:
+                    block.style = block.effective_style()
+                block.style.gradient_angle = int(float(value or 0)) % 360
+                block.style.source = "manual"
+            elif field == "glow_radius":
+                if block.style is None:
+                    block.style = block.effective_style()
+                block.style.glow_radius = max(0, min(32, int(float(value or 0))))
+                block.style.source = "manual"
+            elif field == "glow_intensity":
+                if block.style is None:
+                    block.style = block.effective_style()
+                block.style.glow_intensity = max(0.0, min(1.0, float(value or 0)))
+                block.style.source = "manual"
+            elif field == "reflection_opacity":
+                if block.style is None:
+                    block.style = block.effective_style()
+                block.style.reflection_opacity = max(0.0, min(1.0, float(value or 0)))
+                block.style.source = "manual"
+            elif field == "reflection_offset":
+                if block.style is None:
+                    block.style = block.effective_style()
+                block.style.reflection_offset = max(-64, min(128, int(float(value or 0))))
+                block.style.source = "manual"
+            elif field == "reflection_blur":
+                if block.style is None:
+                    block.style = block.effective_style()
+                block.style.reflection_blur = max(0.0, min(32.0, float(value or 0)))
+                block.style.source = "manual"
+            elif field == "reflection_fade":
+                if block.style is None:
+                    block.style = block.effective_style()
+                block.style.reflection_fade = max(0.0, min(1.0, float(value or 0)))
                 block.style.source = "manual"
             elif field == "align":
                 block.align = str(value or "center") if str(value or "center") in {"left", "center", "right"} else "center"
@@ -7010,10 +8065,48 @@ class LocalizerEngine:
         self.chapter_mgr.request_save_state()
         return self.get_bootstrap()
 
-    def update_region_bbox(self, region_idx: int, x: Any, y: Any, w: Any, h: Any, page_idx: Optional[Any] = None) -> dict:
+    def update_region_bbox(
+        self,
+        region_idx: int,
+        x: Any,
+        y: Any,
+        w: Any,
+        h: Any,
+        page_idx: Optional[Any] = None,
+        edit_page_idx: Optional[Any] = None,
+    ) -> dict:
         self._begin_active_operation("mutate")
         try:
-            return self._update_region_bbox_active(region_idx, x, y, w, h, page_idx)
+            owner_page_idx = page_idx
+            segment_page_idx = edit_page_idx
+            if page_idx is not None and edit_page_idx is None and 0 <= region_idx < len(self._regions):
+                block = self._regions[region_idx]
+                local = getattr(block, "page_local_bboxes", {}) or {}
+                try:
+                    requested_page = int(page_idx)
+                except Exception:
+                    requested_page = None
+                if (
+                    requested_page is not None
+                    and bool(getattr(block, "cross_page", False))
+                    and not self._is_cross_page_secondary(block)
+                    and isinstance(local, dict)
+                    and (requested_page in local or str(requested_page) in local)
+                ):
+                    owner_page_idx = None
+                    segment_page_idx = requested_page
+            return self._with_page_context(
+                owner_page_idx,
+                lambda: self._update_region_bbox_active(
+                    region_idx,
+                    x,
+                    y,
+                    w,
+                    h,
+                    segment_page_idx if segment_page_idx is not None else owner_page_idx,
+                ),
+                bootstrap_after=owner_page_idx is not None,
+            )
         finally:
             self._end_active_operation("mutate")
 
@@ -7067,10 +8160,14 @@ class LocalizerEngine:
         self.chapter_mgr.request_save_state()
         return self.get_bootstrap()
 
-    def add_region(self, x: Any, y: Any, w: Any, h: Any, text: str = "") -> dict:
+    def add_region(self, x: Any, y: Any, w: Any, h: Any, text: str = "", page_idx: Optional[Any] = None) -> dict:
         self._begin_active_operation("mutate")
         try:
-            return self._add_region_active(x, y, w, h, text)
+            return self._with_page_context(
+                page_idx,
+                lambda: self._add_region_active(x, y, w, h, text),
+                bootstrap_after=page_idx is not None,
+            )
         finally:
             self._end_active_operation("mutate")
 
@@ -7137,7 +8234,13 @@ class LocalizerEngine:
             return 3
         return 0
 
-    def set_yolo_train_class(self, region_idx: int, class_id: int) -> dict:
+    def set_yolo_train_class(self, region_idx: int, class_id: int, page_idx: Optional[Any] = None) -> dict:
+        if page_idx is not None:
+            return self._with_page_context(
+                page_idx,
+                lambda: self.set_yolo_train_class(region_idx, class_id, None),
+                bootstrap_after=True,
+            )
         if not (0 <= int(region_idx) < len(self._regions)):
             raise IndexError(f"No region at index {region_idx}")
         class_id = int(class_id)
@@ -7370,10 +8473,14 @@ class LocalizerEngine:
             "pages": dataset.get("pages", 0),
         }
 
-    def delete_region(self, region_idx: int, yolo_reject_reason: str = "") -> dict:
+    def delete_region(self, region_idx: int, yolo_reject_reason: str = "", page_idx: Optional[Any] = None) -> dict:
         self._begin_active_operation("mutate")
         try:
-            return self._delete_region_active(region_idx, yolo_reject_reason)
+            return self._with_page_context(
+                page_idx,
+                lambda: self._delete_region_active(region_idx, yolo_reject_reason),
+                bootstrap_after=page_idx is not None,
+            )
         finally:
             self._end_active_operation("mutate")
 
@@ -7399,10 +8506,14 @@ class LocalizerEngine:
         self.chapter_mgr.save_state()
         return self.get_bootstrap()
 
-    def ocr_region(self, region_idx: int) -> dict:
+    def ocr_region(self, region_idx: int, page_idx: Optional[Any] = None) -> dict:
         self._begin_active_operation("ocr_region")
         try:
-            return self._ocr_region_active(region_idx)
+            return self._with_page_context(
+                page_idx,
+                lambda: self._ocr_region_active(region_idx),
+                bootstrap_after=page_idx is not None,
+            )
         finally:
             self._end_active_operation("ocr_region")
 
@@ -7452,10 +8563,14 @@ class LocalizerEngine:
             self._notify(f"OCR region {region_idx + 1} failed.", 1, 1)
         return self.get_bootstrap()
 
-    def translate_region(self, region_idx: int) -> dict:
+    def translate_region(self, region_idx: int, page_idx: Optional[Any] = None) -> dict:
         self._begin_active_operation("translate_region")
         try:
-            return self._translate_region_active(region_idx)
+            return self._with_page_context(
+                page_idx,
+                lambda: self._translate_region_active(region_idx),
+                bootstrap_after=page_idx is not None,
+            )
         finally:
             self._end_active_operation("translate_region")
 
@@ -8278,6 +9393,26 @@ class LocalizerEngine:
             "outline_width": int((getattr(style, "outline_width", None) if style else None) or getattr(block, "outline_width", 1) or 1),
             "shadow":  _hex_color(getattr(style, "shadow_color", None), "#000000"),
             "shadow_on": bool(getattr(style, "shadow_on", False)),
+            "shadow_offset_x": int((getattr(style, "shadow_offset", (1, 2)) or (1, 2))[0]) if style else 1,
+            "shadow_offset_y": int((getattr(style, "shadow_offset", (1, 2)) or (1, 2))[1]) if style else 2,
+            "shadow_opacity": float(getattr(style, "shadow_opacity", 0.55) if style else 0.55),
+            "shadow_blur": float(getattr(style, "shadow_blur", 0.0) if style else 0.0),
+            "glow": _hex_color(getattr(style, "glow_color", None), "#ffffff"),
+            "glow_on": bool(getattr(style, "glow_on", False)),
+            "glow_radius": int(getattr(style, "glow_radius", 4) if style else 4),
+            "glow_intensity": float(getattr(style, "glow_intensity", 0.45) if style else 0.45),
+            "reflection_on": bool(getattr(style, "reflection_on", False)),
+            "reflection_opacity": float(getattr(style, "reflection_opacity", 0.32) if style else 0.32),
+            "reflection_offset": int(getattr(style, "reflection_offset", 4) if style else 4),
+            "reflection_blur": float(getattr(style, "reflection_blur", 1.5) if style else 1.5),
+            "reflection_fade": float(getattr(style, "reflection_fade", 0.78) if style else 0.78),
+            "gradient_on": bool(getattr(style, "gradient_on", False)),
+            "gradient_start": _hex_color(getattr(style, "gradient_start", None), "#111111"),
+            "gradient_end": _hex_color(getattr(style, "gradient_end", None), "#3c3c3c"),
+            "gradient_angle": int(getattr(style, "gradient_angle", 90) if style else 90),
+            "rotation_angle": float(getattr(block, "rotation_angle", 0.0) or 0.0),
+            "style_source": str(getattr(style, "source", "auto") if style else "auto"),
+            "raw_style_match": getattr(block, "raw_style_match", {}) or {},
             "align":   getattr(block, "align", "center") or "center",
             "visible": bool(getattr(block, "visible", True)),
             "locked":  bool(getattr(block, "locked", False)),
@@ -8474,6 +9609,38 @@ class LocalizerEngine:
         region_entries: List[Dict[str, Any]] = []
         issues:         List[Dict[str, Any]] = []
         cleanup_patch_by_region: Dict[str, Dict[str, Any]] = {}
+        for pidx in range(max(0, len(pages) - 1)):
+            left = pages[pidx]
+            right = pages[pidx + 1]
+            def _sig(page: Any) -> List[Tuple[Tuple[int, int, int, int], str, str]]:
+                regs = getattr(page, "regions", []) or []
+                trans = getattr(page, "translations", []) or []
+                return [
+                    (
+                        tuple(int(v) for v in block.bbox()),
+                        str(getattr(block, "text", "") or "").strip(),
+                        str(trans[ridx] if ridx < len(trans) else "").strip(),
+                    )
+                    for ridx, block in enumerate(regs)
+                ]
+            left_sig = _sig(left)
+            right_sig = _sig(right)
+            if left_sig and left_sig == right_sig:
+                issues.append({
+                    "id": f"duplicate-region-state-{pidx}-{pidx+1}",
+                    "sev": "warn",
+                    "msg": "Adjacent pages have identical region state; reload or rerun detection after this hotfix if boxes still look copied.",
+                    "region": None,
+                    "page": pidx + 1,
+                })
+        if bool(getattr(self.font_lib, "used_system_fallback", False)):
+            issues.append({
+                "id": "font-system-fallback",
+                "sev": "warn",
+                "msg": "No matching comic font was available for at least one render; system font fallback was used.",
+                "region": None,
+                "page": active_page_idx + 1,
+            })
         if current_page is not None:
             for patch in getattr(current_page, "cleanup_patches", []) or []:
                 rid = str(patch.get("region_id", "") or "")
@@ -8504,6 +9671,26 @@ class LocalizerEngine:
                 "outline_width": int((getattr(style, "outline_width", None) if style else None) or getattr(block, "outline_width", 1) or 1),
                 "shadow":  _hex_color(getattr(style, "shadow_color", None), "#000000"),
                 "shadow_on": bool(getattr(style, "shadow_on", False)),
+                "shadow_offset_x": int((getattr(style, "shadow_offset", (1, 2)) or (1, 2))[0]) if style else 1,
+                "shadow_offset_y": int((getattr(style, "shadow_offset", (1, 2)) or (1, 2))[1]) if style else 2,
+                "shadow_opacity": float(getattr(style, "shadow_opacity", 0.55) if style else 0.55),
+                "shadow_blur": float(getattr(style, "shadow_blur", 0.0) if style else 0.0),
+                "glow": _hex_color(getattr(style, "glow_color", None), "#ffffff"),
+                "glow_on": bool(getattr(style, "glow_on", False)),
+                "glow_radius": int(getattr(style, "glow_radius", 4) if style else 4),
+                "glow_intensity": float(getattr(style, "glow_intensity", 0.45) if style else 0.45),
+                "reflection_on": bool(getattr(style, "reflection_on", False)),
+                "reflection_opacity": float(getattr(style, "reflection_opacity", 0.32) if style else 0.32),
+                "reflection_offset": int(getattr(style, "reflection_offset", 4) if style else 4),
+                "reflection_blur": float(getattr(style, "reflection_blur", 1.5) if style else 1.5),
+                "reflection_fade": float(getattr(style, "reflection_fade", 0.78) if style else 0.78),
+                "gradient_on": bool(getattr(style, "gradient_on", False)),
+                "gradient_start": _hex_color(getattr(style, "gradient_start", None), "#111111"),
+                "gradient_end": _hex_color(getattr(style, "gradient_end", None), "#3c3c3c"),
+                "gradient_angle": int(getattr(style, "gradient_angle", 90) if style else 90),
+                "rotation_angle": float(getattr(block, "rotation_angle", 0.0) or 0.0),
+                "style_source": str(getattr(style, "source", "auto") if style else "auto"),
+                "raw_style_match": getattr(block, "raw_style_match", {}) or {},
                 "align":   getattr(block, "align", "center") or "center",
                 "visible": bool(getattr(block, "visible", True)),
                 "locked":  bool(getattr(block, "locked", False)),
@@ -8739,8 +9926,13 @@ class LocalizerEngine:
                     "cleanup_solid_bubble_max_rectangularity": getattr(self.model_config, "cleanup_solid_bubble_max_rectangularity", 0.45),
                     "cleanup_halo_mask_enabled": _config_bool(getattr(self.model_config, "cleanup_halo_mask_enabled", True)),
                     "cleanup_halo_max_px": getattr(self.model_config, "cleanup_halo_max_px", 2),
+                    "cleanup_contrast_mask_completion_enabled": _config_bool(getattr(self.model_config, "cleanup_contrast_mask_completion_enabled", True)),
+                    "cleanup_contrast_mask_completion_radius": getattr(self.model_config, "cleanup_contrast_mask_completion_radius", 18),
+                    "cleanup_mask_backend": str(getattr(self.model_config, "cleanup_mask_backend", "auto") or "auto"),
                     "cleanup_residual_retry_enabled": _config_bool(getattr(self.model_config, "cleanup_residual_retry_enabled", True)),
                     "cleanup_residual_retry_dilate_px": getattr(self.model_config, "cleanup_residual_retry_dilate_px", 1),
+                    "cleanup_force_enabled": _config_bool(getattr(self.model_config, "cleanup_force_enabled", False)),
+                    "cleanup_status_enabled": _config_bool(getattr(self.model_config, "cleanup_status_enabled", True)),
                     "cleanup_allow_grouped_inpaint": _config_bool(getattr(self.model_config, "cleanup_allow_grouped_inpaint", False)),
                     "cleanup_manual_review_only": _config_bool(getattr(self.model_config, "cleanup_manual_review_only", False)),
                     "cleanup_min_container_confidence": getattr(self.model_config, "cleanup_min_container_confidence", 0.0),

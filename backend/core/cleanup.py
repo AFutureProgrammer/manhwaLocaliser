@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from backend.core.constants import debug_print
 from backend.core.regions import BackgroundKind, OCRBlock, RegionKind
@@ -474,6 +474,7 @@ def _render_shadow(
     color:   Tuple[int, int, int],
     offset:  Tuple[int, int],
     opacity: float,
+    blur:    float = 0.0,
 ) -> None:
     """
     Composite a drop shadow behind text using a temporary RGBA layer.
@@ -485,8 +486,9 @@ def _render_shadow(
     sx, sy = x_pos + int(offset[0]), y_pos + int(offset[1])
     try:
         bb = draw.textbbox((sx, sy), text, font=font)
-        bx1 = int(bb[0]) - 2; by1 = int(bb[1]) - 2
-        bx2 = int(bb[2]) + 2; by2 = int(bb[3]) + 2
+        margin = max(2, int(round(max(0.0, float(blur)) * 3)) + 2)
+        bx1 = int(bb[0]) - margin; by1 = int(bb[1]) - margin
+        bx2 = int(bb[2]) + margin; by2 = int(bb[3]) + margin
         bw = max(1, bx2 - bx1); bh = max(1, by2 - by1)
 
         shd = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
@@ -496,6 +498,11 @@ def _render_shadow(
             fill=(int(color[0]), int(color[1]), int(color[2]),
                   int(round(float(np.clip(opacity, 0.0, 1.0)) * 255))),
         )
+        if blur and float(blur) > 0.0:
+            alpha = shd.getchannel("A").filter(ImageFilter.GaussianBlur(radius=max(0.1, float(blur))))
+            blurred = Image.new("RGBA", (bw, bh), (int(color[0]), int(color[1]), int(color[2]), 0))
+            blurred.putalpha(alpha)
+            shd = blurred
         iw, ih = pil_img.size
         cx1 = max(0, bx1); cy1 = max(0, by1)
         cx2 = min(iw, bx2); cy2 = min(ih, by2)
@@ -505,6 +512,44 @@ def _render_shadow(
     except Exception:
         draw.text((sx, sy), text, font=font,
                   fill=(int(color[0]), int(color[1]), int(color[2])))
+
+def _render_glow(
+    pil_img: Image.Image,
+    draw: ImageDraw.Draw,
+    text: str,
+    x_pos: int,
+    y_pos: int,
+    font: ImageFont.ImageFont,
+    color: Tuple[int, int, int],
+    radius: int,
+    intensity: float,
+) -> None:
+    """Composite a soft halo from the glyph alpha before the main text draw."""
+    if not text or intensity <= 0.0 or radius <= 0:
+        return
+    try:
+        bb = draw.textbbox((x_pos, y_pos), text, font=font)
+        margin = max(2, int(radius) * 4)
+        bx1 = int(bb[0]) - margin; by1 = int(bb[1]) - margin
+        bx2 = int(bb[2]) + margin; by2 = int(bb[3]) + margin
+        bw = max(1, bx2 - bx1); bh = max(1, by2 - by1)
+        alpha = Image.new("L", (bw, bh), 0)
+        alpha_draw = ImageDraw.Draw(alpha)
+        alpha_draw.text(
+            (x_pos - bx1, y_pos - by1), text, font=font,
+            fill=int(round(float(np.clip(intensity, 0.0, 1.0)) * 255)),
+        )
+        alpha = alpha.filter(ImageFilter.GaussianBlur(radius=max(1, int(radius))))
+        glow = Image.new("RGBA", (bw, bh), (int(color[0]), int(color[1]), int(color[2]), 0))
+        glow.putalpha(alpha)
+        iw, ih = pil_img.size
+        cx1 = max(0, bx1); cy1 = max(0, by1)
+        cx2 = min(iw, bx2); cy2 = min(ih, by2)
+        if cx1 < cx2 and cy1 < cy2:
+            region = glow.crop((cx1 - bx1, cy1 - by1, cx2 - bx1, cy2 - by1))
+            pil_img.paste(region, (cx1, cy1), region)
+    except Exception:
+        return
 
 def _render_gradient_text(
     pil_img:  Image.Image,
@@ -615,18 +660,29 @@ def _draw_line_with_style(
 ) -> None:
     """
     Full single-line draw pipeline:
-      1. Drop shadow (if enabled)   — lowest layer
-      2. Outline / stroke            — 8-direction offset draws
-      3. Glyph fill                  — solid or gradient
+      1. Glow / halo (if enabled)   — lowest layer
+      2. Drop shadow (if enabled)
+      3. Outline / stroke            — 8-direction offset draws
+      4. Glyph fill                  — solid or gradient
     """
-    # 1. Shadow
+    # 1. Glow
+    if getattr(style, "glow_on", False):
+        _render_glow(
+            pil_img, draw, text, x_pos, y_pos, font,
+            getattr(style, "glow_color", (255, 255, 255)),
+            getattr(style, "glow_radius", 4),
+            getattr(style, "glow_intensity", 0.45),
+        )
+
+    # 2. Shadow
     if style.shadow_on:
         _render_shadow(
             pil_img, draw, text, x_pos, y_pos, font,
             style.shadow_color, style.shadow_offset, style.shadow_opacity,
+            getattr(style, "shadow_blur", 0.0),
         )
 
-    # 2. Outline (8-direction; always before fill so outline goes under glyph)
+    # 3. Outline (8-direction; always before fill so outline goes under glyph)
     if outline_w > 0:
         oc = style.outline_color
         for dx, dy in [(-1,-1),(1,-1),(-1,1),(1,1),(0,-1),(0,1),(-1,0),(1,0)]:
@@ -635,7 +691,7 @@ def _draw_line_with_style(
                 text, font=font, fill=oc,
             )
 
-    # 3. Glyph fill
+    # 4. Glyph fill
     if style.gradient_on:
         _render_gradient_text(pil_img, draw, text, x_pos, y_pos, font,
                               style, outline_w)

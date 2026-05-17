@@ -14,7 +14,7 @@
  * 10. Inspector edits call api.updateRegion() instead of being ignored
  */
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { Fragment, useState, useEffect, useRef, useCallback } from "react";
 import type {
   Bootstrap,
   Region,
@@ -57,7 +57,7 @@ const GLOBAL_CSS = `
     --fnt-disp: 'Syne', sans-serif;
     --fnt-mono: 'IBM Plex Mono', monospace;
     --fnt-body: 'Figtree', sans-serif;
-    --panel-w-l: 220px; --panel-w-r: 268px;
+    --panel-w-l: 220px; --panel-w-r: 380px;
     --topbar-h: 46px; --statusbar-h: 26px;
   }
 
@@ -197,6 +197,12 @@ const GLOBAL_CSS = `
   .region-overlay:hover { border-color: var(--teal); background: rgba(78,201,180,0.1); }
   .region-overlay.sel { border-color: var(--accent); background: rgba(201,165,90,0.1); box-shadow: 0 0 0 1px var(--accent-dim); }
   .region-overlay.dragging { cursor: grabbing; transition: none; }
+  .alignment-guide { position: absolute; pointer-events: none; z-index: 11; opacity: 0.82; }
+  .alignment-guide.v { top: 0; height: 100%; width: 0; border-left: 1px dashed rgba(245,216,76,0.82); }
+  .alignment-guide.h { left: 0; width: 100%; height: 0; border-top: 1px dashed rgba(245,216,76,0.82); }
+  .alignment-guide.container { border-color: rgba(78,201,180,0.78); }
+  .alignment-guide.selected { border-color: rgba(255,255,255,0.58); border-style: dotted; }
+  .alignment-guide.near { border-color: rgba(120,160,255,0.58); opacity: 0.56; }
   .debug-box-overlay { position: absolute; border: 2px solid currentColor; background: transparent; pointer-events: none; z-index: 8; box-shadow: 0 0 0 1px rgba(0,0,0,0.38); }
   .debug-box-label { position: absolute; left: -2px; top: -18px; padding: 2px 5px; border-radius: 2px; background: rgba(8,8,13,0.86); color: currentColor; font-family: var(--fnt-mono); font-size: 9px; white-space: nowrap; }
   .debug-mask-overlay { position: absolute; pointer-events: none; z-index: 7; mix-blend-mode: screen; image-rendering: pixelated; }
@@ -226,6 +232,23 @@ const GLOBAL_CSS = `
   .insp-body { padding: 0; overflow-y: auto; flex: 1; }
   .insp-section { border-bottom: 1px solid var(--br-0); padding: 10px 12px; }
   .insp-section-title { font-family: var(--fnt-mono); font-size: 9px; color: var(--t3); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 8px; }
+  .editor-section { border-bottom: 1px solid var(--br-0); }
+  .editor-section > summary { list-style: none; cursor: pointer; padding: 10px 12px; font-family: var(--fnt-mono); font-size: 9px; color: var(--t3); letter-spacing: 0.08em; text-transform: uppercase; user-select: none; display: flex; align-items: center; justify-content: space-between; }
+  .editor-section > summary::-webkit-details-marker { display: none; }
+  .editor-section > summary::after { content: "›"; color: var(--t4); transform: rotate(90deg); transition: transform 0.12s; }
+  .editor-section:not([open]) > summary::after { transform: rotate(0deg); }
+  .editor-section > summary:hover { background: var(--bg-3); color: var(--t2); }
+  .editor-section-body { padding: 0 12px 12px; }
+  .style-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .style-row .prop-val { width: auto; min-width: 72px; }
+  .raw-match-card { border: 1px solid var(--br-1); background: var(--bg-2); border-radius: var(--r2); padding: 8px; display: grid; gap: 7px; }
+  .raw-match-summary { color: var(--t1); font-size: 12px; }
+  .raw-match-meta { color: var(--t3); font-family: var(--fnt-mono); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+  .topbar-overflow { position: relative; }
+  .topbar-overflow summary { list-style: none; }
+  .topbar-overflow summary::-webkit-details-marker { display: none; }
+  .topbar-menu { position: absolute; right: 0; top: 32px; z-index: 150; min-width: 190px; border: 1px solid var(--br-2); background: var(--bg-2); box-shadow: 0 12px 40px rgba(0,0,0,0.45); padding: 6px; display: grid; gap: 5px; }
+  .topbar-menu .btn-ghost { justify-content: flex-start; width: 100%; }
   .prop-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .prop-cell { display: flex; flex-direction: column; gap: 3px; }
   .prop-label { font-family: var(--fnt-mono); font-size: 9px; color: var(--t3); letter-spacing: 0.04em; }
@@ -346,7 +369,7 @@ type StepState = "idle" | "done" | "active" | "running" | "error";
 type ImageMode = "best" | "raw" | "cleaned" | "typeset";
 type PageSelectMode = "immediate" | "debounced" | "local";
 type RegionBBox = Pick<Region, "x" | "y" | "w" | "h">;
-type RegionDraft = Partial<Pick<Region, "x" | "y" | "w" | "h" | "src" | "tl" | "font" | "size" | "align" | "fg" | "bg" | "outline" | "outline_width" | "shadow" | "shadow_on" | "visible" | "locked">>;
+type RegionDraft = Partial<Pick<Region, "x" | "y" | "w" | "h" | "src" | "tl" | "font" | "size" | "align" | "fg" | "bg" | "outline" | "outline_width" | "shadow" | "shadow_on" | "shadow_offset_x" | "shadow_offset_y" | "shadow_opacity" | "shadow_blur" | "glow" | "glow_on" | "glow_radius" | "glow_intensity" | "reflection_on" | "reflection_opacity" | "reflection_offset" | "reflection_blur" | "reflection_fade" | "gradient_on" | "gradient_start" | "gradient_end" | "gradient_angle" | "rotation_angle" | "visible" | "locked">>;
 type CleanupMaskPayload = { b64: string; bbox: number[] } | null;
 type Sam2UiMode = "cleanup" | "container" | "protect";
 type Sam2MergeMode = "replace" | "add" | "subtract";
@@ -444,6 +467,24 @@ const regionStyleDebug = (r: Region | (Region & RegionDraft)) => ({
   outline_width: r.outline_width,
   shadow: r.shadow,
   shadow_on: r.shadow_on,
+  shadow_offset_x: r.shadow_offset_x,
+  shadow_offset_y: r.shadow_offset_y,
+  shadow_opacity: r.shadow_opacity,
+  shadow_blur: r.shadow_blur,
+  glow: r.glow,
+  glow_on: r.glow_on,
+  glow_radius: r.glow_radius,
+  glow_intensity: r.glow_intensity,
+  reflection_on: r.reflection_on,
+  reflection_opacity: r.reflection_opacity,
+  reflection_offset: r.reflection_offset,
+  reflection_blur: r.reflection_blur,
+  reflection_fade: r.reflection_fade,
+  gradient_on: r.gradient_on,
+  gradient_start: r.gradient_start,
+  gradient_end: r.gradient_end,
+  gradient_angle: r.gradient_angle,
+  rotation_angle: r.rotation_angle,
   align: r.align,
   detector_source: r.detector_source,
 });
@@ -463,6 +504,24 @@ const regionVisualStyleKey = (r: Region | (Region & RegionDraft)) => JSON.string
   outline_width: r.outline_width,
   shadow: r.shadow,
   shadow_on: r.shadow_on,
+  shadow_offset_x: r.shadow_offset_x,
+  shadow_offset_y: r.shadow_offset_y,
+  shadow_opacity: r.shadow_opacity,
+  shadow_blur: r.shadow_blur,
+  glow: r.glow,
+  glow_on: r.glow_on,
+  glow_radius: r.glow_radius,
+  glow_intensity: r.glow_intensity,
+  reflection_on: r.reflection_on,
+  reflection_opacity: r.reflection_opacity,
+  reflection_offset: r.reflection_offset,
+  reflection_blur: r.reflection_blur,
+  reflection_fade: r.reflection_fade,
+  gradient_on: r.gradient_on,
+  gradient_start: r.gradient_start,
+  gradient_end: r.gradient_end,
+  gradient_angle: r.gradient_angle,
+  rotation_angle: r.rotation_angle,
 });
 const regionPreviewSpriteKey = (r: Region | (Region & RegionDraft)) => JSON.stringify({
   visual: regionVisualStyleKey(r),
@@ -476,7 +535,13 @@ const previewReason = (draft?: RegionDraft) => {
   if (
     draft.font !== undefined || draft.size !== undefined || draft.align !== undefined ||
     draft.fg !== undefined || draft.outline !== undefined ||
-    draft.outline_width !== undefined || draft.shadow !== undefined || draft.shadow_on !== undefined
+    draft.outline_width !== undefined || draft.shadow !== undefined || draft.shadow_on !== undefined ||
+    draft.shadow_offset_x !== undefined || draft.shadow_offset_y !== undefined || draft.shadow_opacity !== undefined || draft.shadow_blur !== undefined ||
+    draft.glow !== undefined || draft.glow_on !== undefined || draft.glow_radius !== undefined || draft.glow_intensity !== undefined ||
+    draft.reflection_on !== undefined || draft.reflection_opacity !== undefined || draft.reflection_offset !== undefined ||
+    draft.reflection_blur !== undefined || draft.reflection_fade !== undefined ||
+    draft.gradient_on !== undefined || draft.gradient_start !== undefined || draft.gradient_end !== undefined || draft.gradient_angle !== undefined ||
+    draft.rotation_angle !== undefined
   ) return "style_change";
   return "local_change";
 };
@@ -486,6 +551,32 @@ const isBboxOnlyDraft = (draft?: RegionDraft) => {
   return keys.length > 0 && keys.every(k => k === "x" || k === "y" || k === "w" || k === "h");
 };
 const clampNumber = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const validBoxArray = (box?: number[] | null): RegionBBox | null => {
+  if (!Array.isArray(box) || box.length !== 4) return null;
+  const [x, y, w, h] = box.map(Number);
+  if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) return null;
+  return { x, y, w, h };
+};
+const containerBoxForRegion = (region: Region): RegionBBox => (
+  validBoxArray(region.cleanup_container_bbox) ??
+  validBoxArray(region.container_bbox) ??
+  { x: region.x, y: region.y, w: region.w, h: region.h }
+);
+const boxCenter = (box: RegionBBox) => ({ x: box.x + box.w / 2, y: box.y + box.h / 2 });
+const clampBboxToSize = (bbox: RegionBBox, size: { w: number; h: number }): RegionBBox => {
+  const pageW = Math.max(1, Number(size.w) || 1);
+  const pageH = Math.max(1, Number(size.h) || 1);
+  const minW = Math.min(8, pageW);
+  const minH = Math.min(8, pageH);
+  const w = Math.min(Math.max(Math.round(bbox.w), minW), pageW);
+  const h = Math.min(Math.max(Math.round(bbox.h), minH), pageH);
+  return {
+    x: Math.min(Math.max(Math.round(bbox.x), 0), Math.max(0, pageW - w)),
+    y: Math.min(Math.max(Math.round(bbox.y), 0), Math.max(0, pageH - h)),
+    w,
+    h,
+  };
+};
 const isCrossPageSecondary = (r: Region) => Boolean((r as any).cross_page_secondary);
 const regionOwnerPage = (r: Region, fallbackPage: number) =>
   typeof r.source_page_idx === "number" ? r.source_page_idx : fallbackPage;
@@ -512,7 +603,7 @@ const editorRegionsForPage = (data: Bootstrap, pageIdx: number): Region[] => {
     .filter(r => !isCrossPageSecondary(r))
     .map(r => {
       const segmented = regionSegmentForPage(r, pageIdx);
-      return { ...segmented, id: editorRegionId(segmented, pageIdx) };
+      return { ...segmented, id: editorRegionId(segmented, pageIdx), display_page_idx: pageIdx };
     });
 };
 
@@ -566,10 +657,9 @@ const TopBar = ({
 
     <div className="ml-pipeline">
       {PIPELINE_STEPS.map((name, i) => (
-        <>
+        <Fragment key={name}>
           {i > 0 && <span key={`a${i}`} className="pip-arrow">›</span>}
           <button
-            key={name}
             className={`pip-step ${pipeState[i] ?? "idle"}`}
             onClick={() => !busy && canRun && onStep(i)}
             disabled={busy || !canRun}
@@ -578,7 +668,7 @@ const TopBar = ({
             <div className="pip-dot" />
             {name}
           </button>
-        </>
+        </Fragment>
       ))}
     </div>
 
@@ -586,38 +676,27 @@ const TopBar = ({
       <button className="btn-ghost" onClick={onOpenChapter} disabled={busy}>
         <Svg icon="folder" size={12} /> Open Chapter
       </button>
-      <button className="btn-ghost" onClick={onBrowse} disabled={busy}>
-        Browse Source
+      <button className="btn-ghost" onClick={onRunPage} disabled={busy || !canRun} title={canRun ? "Run the selected page" : "Open or import a chapter before running the pipeline."}>
+        <Svg icon="run" size={12} /> Run Page
       </button>
       <button className="btn-primary" onClick={onRunAll} disabled={busy || !canRun} title={canRun ? "Run all loaded pages" : "Open or import a chapter before running the pipeline."}>
         <Svg icon="run" size={12} /> Run All
       </button>
-      {canContinueRunAll && (
-        <button className="btn-ghost" onClick={onContinueRunAll} disabled={busy || !canRun} title={continueTitle}>
-          Continue
-        </button>
-      )}
-      <button className="btn-ghost" onClick={onDetectAll} disabled={busy || !canRun} title={canRun ? "Detect boxes on every page only" : "Open or import a chapter first."}>
-        Detect All
-      </button>
-      <button className="btn-ghost" onClick={onRunPage} disabled={busy || !canRun} title={canRun ? "Run the selected page" : "Open or import a chapter before running the pipeline."}>
-        <Svg icon="run" size={12} /> Run Page
-      </button>
-      <button className="btn-ghost" onClick={onExportYoloDataset} disabled={busy || !canRun} title="Export YOLO-format images, labels, and deletion corrections">
-        YOLO Data
-      </button>
-      <button className="btn-ghost" onClick={onTrainYolo} disabled={busy || !canRun} title="Train a YOLO checkpoint from the current fine-tune dataset">
-        Train YOLO
-      </button>
-      <button className="btn-ghost" onClick={onUndo} disabled={busy}>
-        Undo
-      </button>
       <button className="btn-ghost" onClick={onExport} disabled={busy}>
         <Svg icon="export" size={12} /> Export
       </button>
-      <button className="btn-ghost" onClick={onSettings} disabled={busy}>
-        Settings
-      </button>
+      <details className="topbar-overflow">
+        <summary className="btn-ghost">More</summary>
+        <div className="topbar-menu">
+          <button className="btn-ghost" onClick={onBrowse} disabled={busy}>Browse Source</button>
+          {canContinueRunAll && <button className="btn-ghost" onClick={onContinueRunAll} disabled={busy || !canRun} title={continueTitle}>Continue Run All</button>}
+          <button className="btn-ghost" onClick={onDetectAll} disabled={busy || !canRun} title={canRun ? "Detect boxes on every page only" : "Open or import a chapter first."}>Detect All</button>
+          <button className="btn-ghost" onClick={onExportYoloDataset} disabled={busy || !canRun} title="Export YOLO-format images, labels, and deletion corrections">YOLO Data</button>
+          <button className="btn-ghost" onClick={onTrainYolo} disabled={busy || !canRun} title="Train a YOLO checkpoint from the current fine-tune dataset">Train YOLO</button>
+          <button className="btn-ghost" onClick={onUndo} disabled={busy}>Undo</button>
+          <button className="btn-ghost" onClick={onSettings} disabled={busy}>Settings</button>
+        </div>
+      </details>
       <div className="divider-v" />
       <button className={`btn-icon ${leftOpen ? "on" : ""}`} onClick={onToggleLeft} title="Toggle left panel">
         <Svg icon="collapse" size={13} />
@@ -728,6 +807,7 @@ const SettingsModal = ({
             <select className="settings-input" value={valueOf("sam2_mask_mode", "manual_only")} onChange={e => update("sam2_mask_mode", e.target.value)}>
               <option value="manual_only">Manual only</option>
               <option value="cleanup_assist">Cleanup assist</option>
+              <option value="auto_cleanup">Auto cleanup</option>
               <option value="container_assist">Container/protect assist</option>
             </select>
             <label>Model path</label>
@@ -742,7 +822,7 @@ const SettingsModal = ({
               <option value="mps">mps</option>
             </select>
           </div>
-          <div className="settings-note">SAM2 only proposes masks. Preview/apply still uses the normal cleanup patch flow.</div>
+          <div className="settings-note">SAM2 proposes masks. With cleanup mask backend set to Auto or SAM2, automatic cleanup can use those masks before the normal patch flow.</div>
           <div className="insp-section-title">Pipeline</div>
           <div className="settings-grid">
             <label>Process SFX regions</label>
@@ -777,6 +857,12 @@ const SettingsModal = ({
               <option value="aggressive">Aggressive</option>
               <option value="manual">Manual / Review only</option>
             </select>
+            <label>Mask backend</label>
+            <select className="settings-input" value={valueOf("cleanup_mask_backend", "auto")} onChange={e => update("cleanup_mask_backend", e.target.value)}>
+              <option value="auto">Auto (CV + SAM2)</option>
+              <option value="cv">CV only</option>
+              <option value="sam2">SAM2</option>
+            </select>
             <label>Solid bubble fill</label>
             <input type="checkbox" checked={checked("cleanup_solid_bubble_fill_enabled", true)} onChange={e => update("cleanup_solid_bubble_fill_enabled", String(e.target.checked))} title="Best for white/solid bubbles" />
             <label>Solid min container conf</label>
@@ -789,10 +875,18 @@ const SettingsModal = ({
             <input type="checkbox" checked={checked("cleanup_halo_mask_enabled", true)} onChange={e => update("cleanup_halo_mask_enabled", String(e.target.checked))} title="Expands the cleanup mask over faint text edges" />
             <label>Edge cleanup px</label>
             <input className="settings-input" type="number" min="0" max="8" value={valueOf("cleanup_halo_max_px", "2")} onChange={e => update("cleanup_halo_max_px", e.target.value)} />
+            <label>Complete outlines</label>
+            <input type="checkbox" checked={checked("cleanup_contrast_mask_completion_enabled", true)} onChange={e => update("cleanup_contrast_mask_completion_enabled", String(e.target.checked))} title="Expands flat-bubble masks over missed high-contrast outlines and shadows" />
+            <label>Outline radius</label>
+            <input className="settings-input" type="number" min="4" max="32" value={valueOf("cleanup_contrast_mask_completion_radius", "18")} onChange={e => update("cleanup_contrast_mask_completion_radius", e.target.value)} />
             <label>Leftover text retry</label>
             <input type="checkbox" checked={checked("cleanup_residual_retry_enabled", true)} onChange={e => update("cleanup_residual_retry_enabled", String(e.target.checked))} title="Tries once more with a slightly larger mask when text remains" />
             <label>Retry dilation px</label>
             <input className="settings-input" type="number" min="0" max="8" value={valueOf("cleanup_residual_retry_dilate_px", "1")} onChange={e => update("cleanup_residual_retry_dilate_px", e.target.value)} />
+            <label>Force cleanup</label>
+            <input type="checkbox" checked={checked("cleanup_force_enabled", false)} onChange={e => update("cleanup_force_enabled", String(e.target.checked))} title="Always attempts cleanup, falling back to bbox masks and bypassing normal skip/review gates" />
+            <label>Show cleanup status</label>
+            <input type="checkbox" checked={checked("cleanup_status_enabled", true)} onChange={e => update("cleanup_status_enabled", String(e.target.checked))} title="When off, cleanup still runs but cautious/review status labels are hidden" />
             <label>Grouped inpaint</label>
             <input type="checkbox" checked={checked("cleanup_allow_grouped_inpaint", false)} onChange={e => update("cleanup_allow_grouped_inpaint", String(e.target.checked))} />
             <label>Fallback backend</label>
@@ -1249,6 +1343,7 @@ const ContinuousPage = ({
     regions.forEach(region => {
       if (!region.visible || !region.tl) return;
       if (regionOwnerPage(region, idx) !== idx) return;
+      if (selectedRegion?.id !== region.id && !regionDrafts[region.id]) return;
       const draft = {
         ...(regionDrafts[region.id] ?? {}),
       };
@@ -1262,7 +1357,7 @@ const ContinuousPage = ({
       pendingSpriteKeysRef.current.add(requestKey);
       api.getRegionPreviewSprite(region.idx, draft, idx).then(resp => {
         pendingSpriteKeysRef.current.delete(requestKey);
-        if (cancelled || !resp.ok || !resp.b64) return;
+        if (cancelled || !showOverlayBoxes || !showEnglishOverlay || !resp.ok || !resp.b64) return;
         setPreviewSprites(prev => ({
           ...prev,
           [slot]: {
@@ -1278,7 +1373,7 @@ const ContinuousPage = ({
       });
     });
     return () => { cancelled = true; };
-  }, [active, chapterDir, showOverlayBoxes, showEnglishOverlay, naturalSize.w, naturalSize.h, idx, regions, regionDrafts]);
+  }, [active, chapterDir, showOverlayBoxes, showEnglishOverlay, naturalSize.w, naturalSize.h, idx, regions, regionDrafts, selectedRegion?.id]);
 
   const clampContinuousBox = (box: RegionBBox): RegionBBox => {
     const minW = 8;
@@ -1328,7 +1423,7 @@ const ContinuousPage = ({
     }
     e.stopPropagation();
     e.preventDefault();
-    onSelect(idx, "immediate");
+    onSelect(idx, "local");
     onRegionSelect(region);
     const draft = regionDrafts[region.id] ?? {};
     const box = clampContinuousBox({
@@ -1416,6 +1511,8 @@ const ContinuousPage = ({
             if (r.pipeline_disabled && selectedRegion?.id !== r.id) return null;
             const isSelected = selectedRegion?.id === r.id;
             const sprite = previewSprites[`${idx}:${region.id}`];
+            const isLiveEdit = isSelected || Boolean(regionDrafts[region.id]) || dragBox?.id === region.id;
+            const showLiveText = showOverlayBoxes && showEnglishOverlay && isLiveEdit && r.visible && Boolean(r.tl);
             return (
               <div
                 key={r.id}
@@ -1435,7 +1532,7 @@ const ContinuousPage = ({
                 <div className={`region-label ${isSelected ? "gold" : "teal"}`}>
                   {r.label}{r.locked ? " · LOCK" : ""}
                 </div>
-                {showOverlayBoxes && showEnglishOverlay && r.visible && r.tl && sprite?.b64 ? (
+                {showLiveText && sprite?.b64 ? (
                   <img
                     className="translation-bitmap-preview"
                     src={`data:image/png;base64,${sprite.b64}`}
@@ -1448,7 +1545,7 @@ const ContinuousPage = ({
                       height: `${(sprite.h / sprite.sourceBox.h) * 100}%`,
                     }}
                   />
-                ) : showOverlayBoxes && showEnglishOverlay && r.visible && r.tl && (
+                ) : showLiveText && (
                   <div
                     className="translation-overlay"
                     style={{
@@ -1457,6 +1554,8 @@ const ContinuousPage = ({
                       fontSize: continuousPreviewFontSize(r),
                       textAlign: r.align,
                       textShadow: `${r.outline || "#ffffff"} 0 0 ${Math.max(1, r.outline_width || 1)}px`,
+                      transform: `rotate(${Number(r.rotation_angle ?? 0)}deg)`,
+                      transformOrigin: "center center",
                     }}
                   >
                     {r.tl}
@@ -1589,7 +1688,7 @@ const ContinuousReader = ({
           zoom={zoom}
           showMarker={showMarkers}
           totalPages={data.pages.length}
-          onSelect={(idx) => onPageSelect(idx, "immediate")}
+          onSelect={(idx) => onPageSelect(idx, "local")}
           onRegionSelect={onRegionSelect}
           onPreviewRegion={onPreviewRegion}
           onCommitBBox={onCommitBBox}
@@ -1603,7 +1702,7 @@ const CanvasArea = ({
   data, activePage, selectedRegion, setSelectedRegion, zoom, setZoom,
   regionDrafts, onPreviewRegion, onCommitBBox, showEnglishOverlay, setShowEnglishOverlay,
   readerMode, setReaderMode, showPageIndicator, setShowPageIndicator, scrollTarget, onPageSelect,
-  imageMode, setImageMode, pageVersions, cleanupDebug, debugOverlays,
+  imageMode, setImageMode, pageVersions, cleanupDebug, debugOverlays, onPageSizeChange,
 }: {
   data:             Bootstrap;
   activePage:       number;
@@ -1627,10 +1726,17 @@ const CanvasArea = ({
   pageVersions:      Record<number, number>;
   cleanupDebug:      CleanupDebugResponse | null;
   debugOverlays:     DebugOverlayToggles;
+  onPageSizeChange:  (pageIdx: number, size: { w: number; h: number }) => void;
 }) => {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [cleanedImageSrc, setCleanedImageSrc] = useState<string | null>(null);
   const [showPageMarkers, setShowPageMarkers] = useState(true);
+  const [showAlignmentGuides, setShowAlignmentGuides] = useState<boolean>(() => {
+    try { return localStorage.getItem("ml.alignmentGuides") === "1"; } catch { return false; }
+  });
+  const [snapAlignment, setSnapAlignment] = useState<boolean>(() => {
+    try { return localStorage.getItem("ml.snapAlignment") === "1"; } catch { return false; }
+  });
   /**
    * Pass 5: UI-only toggle that hides region rectangles / labels / resize
    * handles while keeping the rendered translated text, cleaned image, and
@@ -1646,6 +1752,22 @@ const CanvasArea = ({
   useEffect(() => {
     try { localStorage.setItem("ml.showOverlayBoxes", showOverlayBoxes ? "1" : "0"); } catch {}
   }, [showOverlayBoxes]);
+  useEffect(() => {
+    try { localStorage.setItem("ml.alignmentGuides", showAlignmentGuides ? "1" : "0"); } catch {}
+  }, [showAlignmentGuides]);
+  useEffect(() => {
+    try { localStorage.setItem("ml.snapAlignment", snapAlignment ? "1" : "0"); } catch {}
+  }, [snapAlignment]);
+  useEffect(() => {
+    const toggleGuides = () => setShowAlignmentGuides(v => !v);
+    const toggleSnap = () => setSnapAlignment(v => !v);
+    window.addEventListener("ml:toggle-alignment-guides", toggleGuides);
+    window.addEventListener("ml:toggle-alignment-snap", toggleSnap);
+    return () => {
+      window.removeEventListener("ml:toggle-alignment-guides", toggleGuides);
+      window.removeEventListener("ml:toggle-alignment-snap", toggleSnap);
+    };
+  }, []);
   const [imageError, setImageError] = useState("");
   const [imageSize, setImageSize] = useState({ w: 460, h: 660 });
   const [dragPreview, setDragPreview] = useState<{ id: string; bbox: RegionBBox } | null>(null);
@@ -1758,7 +1880,9 @@ const CanvasArea = ({
 
   const onImgLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
     const img = e.currentTarget;
-    setImageSize({ w: img.naturalWidth, h: img.naturalHeight });
+    const next = { w: img.naturalWidth, h: img.naturalHeight };
+    setImageSize(next);
+    onPageSizeChange(activePage, next);
   };
 
   const scale = zoom / 100;
@@ -1815,6 +1939,32 @@ const CanvasArea = ({
     }
 
     return clampBbox({ x: left, y: top, w: right - left, h: bottom - top });
+  };
+
+  const snapBoxToGuides = (box: RegionBBox, region: Region, snapActive: boolean): RegionBBox => {
+    if (!snapActive || imageSize.w <= 0 || imageSize.h <= 0) return box;
+    const threshold = 6 / Math.max(0.2, scale);
+    const center = boxCenter(box);
+    const containerCenter = boxCenter(containerBoxForRegion(region));
+    const xGuides = [imageSize.w / 2, containerCenter.x];
+    const yGuides = [imageSize.h / 2, containerCenter.y];
+    regions.forEach(other => {
+      if (other.id === region.id || !other.visible) return;
+      xGuides.push(other.x, other.x + other.w / 2, other.x + other.w);
+      yGuides.push(other.y, other.y + other.h / 2, other.y + other.h);
+    });
+    let next = { ...box };
+    const nearestX = xGuides.reduce<{ value: number; dist: number } | null>((best, guide) => {
+      const dist = Math.abs(center.x - guide);
+      return dist <= threshold && (!best || dist < best.dist) ? { value: guide, dist } : best;
+    }, null);
+    const nearestY = yGuides.reduce<{ value: number; dist: number } | null>((best, guide) => {
+      const dist = Math.abs(center.y - guide);
+      return dist <= threshold && (!best || dist < best.dist) ? { value: guide, dist } : best;
+    }, null);
+    if (nearestX) next.x += nearestX.value - center.x;
+    if (nearestY) next.y += nearestY.value - center.y;
+    return clampBbox(next);
   };
 
   const startDrag = (e: React.PointerEvent<HTMLDivElement>, region: Region, mode: "move" | ResizeHandle) => {
@@ -1876,7 +2026,8 @@ const CanvasArea = ({
     const next = drag.mode === "move"
       ? clampBbox({ ...drag.startBox, x: drag.startBox.x + dx, y: drag.startBox.y + dy })
       : resizeBox(drag.mode, drag.startBox, dx, dy);
-    drag.currentBox = next;
+    const snapped = drag.mode === "move" ? snapBoxToGuides(next, drag.region, snapAlignment || e.altKey) : next;
+    drag.currentBox = snapped;
     drag.moves += 1;
     renderDebug("bbox.preview", {
       page: activePage,
@@ -1885,10 +2036,10 @@ const CanvasArea = ({
       moves: drag.moves,
       baseLayer: displayImageMode,
       dirty: isRenderDirty,
-      bbox: next,
+      bbox: snapped,
       style: regionStyleDebug(drag.region),
     });
-    setDragPreview({ id: drag.region.id, bbox: next });
+    setDragPreview({ id: drag.region.id, bbox: snapped });
   };
 
   const onPointerUp = async (e: React.PointerEvent<HTMLDivElement>) => {
@@ -1955,7 +2106,8 @@ const CanvasArea = ({
     ...(dragPreview?.id === r.id ? dragPreview.bbox : {}),
   }));
   const requestPreviewSprite = (region: Region | (Region & RegionDraft), draft: RegionDraft, reason: string, debounceMs = 0) => {
-    if (!data.meta.chapterDir || !showOverlayBoxes || !region.visible || !region.tl || dragRef.current?.region.id === region.id) return;
+    const activeForPreview = selectedRegion?.id === region.id || Boolean(regionDrafts[region.id]) || dragRef.current?.region.id === region.id;
+    if (!data.meta.chapterDir || !showOverlayBoxes || !showEnglishOverlay || !activeForPreview || !region.visible || !region.tl || dragRef.current?.region.id === region.id) return;
     const slot = spriteSlot(region.id);
     if (previewTimers.current[slot]) window.clearTimeout(previewTimers.current[slot]);
     previewTimers.current[slot] = window.setTimeout(() => {
@@ -2026,7 +2178,7 @@ const CanvasArea = ({
 
   const activeBackendSprites = showOverlayBoxes ? regions.reduce<BackendPreviewSprite[]>((acc, r) => {
     const sprite = backendPreviewSprites[spriteSlot(r.id)];
-    if (previewSpriteMatches(sprite, r) && (dragPreview?.id === r.id || regionDrafts[r.id] || isRenderDirty || !isTypesetDone)) {
+    if (previewSpriteMatches(sprite, r) && (selectedRegion?.id === r.id || dragPreview?.id === r.id || regionDrafts[r.id])) {
       acc.push(sprite);
     }
     return acc;
@@ -2039,6 +2191,32 @@ const CanvasArea = ({
       const y2 = Math.max(sprite.sourceBox.y + sprite.sourceBox.h, sprite.y + sprite.h);
       return clampBbox({ x: x1, y: y1, w: x2 - x1, h: y2 - y1 });
   });
+  const selectedLiveRegion = selectedRegion ? regions.find(r => r.id === selectedRegion.id) ?? null : null;
+  const guidesVisible = showOverlayBoxes && imageSize.w > 0 && imageSize.h > 0 && Boolean(selectedLiveRegion) && (showAlignmentGuides || Boolean(dragPreview));
+  const alignmentGuides = guidesVisible && selectedLiveRegion ? (() => {
+    const region = selectedLiveRegion;
+    const center = boxCenter(region);
+    const container = containerBoxForRegion(region);
+    const containerCenter = boxCenter(container);
+    const guides: Array<{ id: string; axis: "v" | "h"; value: number; kind: "page" | "container" | "selected" | "near" }> = [
+      { id: "page-v", axis: "v", value: imageSize.w / 2, kind: "page" },
+      { id: "page-h", axis: "h", value: imageSize.h / 2, kind: "page" },
+      { id: "container-v", axis: "v", value: containerCenter.x, kind: "container" },
+      { id: "container-h", axis: "h", value: containerCenter.y, kind: "container" },
+      { id: "selected-v", axis: "v", value: center.x, kind: "selected" },
+      { id: "selected-h", axis: "h", value: center.y, kind: "selected" },
+    ];
+    regions.forEach(other => {
+      if (other.id === region.id || !other.visible) return;
+      guides.push({ id: `${other.id}-left`, axis: "v", value: other.x, kind: "near" });
+      guides.push({ id: `${other.id}-cx`, axis: "v", value: other.x + other.w / 2, kind: "near" });
+      guides.push({ id: `${other.id}-right`, axis: "v", value: other.x + other.w, kind: "near" });
+      guides.push({ id: `${other.id}-top`, axis: "h", value: other.y, kind: "near" });
+      guides.push({ id: `${other.id}-cy`, axis: "h", value: other.y + other.h / 2, kind: "near" });
+      guides.push({ id: `${other.id}-bottom`, axis: "h", value: other.y + other.h, kind: "near" });
+    });
+    return guides;
+  })() : [];
 
   useEffect(() => {
     const onSpriteRequest = (ev: Event) => {
@@ -2055,11 +2233,12 @@ const CanvasArea = ({
 
   useEffect(() => {
     if (!data.meta.chapterDir || !showOverlayBoxes || !showEnglishOverlay || dragRef.current) return;
-    if (imageMode === "best" && isTypesetDone && !isRenderDirty) return;
     regions.forEach(region => {
-      if (region.visible && region.tl) requestPreviewSprite(region, {}, "overlay_restore", 0);
+      if (region.visible && region.tl && (selectedRegion?.id === region.id || regionDrafts[region.id])) {
+        requestPreviewSprite(region, {}, "overlay_restore", 0);
+      }
     });
-  }, [activePage, pageStatusKey, data.meta.chapterDir, isTypesetDone, isRenderDirty, imageMode, showEnglishOverlay, showOverlayBoxes]);
+  }, [activePage, pageStatusKey, data.meta.chapterDir, imageMode, showEnglishOverlay, showOverlayBoxes, selectedRegion?.id, regionDrafts]);
 
   const overlayFontSize = (r: Region) => {
     if (r.size && r.size > 0) return Math.max(8, Math.min(72, r.size)) * scale;
@@ -2089,7 +2268,16 @@ const CanvasArea = ({
           `${-width}px ${width}px ${outline}`, `${width}px ${width}px ${outline}`,
         ]
       : [];
-    if (r.shadow_on) stroke.push(`1px 2px 2px ${r.shadow || "rgba(0,0,0,0.45)"}`);
+    if (r.shadow_on) {
+      const sx = Number(r.shadow_offset_x ?? 1);
+      const sy = Number(r.shadow_offset_y ?? 2);
+      const blur = Math.max(0, Number(r.shadow_blur ?? 2));
+      stroke.push(`${sx}px ${sy}px ${blur}px ${r.shadow || "rgba(0,0,0,0.45)"}`);
+    }
+    if (r.glow_on) {
+      const radius = Math.max(1, Number(r.glow_radius ?? 4));
+      stroke.push(`0 0 ${radius}px ${r.glow || "rgba(255,255,255,0.6)"}`);
+    }
     return stroke.length ? stroke.join(", ") : "none";
   };
 
@@ -2231,6 +2419,22 @@ const CanvasArea = ({
           Boxes
         </button>
         <button
+          className={`btn-ghost ${showAlignmentGuides ? "active" : ""}`}
+          style={{ padding: "4px 7px", fontSize: 10 }}
+          onClick={() => setShowAlignmentGuides(!showAlignmentGuides)}
+          title="Show page, container, selected box, and nearby region alignment guides"
+        >
+          Guides
+        </button>
+        <button
+          className={`btn-ghost ${snapAlignment ? "active" : ""}`}
+          style={{ padding: "4px 7px", fontSize: 10 }}
+          onClick={() => setSnapAlignment(!snapAlignment)}
+          title="Snap selected box center to nearby guides while dragging. Hold Alt to snap temporarily."
+        >
+          Snap
+        </button>
+        <button
           className={`btn-ghost ${showPageMarkers ? "active" : ""}`}
           style={{ padding: "4px 7px", fontSize: 10 }}
           onClick={() => setShowPageMarkers(!showPageMarkers)}
@@ -2346,6 +2550,14 @@ const CanvasArea = ({
               </>
             )}
 
+            {alignmentGuides.map(guide => (
+              <div
+                key={guide.id}
+                className={`alignment-guide ${guide.axis} ${guide.kind}`}
+                style={guide.axis === "v" ? { left: guide.value * scale } : { top: guide.value * scale }}
+              />
+            ))}
+
             {/* Region overlays (positioned in original image coordinates, displayed at current zoom) */}
             {imageSrc && showOverlayBoxes && regions.map(r => {
               if (!r.visible && selectedRegion?.id !== r.id) return null;
@@ -2362,7 +2574,8 @@ const CanvasArea = ({
                 ? dragRef.current?.visual
                 : hasLocalPreview && snapshot?.styleKey === regionVisualStyleKey(r) ? snapshot : null;
               const backendSprite = backendPreviewSprites[spriteSlot(r.id)];
-              const wantsPreviewText = displayImageMode !== "typeset" && (displayImageMode !== "best" || isDragging || hasLocalPreview || isRenderDirty || !isTypesetDone);
+              const isLiveEdit = isSelected || isDragging || hasLocalPreview;
+              const wantsPreviewText = displayImageMode !== "typeset" && isLiveEdit;
               const liveBackendSprite = wantsPreviewText && previewSpriteMatches(backendSprite, r)
                 ? backendSprite
                 : null;
@@ -2425,6 +2638,8 @@ const CanvasArea = ({
                         fontSize: frozenVisual?.fontSize ?? overlayFontSize(r),
                         textAlign: frozenVisual?.textAlign ?? r.align,
                         textShadow: frozenVisual?.textShadow ?? previewTextShadow(r),
+                        transform: `rotate(${Number(r.rotation_angle ?? 0)}deg)`,
+                        transformOrigin: "center center",
                       }}
                     >
                       {r.tl}
@@ -2451,7 +2666,7 @@ const CanvasArea = ({
 /*  INSPECTOR TAB                                                              */
 /* ─────────────────────────────────────────────────────────────────────────── */
 const InspectorTab = ({
-  region, pageIndex, fontOptions, onUpdateRegion, onPreviewRegion, onCommitBBox, onAddRegion, onDeleteRegion, onOcrRegion, onTranslateRegion,
+  region, regions, pageIndex, pageSize, fontOptions, onUpdateRegion, onPreviewRegion, onCommitBBox, onAddRegion, onDeleteRegion, onOcrRegion, onTranslateRegion,
   onSetYoloTrainClass,
   cleanupPreview, cleanupDebug, debugOverlays, onDebugOverlayChange,
   cleanupCandidates, selectedCandidateId, onSelectCleanupCandidate,
@@ -2460,7 +2675,9 @@ const InspectorTab = ({
   onCompareCleanupCandidates, onApplyCleanupCandidate, onUseCleanupCandidatePreview, cleanupCompareLoading,
 }: {
   region:         Region | null;
+  regions:        Region[];
   pageIndex:      number;
+  pageSize:       { w: number; h: number } | null;
   fontOptions:    FontOptions;
   onUpdateRegion: (idx: number, field: string, value: unknown) => void;
   onPreviewRegion: (regionId: string, patch: RegionDraft, options?: { requestSprite?: boolean; reason?: string }) => void;
@@ -2566,6 +2783,32 @@ const InspectorTab = ({
   const commitBboxDraft = () => {
     if (!region) return;
     onCommitBBox(region, bboxDraft);
+  };
+  const applyTransformBox = (next: RegionBBox, reason: string) => {
+    if (!region) return;
+    const clean = pageSize ? clampBboxToSize(next, pageSize) : {
+      x: Math.round(next.x),
+      y: Math.round(next.y),
+      w: Math.max(8, Math.round(next.w)),
+      h: Math.max(8, Math.round(next.h)),
+    };
+    setBboxDraft(clean);
+    onPreviewRegion(region.id, clean, { requestSprite: true, reason });
+    void onCommitBBox(region, clean);
+  };
+  const centerRegion = (scope: "bubble" | "page", axis: "x" | "y" | "both") => {
+    if (!region) return;
+    const target = scope === "bubble"
+      ? containerBoxForRegion(region)
+      : pageSize
+        ? { x: 0, y: 0, w: pageSize.w, h: pageSize.h }
+        : null;
+    if (!target) return;
+    const targetCenter = boxCenter(target);
+    const next = { ...bboxDraft };
+    if (axis === "x" || axis === "both") next.x = targetCenter.x - next.w / 2;
+    if (axis === "y" || axis === "both") next.y = targetCenter.y - next.h / 2;
+    applyTransformBox(next, `${scope}_center`);
   };
   const cleanupOverride = region?.cleanup_override ?? {};
   const cleanupValue = (key: string, fallback = "") => {
@@ -2786,6 +3029,17 @@ const InspectorTab = ({
     ];
     void navigator.clipboard?.writeText(lines.join("\n"));
   };
+  const rawMatch = region?.raw_style_match ?? {};
+  const rawStatus = String(rawMatch.status ?? "fallback");
+  const rawIgnored = Array.isArray(rawMatch.ignored) ? rawMatch.ignored : [];
+  const rawDowngrades = Array.isArray(rawMatch.downgrade_reasons) ? rawMatch.downgrade_reasons : [];
+  const rawMatched = Array.isArray(rawMatch.matched) ? rawMatch.matched : [];
+  const rawConfidence = rawMatch.confidence && typeof rawMatch.confidence === "object" ? rawMatch.confidence as Record<string, string> : {};
+  const previewAndCommit = (patch: RegionDraft, field: string, value: unknown) => {
+    if (!region) return;
+    onPreviewRegion(region.id, patch, { requestSprite: true, reason: "style_change" });
+    scheduleFieldCommit(field, value);
+  };
 
   useEffect(() => {
     if (region) void onRefreshCleanupDebug(region);
@@ -2802,8 +3056,10 @@ const InspectorTab = ({
 
   return (
     <div className="insp-body">
-      <div className="insp-section">
-        <div className="insp-section-title">Source (Korean)</div>
+      <details className="editor-section" open>
+        <summary>Text</summary>
+        <div className="editor-section-body">
+        <div className="insp-section-title">Source OCR</div>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 }}>
           <span className={`det-badge ${region.detector_source}`}>{region.detector_source || "ocr"}</span>
           <button className="btn-ghost" onClick={() => onOcrRegion(region.idx)}>OCR Selected</button>
@@ -2819,10 +3075,7 @@ const InspectorTab = ({
           }}
           onBlur={() => onUpdateRegion(region.idx, "text", srcDraft)}
         />
-      </div>
-
-      <div className="insp-section">
-        <div className="insp-section-title">Translation</div>
+        <div className="insp-section-title" style={{ marginTop: 10 }}>Translation</div>
         <textarea
           className="text-area"
           value={tlDraft}
@@ -2837,10 +3090,40 @@ const InspectorTab = ({
         <button className="btn-ghost" style={{ marginTop: 8 }} onClick={() => onTranslateRegion(region.idx)}>
           Translate Selected
         </button>
-      </div>
+        </div>
+      </details>
 
-      <div className="insp-section">
-        <div className="insp-section-title">Geometry</div>
+      <details className="editor-section" open>
+        <summary>RAW Match</summary>
+        <div className="editor-section-body">
+          <div className="raw-match-card">
+            <div className={`det-badge ${rawStatus === "high" ? "" : "manual"}`}>{rawStatus}</div>
+            <div className="raw-match-summary">{String(rawMatch.summary ?? "No RAW style match yet; readable defaults are active.")}</div>
+            <div className="raw-match-meta">
+              matched: {rawMatched.length ? rawMatched.join(", ") : "none"}<br />
+              confidence: {Object.keys(rawConfidence).length ? Object.entries(rawConfidence).map(([k, v]) => `${k} ${v}`).join(" · ") : "not measured"}<br />
+              downgrades: {rawDowngrades.length ? rawDowngrades.join(" · ") : "none"}<br />
+              ignored: {rawIgnored.length ? rawIgnored.join(" · ") : "none"}<br />
+              auto: {rawMatch.auto_applied ? "applied" : "not applied"}<br />
+              source: {region.style_source ?? "auto"}
+            </div>
+            <div className="style-row">
+              <button className="btn-ghost" onClick={() => onUpdateRegion(region.idx, "rematch_raw_style", true)}>Re-match RAW Style</button>
+              <button className="btn-ghost" onClick={() => onUpdateRegion(region.idx, "apply_raw_match", true)}>Apply RAW Match</button>
+              <button className="btn-ghost" onClick={() => onUpdateRegion(region.idx, "reset_style", true)}>Reset to Auto</button>
+            </div>
+            <div className="style-row">
+              <button className="btn-ghost" onClick={() => window.dispatchEvent(new CustomEvent("ml:set-image-mode", { detail: "raw" }))}>RAW</button>
+              <button className="btn-ghost" onClick={() => window.dispatchEvent(new CustomEvent("ml:set-image-mode", { detail: "cleaned" }))}>Cleaned</button>
+              <button className="btn-ghost" onClick={() => window.dispatchEvent(new CustomEvent("ml:set-image-mode", { detail: "typeset" }))}>Typeset</button>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <details className="editor-section">
+        <summary>Transform</summary>
+        <div className="editor-section-body">
         <div className="prop-grid">
           <div className="prop-cell">
             <span className="prop-label">X</span>
@@ -2858,11 +3141,41 @@ const InspectorTab = ({
             <span className="prop-label">H</span>
             <input className="prop-val" type="number" disabled={region.locked} min={8} value={bboxDraft.h} onChange={e => updateBboxDraft("h", e.target.value)} onBlur={commitBboxDraft} onKeyDown={handleBboxKey} />
           </div>
+          <div className="prop-cell">
+            <span className="prop-label">Rotation</span>
+            <input className="prop-val" type="number" disabled={region.locked} min={0} max={359} value={Math.round(Number(region.rotation_angle ?? 0))} onChange={e => previewAndCommit({ rotation_angle: Number(e.target.value) }, "rotation_angle", Number(e.target.value))} />
+          </div>
         </div>
         <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
           <button className="btn-ghost" disabled={region.locked} onClick={commitBboxDraft}>
             Apply Box
           </button>
+          <button className="btn-ghost" disabled={region.locked} onClick={() => {
+            const next = (Number(region.rotation_angle ?? 0) - 5 + 360) % 360;
+            previewAndCommit({ rotation_angle: next }, "rotation_angle", next);
+          }}>-5°</button>
+          <button className="btn-ghost" disabled={region.locked} onClick={() => {
+            const next = (Number(region.rotation_angle ?? 0) + 5) % 360;
+            previewAndCommit({ rotation_angle: next }, "rotation_angle", next);
+          }}>+5°</button>
+          <button className="btn-ghost" disabled={region.locked} onClick={() => previewAndCommit({ rotation_angle: 0 }, "rotation_angle", 0)}>Reset Rotation</button>
+          <button className="btn-ghost" disabled={region.locked} onClick={() => onUpdateRegion(region.idx, "reset_transform", true)}>Reset Transform</button>
+        </div>
+        <div className="style-row" style={{ marginTop: 8 }}>
+          <button className="btn-ghost" disabled={region.locked} onClick={() => centerRegion("bubble", "x")}>Bubble H</button>
+          <button className="btn-ghost" disabled={region.locked} onClick={() => centerRegion("bubble", "y")}>Bubble V</button>
+          <button className="btn-ghost" disabled={region.locked} onClick={() => centerRegion("bubble", "both")}>Bubble Center</button>
+        </div>
+        <div className="style-row" style={{ marginTop: 6 }}>
+          <button className="btn-ghost" disabled={region.locked || !pageSize} onClick={() => centerRegion("page", "x")}>Page H</button>
+          <button className="btn-ghost" disabled={region.locked || !pageSize} onClick={() => centerRegion("page", "y")}>Page V</button>
+          <button className="btn-ghost" disabled={region.locked || !pageSize} onClick={() => centerRegion("page", "both")}>Page Center</button>
+        </div>
+        <div className="style-row" style={{ marginTop: 6 }}>
+          <button className="btn-ghost" onClick={() => window.dispatchEvent(new CustomEvent("ml:toggle-alignment-guides"))}>Guides</button>
+          <button className="btn-ghost" onClick={() => window.dispatchEvent(new CustomEvent("ml:toggle-alignment-snap"))}>Snap</button>
+        </div>
+        <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
           <button className="btn-ghost" onClick={onAddRegion}>Add Region</button>
           <button className="btn-ghost" disabled={region.locked} onClick={() => onDeleteRegion(region.idx)}>Delete</button>
         </div>
@@ -2903,10 +3216,12 @@ const InspectorTab = ({
             </button>
           ))}
         </div>
-      </div>
+        </div>
+      </details>
 
-      <div className="insp-section">
-        <div className="insp-section-title">Properties</div>
+      <details className="editor-section" open>
+        <summary>Typography</summary>
+        <div className="editor-section-body">
         <div className="prop-grid">
           <div className="prop-cell">
             <span className="prop-label">Conf</span>
@@ -2962,19 +3277,112 @@ const InspectorTab = ({
             </label>
           </div>
         </div>
-      </div>
+        </div>
+      </details>
 
-      <div className="insp-section">
-        <div className="insp-section-title">Colors</div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-            <input type="color" disabled={region.locked} value={region.fg} onChange={e => { onPreviewRegion(region.id, { fg: e.target.value }); scheduleFieldCommit("fg_color", e.target.value); }} onBlur={e => flushFieldCommit("fg_color", e.target.value)} style={{ width: 28, height: 24, background: "transparent", border: "none" }} />
-            <span style={{ fontFamily: "var(--fnt-mono)", fontSize: 9, color: "var(--t3)" }}>FG</span>
+      <details className="editor-section" open>
+        <summary>Fill</summary>
+        <div className="editor-section-body">
+          <div className="style-row">
+            <input type="color" disabled={region.locked} value={region.fg} onChange={e => previewAndCommit({ fg: e.target.value }, "fg_color", e.target.value)} onBlur={e => flushFieldCommit("fg_color", e.target.value)} />
+            <span className="prop-label">Solid</span>
+            <label className="prop-val" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="checkbox" checked={Boolean(region.gradient_on)} onChange={e => previewAndCommit({ gradient_on: e.target.checked }, "gradient_on", e.target.checked)} />
+              Gradient
+            </label>
+          </div>
+          {region.gradient_on && (
+            <div className="prop-grid" style={{ marginTop: 8 }}>
+              <div className="prop-cell"><span className="prop-label">Start</span><input className="prop-val" type="color" value={region.gradient_start ?? region.fg} onChange={e => previewAndCommit({ gradient_start: e.target.value }, "gradient_start", e.target.value)} /></div>
+              <div className="prop-cell"><span className="prop-label">End</span><input className="prop-val" type="color" value={region.gradient_end ?? region.fg} onChange={e => previewAndCommit({ gradient_end: e.target.value }, "gradient_end", e.target.value)} /></div>
+              <div className="prop-cell"><span className="prop-label">Angle</span><input className="prop-val" type="number" min={0} max={359} value={region.gradient_angle ?? 90} onChange={e => previewAndCommit({ gradient_angle: Number(e.target.value) }, "gradient_angle", Number(e.target.value))} /></div>
+            </div>
+          )}
+        </div>
+      </details>
+
+      <details className="editor-section">
+        <summary>Stroke</summary>
+        <div className="editor-section-body">
+          <div className="prop-grid">
+            <div className="prop-cell"><span className="prop-label">Color</span><input className="prop-val" type="color" value={region.outline ?? "#ffffff"} onChange={e => previewAndCommit({ outline: e.target.value }, "outline_color", e.target.value)} /></div>
+            <div className="prop-cell"><span className="prop-label">Width</span><input className="prop-val" type="number" min={0} max={8} value={region.outline_width ?? 1} onChange={e => previewAndCommit({ outline_width: Number(e.target.value) }, "outline_width", Number(e.target.value))} /></div>
           </div>
         </div>
-      </div>
+      </details>
 
-      <div className="insp-section">
+      <details className="editor-section">
+        <summary>Effects</summary>
+        <div className="editor-section-body">
+          <div className="prop-grid">
+            <label className="prop-val" style={{ display: "flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={Boolean(region.shadow_on)} onChange={e => previewAndCommit({ shadow_on: e.target.checked }, "shadow_on", e.target.checked)} />Shadow</label>
+            <label className="prop-val" style={{ display: "flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={Boolean(region.glow_on)} onChange={e => previewAndCommit({ glow_on: e.target.checked }, "glow_on", e.target.checked)} />Glow</label>
+            <label className="prop-val" style={{ display: "flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={Boolean(region.reflection_on)} onChange={e => previewAndCommit({ reflection_on: e.target.checked }, "reflection_on", e.target.checked)} />Reflection</label>
+            <div className="prop-cell"><span className="prop-label">Shadow color</span><input className="prop-val" type="color" value={region.shadow ?? "#000000"} onChange={e => previewAndCommit({ shadow: e.target.value }, "shadow_color", e.target.value)} /></div>
+            <div className="prop-cell"><span className="prop-label">Glow color</span><input className="prop-val" type="color" value={region.glow ?? "#ffffff"} onChange={e => previewAndCommit({ glow: e.target.value }, "glow_color", e.target.value)} /></div>
+            <div className="prop-cell"><span className="prop-label">Shadow X</span><input className="prop-val" type="number" min={-24} max={24} value={region.shadow_offset_x ?? 1} onChange={e => previewAndCommit({ shadow_offset_x: Number(e.target.value) }, "shadow_offset_x", Number(e.target.value))} /></div>
+            <div className="prop-cell"><span className="prop-label">Shadow Y</span><input className="prop-val" type="number" min={-24} max={24} value={region.shadow_offset_y ?? 2} onChange={e => previewAndCommit({ shadow_offset_y: Number(e.target.value) }, "shadow_offset_y", Number(e.target.value))} /></div>
+            <div className="prop-cell"><span className="prop-label">Shadow opacity</span><input className="prop-val" type="number" min={0} max={1} step={0.05} value={region.shadow_opacity ?? 0.55} onChange={e => previewAndCommit({ shadow_opacity: Number(e.target.value) }, "shadow_opacity", Number(e.target.value))} /></div>
+            <div className="prop-cell"><span className="prop-label">Shadow blur</span><input className="prop-val" type="number" min={0} max={32} step={0.5} value={region.shadow_blur ?? 0} onChange={e => previewAndCommit({ shadow_blur: Number(e.target.value) }, "shadow_blur", Number(e.target.value))} /></div>
+            <div className="prop-cell"><span className="prop-label">Glow radius</span><input className="prop-val" type="number" min={0} max={32} value={region.glow_radius ?? 4} onChange={e => previewAndCommit({ glow_radius: Number(e.target.value) }, "glow_radius", Number(e.target.value))} /></div>
+            <div className="prop-cell"><span className="prop-label">Glow intensity</span><input className="prop-val" type="number" min={0} max={1} step={0.05} value={region.glow_intensity ?? 0.45} onChange={e => previewAndCommit({ glow_intensity: Number(e.target.value) }, "glow_intensity", Number(e.target.value))} /></div>
+            {region.reflection_on && (
+              <>
+                <div className="prop-cell"><span className="prop-label">Reflect opacity</span><input className="prop-val" type="number" min={0} max={1} step={0.05} value={region.reflection_opacity ?? 0.32} onChange={e => previewAndCommit({ reflection_opacity: Number(e.target.value) }, "reflection_opacity", Number(e.target.value))} /></div>
+                <div className="prop-cell"><span className="prop-label">Reflect offset</span><input className="prop-val" type="number" min={-64} max={128} value={region.reflection_offset ?? 4} onChange={e => previewAndCommit({ reflection_offset: Number(e.target.value) }, "reflection_offset", Number(e.target.value))} /></div>
+                <div className="prop-cell"><span className="prop-label">Reflect blur</span><input className="prop-val" type="number" min={0} max={32} step={0.5} value={region.reflection_blur ?? 1.5} onChange={e => previewAndCommit({ reflection_blur: Number(e.target.value) }, "reflection_blur", Number(e.target.value))} /></div>
+                <div className="prop-cell"><span className="prop-label">Reflect fade</span><input className="prop-val" type="number" min={0} max={1} step={0.05} value={region.reflection_fade ?? 0.78} onChange={e => previewAndCommit({ reflection_fade: Number(e.target.value) }, "reflection_fade", Number(e.target.value))} /></div>
+              </>
+            )}
+          </div>
+        </div>
+      </details>
+
+      <details className="editor-section">
+        <summary>Presets</summary>
+        <div className="editor-section-body">
+          <div className="style-row">
+            {[
+              ["dialog_light", "Dialogue"],
+              ["thought_soft", "Thought"],
+              ["narration", "Narration"],
+              ["shout", "Shout"],
+              ["sfx_impact", "SFX"],
+              ["sfx_color", "SFX Glow"],
+              ["reset_auto", "Reset Auto"],
+            ].map(([key, label]) => <button key={key} className="btn-ghost" onClick={() => onUpdateRegion(region.idx, "style_preset", key)}>{label}</button>)}
+          </div>
+        </div>
+      </details>
+
+      <details className="editor-section">
+        <summary>Style Tools</summary>
+        <div className="editor-section-body">
+          <div className="style-row">
+            <button className="btn-ghost" onClick={() => localStorage.setItem("ml.styleClipboard", JSON.stringify({ fg: region.fg, outline: region.outline, outline_width: region.outline_width, shadow: region.shadow, shadow_on: region.shadow_on, shadow_offset_x: region.shadow_offset_x, shadow_offset_y: region.shadow_offset_y, shadow_opacity: region.shadow_opacity, shadow_blur: region.shadow_blur, gradient_on: region.gradient_on, gradient_start: region.gradient_start, gradient_end: region.gradient_end, gradient_angle: region.gradient_angle, glow: region.glow, glow_on: region.glow_on, glow_radius: region.glow_radius, glow_intensity: region.glow_intensity, reflection_on: region.reflection_on, reflection_opacity: region.reflection_opacity, reflection_offset: region.reflection_offset, reflection_blur: region.reflection_blur, reflection_fade: region.reflection_fade }))}>Copy Style</button>
+            <button className="btn-ghost" onClick={() => {
+              try {
+                const style = JSON.parse(localStorage.getItem("ml.styleClipboard") || "{}");
+                Object.entries(style).forEach(([key, val]) => {
+                  const fieldMap: Record<string, string> = { fg: "fg_color", outline: "outline_color", shadow: "shadow_color", glow: "glow_color" };
+                  onUpdateRegion(region.idx, fieldMap[key] ?? key, val);
+                });
+              } catch { /* noop */ }
+            }}>Paste Style</button>
+            <button className="btn-ghost" onClick={() => {
+              const style = { fg: region.fg, outline: region.outline, outline_width: region.outline_width, shadow: region.shadow, shadow_on: region.shadow_on, shadow_offset_x: region.shadow_offset_x, shadow_offset_y: region.shadow_offset_y, shadow_opacity: region.shadow_opacity, shadow_blur: region.shadow_blur, gradient_on: region.gradient_on, gradient_start: region.gradient_start, gradient_end: region.gradient_end, gradient_angle: region.gradient_angle, glow: region.glow, glow_on: region.glow_on, glow_radius: region.glow_radius, glow_intensity: region.glow_intensity, reflection_on: region.reflection_on, reflection_opacity: region.reflection_opacity, reflection_offset: region.reflection_offset, reflection_blur: region.reflection_blur, reflection_fade: region.reflection_fade };
+              const fieldMap: Record<string, string> = { fg: "fg_color", outline: "outline_color", shadow: "shadow_color", glow: "glow_color" };
+              regions.filter(r => r.id !== region.id && r.role === region.role).forEach(r => {
+                Object.entries(style).forEach(([key, val]) => onUpdateRegion(r.idx, fieldMap[key] ?? key, val));
+              });
+            }}>Apply to Same Role</button>
+          </div>
+        </div>
+      </details>
+
+      <details className="editor-section">
+        <summary>Cleanup / Debug</summary>
+        <div className="editor-section-body">
         <div className="insp-section-title">Cleanup Override</div>
         <div className="prop-grid">
           <div className="prop-cell">
@@ -3265,10 +3673,12 @@ const InspectorTab = ({
         <button className="btn-ghost" style={{ marginTop: 8 }} onClick={() => onUpdateRegion(region.idx, "reset_cleanup_override", true)}>
           Reset cleanup override
         </button>
-      </div>
+        </div>
+      </details>
 
-      <div className="insp-section">
-        <div className="insp-section-title">Cleanup analysis</div>
+      <details className="editor-section">
+        <summary>Cleanup Analysis</summary>
+        <div className="editor-section-body">
         <div className="prop-grid">
           {[
             ["Page index", qaValue(qa?.page_index ?? pageIndex), "page_index"],
@@ -3331,7 +3741,8 @@ const InspectorTab = ({
             easy white bubble · off-white bubble · colored bubble · dark caption · gradient bubble · halftone/screentone bubble · translucent caption · text over art · SFX · large bold Korean text
           </div>
         </details>
-      </div>
+        </div>
+      </details>
 
       {/* Pass 6: per-stage diagnostic breakdown. Shows whichever stages have
           produced data; hidden rows are omitted to keep the panel compact. */}
@@ -3342,8 +3753,9 @@ const InspectorTab = ({
         (region as any).typeset_status ||
         (region as any).translation_status
       ) && (
-        <div className="insp-section">
-          <div className="insp-section-title">Diagnostics</div>
+        <details className="editor-section">
+          <summary>Diagnostics</summary>
+          <div className="editor-section-body">
           <div className="prop-grid">
             {typeof region.detector_confidence === "number" && region.detector_confidence > 0 && (
               <div className="prop-cell">
@@ -3411,7 +3823,8 @@ const InspectorTab = ({
               </div>
             )}
           </div>
-        </div>
+          </div>
+        </details>
       )}
     </div>
   );
@@ -3672,7 +4085,7 @@ const MemoryTab = ({
 /*  RIGHT PANEL                                                                */
 /* ─────────────────────────────────────────────────────────────────────────── */
 const RightPanel = ({
-  data, region, issues, pageIndex, onSelectRegion, onUpdateRegion, onPreviewRegion, onCommitBBox, onAddRegion,
+  data, region, issues, pageIndex, pageSize, onSelectRegion, onUpdateRegion, onPreviewRegion, onCommitBBox, onAddRegion,
   onDeleteRegion, onSetYoloTrainClass, onOcrRegion, onTranslateRegion, onMemoryMutation, fontOptions,
   cleanupPreview, cleanupDebug, debugOverlays, onDebugOverlayChange,
   cleanupCandidates, selectedCandidateId, onSelectCleanupCandidate,
@@ -3684,6 +4097,7 @@ const RightPanel = ({
   region:         Region | null;
   issues:         Issue[];
   pageIndex:      number;
+  pageSize:       { w: number; h: number } | null;
   fontOptions:    FontOptions;
   onSelectRegion: (region: Region) => void;
   onUpdateRegion: (idx: number, field: string, value: unknown) => void;
@@ -3715,13 +4129,14 @@ const RightPanel = ({
   onUseCleanupCandidatePreview: (region: Region, candidate: CleanupCandidate) => void;
   cleanupCompareLoading: boolean;
 }) => {
-  const [tab, setTab] = useState<"inspector" | "layers" | "memory" | "review">("inspector");
+  const [tab, setTab] = useState<"editor" | "layers" | "issues" | "memory">("editor");
+  useEffect(() => { if (region) setTab("editor"); }, [region?.id]);
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
       <div className="tab-bar">
-        {(["inspector", "layers", "memory", "review"] as const).map(t => (
+        {(["editor", "layers", "issues", "memory"] as const).map(t => (
           <div key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
-            {t === "review"
+            {t === "issues"
               ? `Issues${issues.length > 0 ? ` (${issues.length})` : ""}`
               : t === "memory"
                 ? `Memory${data.memory.names.length + data.memory.glossary.length > 0 ? ` (${data.memory.names.length + data.memory.glossary.length})` : ""}`
@@ -3730,10 +4145,12 @@ const RightPanel = ({
         ))}
       </div>
       <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-        {tab === "inspector" && (
+        {tab === "editor" && (
           <InspectorTab
             region={region}
+            regions={data.regions}
             pageIndex={pageIndex}
+            pageSize={pageSize}
             fontOptions={fontOptions}
             onUpdateRegion={onUpdateRegion}
             onPreviewRegion={onPreviewRegion}
@@ -3774,8 +4191,8 @@ const RightPanel = ({
             onUpdateRegion={onUpdateRegion}
           />
         )}
+        {tab === "issues"    && <ReviewTab issues={issues} />}
         {tab === "memory"    && <MemoryTab data={data} region={region} onMemoryMutation={onMemoryMutation} />}
-        {tab === "review"    && <ReviewTab issues={issues} />}
       </div>
     </div>
   );
@@ -3891,6 +4308,7 @@ export default function App() {
   const [zoom,            setZoom]            = useState<number>(85);
   const [canvasImageMode, setCanvasImageMode] = useState<ImageMode>("best");
   const [pageVersions,    setPageVersions]    = useState<Record<number, number>>({});
+  const [pageSizes,       setPageSizes]       = useState<Record<number, { w: number; h: number }>>({});
   const [pipelineProgress, setPipelineProgress] = useState<ProgressEvent | null>(null);
   const [yoloTraining, setYoloTraining] = useState<{ status?: string; running?: boolean; log?: string; onnx?: string; error?: string } | null>(null);
   const [readerMode,      setReaderMode]      = useState<"single" | "continuous">("single");
@@ -3909,9 +4327,9 @@ export default function App() {
   const [rightWidth,      setRightWidth]      = useState(() => {
     try {
       const raw = localStorage.getItem("ml.rightPanelWidth");
-      return clampNumber(Number(raw) || 268, 280, Math.min(620, Math.floor(window.innerWidth * 0.45)));
+      return clampNumber(Number(raw) || 380, 340, Math.min(680, Math.floor(window.innerWidth * 0.5)));
     } catch {
-      return 280;
+      return 380;
     }
   });
   const [resizingRight,   setResizingRight]   = useState(false);
@@ -3990,6 +4408,17 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem("ml.cleanupDebugOverlays", JSON.stringify(debugOverlays)); } catch { /* noop */ }
   }, [debugOverlays]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (detail === "raw" || detail === "cleaned" || detail === "typeset" || detail === "best") {
+        setCanvasImageMode(detail);
+      }
+    };
+    window.addEventListener("ml:set-image-mode", handler);
+    return () => window.removeEventListener("ml:set-image-mode", handler);
+  }, []);
 
   useEffect(() => {
     if (!resizingRight) return;
@@ -4390,15 +4819,10 @@ export default function App() {
   const handleUpdateRegion = useCallback(async (idx: number, field: string, value: unknown) => {
     renderDebug("backend.mutation", { action: "updateRegion", page: activePage, region: idx, field, value });
     const ownerPage = selectedRegion?.idx === idx ? regionOwnerPage(selectedRegion, activePage) : activePage;
-    let resp: any = { ok: false };
     suppressBackendPageSyncRef.current = true;
+    let resp: any = { ok: false };
     try {
-      if (ownerPage !== activePage) await api.goToPage(ownerPage);
-      resp = await api.updateRegion(idx, field, value);
-      if (ownerPage !== activePage) {
-        const back = await api.goToPage(activePage);
-        if (back.ok) resp = back;
-      }
+      resp = await api.updateRegion(idx, field, value, ownerPage);
     } finally {
       suppressBackendPageSyncRef.current = false;
     }
@@ -4421,6 +4845,15 @@ export default function App() {
     }
   }, [activePage, regionDrafts]);
 
+  const handlePageSizeChange = useCallback((pageIdx: number, size: { w: number; h: number }) => {
+    if (!size.w || !size.h) return;
+    setPageSizes(prev => {
+      const current = prev[pageIdx];
+      if (current?.w === size.w && current?.h === size.h) return prev;
+      return { ...prev, [pageIdx]: size };
+    });
+  }, []);
+
   const handleSelectRegion = useCallback((region: Region | null) => {
     renderDebug("select", {
       action: "select",
@@ -4435,7 +4868,9 @@ export default function App() {
   }, [activePage]);
 
   const handleCommitBBox = useCallback(async (region: Region, bbox: RegionBBox) => {
-    const baseRegion = editorRegionsForPage(data, activePage).find(r => r.id === region.id);
+    const ownerPage = regionOwnerPage(region, activePage);
+    const editPage = typeof region.display_page_idx === "number" ? region.display_page_idx : activePage;
+    const baseRegion = editorRegionsForPage(data, editPage).find(r => r.id === region.id);
     const pendingStyle: Array<[string, unknown]> = [];
     if (baseRegion) {
       if (region.font !== baseRegion.font) pendingStyle.push(["font_name", region.font]);
@@ -4446,10 +4881,28 @@ export default function App() {
       if (region.outline_width !== baseRegion.outline_width) pendingStyle.push(["outline_width", region.outline_width]);
       if (region.shadow !== baseRegion.shadow) pendingStyle.push(["shadow_color", region.shadow]);
       if (region.shadow_on !== baseRegion.shadow_on) pendingStyle.push(["shadow_on", region.shadow_on]);
+      if (region.shadow_offset_x !== baseRegion.shadow_offset_x) pendingStyle.push(["shadow_offset_x", region.shadow_offset_x]);
+      if (region.shadow_offset_y !== baseRegion.shadow_offset_y) pendingStyle.push(["shadow_offset_y", region.shadow_offset_y]);
+      if (region.shadow_opacity !== baseRegion.shadow_opacity) pendingStyle.push(["shadow_opacity", region.shadow_opacity]);
+      if (region.shadow_blur !== baseRegion.shadow_blur) pendingStyle.push(["shadow_blur", region.shadow_blur]);
+      if (region.glow !== baseRegion.glow) pendingStyle.push(["glow_color", region.glow]);
+      if (region.glow_on !== baseRegion.glow_on) pendingStyle.push(["glow_on", region.glow_on]);
+      if (region.glow_radius !== baseRegion.glow_radius) pendingStyle.push(["glow_radius", region.glow_radius]);
+      if (region.glow_intensity !== baseRegion.glow_intensity) pendingStyle.push(["glow_intensity", region.glow_intensity]);
+      if (region.reflection_on !== baseRegion.reflection_on) pendingStyle.push(["reflection_on", region.reflection_on]);
+      if (region.reflection_opacity !== baseRegion.reflection_opacity) pendingStyle.push(["reflection_opacity", region.reflection_opacity]);
+      if (region.reflection_offset !== baseRegion.reflection_offset) pendingStyle.push(["reflection_offset", region.reflection_offset]);
+      if (region.reflection_blur !== baseRegion.reflection_blur) pendingStyle.push(["reflection_blur", region.reflection_blur]);
+      if (region.reflection_fade !== baseRegion.reflection_fade) pendingStyle.push(["reflection_fade", region.reflection_fade]);
+      if (region.gradient_on !== baseRegion.gradient_on) pendingStyle.push(["gradient_on", region.gradient_on]);
+      if (region.gradient_start !== baseRegion.gradient_start) pendingStyle.push(["gradient_start", region.gradient_start]);
+      if (region.gradient_end !== baseRegion.gradient_end) pendingStyle.push(["gradient_end", region.gradient_end]);
+      if (region.gradient_angle !== baseRegion.gradient_angle) pendingStyle.push(["gradient_angle", region.gradient_angle]);
+      if (region.rotation_angle !== baseRegion.rotation_angle) pendingStyle.push(["rotation_angle", region.rotation_angle]);
     }
     for (const [field, value] of pendingStyle) {
-      renderDebug("api.updateRegion.beforeBBox", { page: activePage, region: region.idx, field, value });
-      await api.updateRegion(region.idx, field, value);
+      renderDebug("api.updateRegion.beforeBBox", { page: editPage, ownerPage, region: region.idx, field, value });
+      await api.updateRegion(region.idx, field, value, ownerPage);
     }
     const cleanBbox = {
       x: Number(bbox.x),
@@ -4463,22 +4916,17 @@ export default function App() {
     }
     renderDebug("backend.mutation", {
       action: "updateRegionBBox",
-      page: activePage,
+      page: editPage,
+      ownerPage,
       region: region.idx,
       bbox: cleanBbox,
       beforeStyle: regionStyleDebug(region),
     });
-    renderDebug("api.updateRegionBBox", { page: activePage, region: region.idx, bbox: cleanBbox });
-    const ownerPage = regionOwnerPage(region, activePage);
-    let resp: any = { ok: false };
+    renderDebug("api.updateRegionBBox", { page: editPage, ownerPage, region: region.idx, bbox: cleanBbox });
     suppressBackendPageSyncRef.current = true;
+    let resp: any = { ok: false };
     try {
-      if (ownerPage !== activePage) await api.goToPage(ownerPage);
-      resp = await api.updateRegionBBox(region.idx, cleanBbox.x, cleanBbox.y, cleanBbox.w, cleanBbox.h, activePage);
-      if (ownerPage !== activePage) {
-        const back = await api.goToPage(activePage);
-        if (back.ok) resp = back;
-      }
+      resp = await api.updateRegionBBox(region.idx, cleanBbox.x, cleanBbox.y, cleanBbox.w, cleanBbox.h, ownerPage, editPage);
     } finally {
       suppressBackendPageSyncRef.current = false;
     }
@@ -4496,22 +4944,47 @@ export default function App() {
     return false;
   }, [activePage, data.regions]);
 
+  useEffect(() => {
+    const isTypingTarget = (target: EventTarget | null) => {
+      const el = target as HTMLElement | null;
+      if (!el) return false;
+      const tag = el.tagName?.toLowerCase();
+      return tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable;
+    };
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(ev.key)) return;
+      if (isTypingTarget(ev.target) || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      if (!selectedRegion || selectedRegion.locked) return;
+      const displayPage = typeof selectedRegion.display_page_idx === "number" ? selectedRegion.display_page_idx : activePage;
+      const pageSize = pageSizes[displayPage];
+      if (!pageSize) return;
+      ev.preventDefault();
+      const step = ev.shiftKey ? 10 : 1;
+      const dx = ev.key === "ArrowLeft" ? -step : ev.key === "ArrowRight" ? step : 0;
+      const dy = ev.key === "ArrowUp" ? -step : ev.key === "ArrowDown" ? step : 0;
+      const draft = regionDrafts[selectedRegion.id] ?? {};
+      const current = { ...selectedRegion, ...draft } as Region;
+      const next = clampBboxToSize({ x: current.x + dx, y: current.y + dy, w: current.w, h: current.h }, pageSize);
+      handlePreviewRegion(selectedRegion.id, next, { requestSprite: false, reason: "keyboard_nudge" });
+      void handleCommitBBox(current, next);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activePage, handleCommitBBox, handlePreviewRegion, pageSizes, regionDrafts, selectedRegion]);
+
   const handleAddRegion = useCallback(async () => {
-    const resp = await api.addRegion(24, 24, 160, 80);
+    const resp = await api.addRegion(24, 24, 160, 80, "", activePage);
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
       showToast("Region added");
     }
-  }, []);
+  }, [activePage]);
 
-  const runForRegionOwner = useCallback(async <T,>(region: Region, fn: () => Promise<T>): Promise<T> => {
+  const runForRegionOwner = useCallback(async <T,>(region: Region, fn: (pageIdx: number) => Promise<T>): Promise<T> => {
     const ownerPage = regionOwnerPage(region, activePage);
     suppressBackendPageSyncRef.current = true;
     try {
-      if (ownerPage !== activePage) await api.goToPage(ownerPage);
-      const result = await fn();
-      if (ownerPage !== activePage) await api.goToPage(activePage);
-      return result;
+      return await fn(ownerPage);
     } finally {
       suppressBackendPageSyncRef.current = false;
     }
@@ -4520,8 +4993,8 @@ export default function App() {
   const handleDeleteRegion = useCallback(async (idx: number, yoloRejectReason = "") => {
     const region = selectedRegion?.idx === idx ? selectedRegion : null;
     const resp = region
-      ? await runForRegionOwner(region, () => api.deleteRegion(idx, yoloRejectReason))
-      : await api.deleteRegion(idx, yoloRejectReason);
+      ? await runForRegionOwner(region, pageIdx => api.deleteRegion(idx, yoloRejectReason, pageIdx))
+      : await api.deleteRegion(idx, yoloRejectReason, activePage);
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
       setActivePage(activePage);
@@ -4530,7 +5003,7 @@ export default function App() {
   }, [activePage, runForRegionOwner, selectedRegion]);
 
   const handleSetYoloTrainClass = useCallback(async (region: Region, classId: number) => {
-    const resp = await runForRegionOwner(region, () => api.setYoloTrainClass(region.idx, classId));
+    const resp = await runForRegionOwner(region, pageIdx => api.setYoloTrainClass(region.idx, classId, pageIdx));
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
       setActivePage(activePage);
@@ -4544,8 +5017,8 @@ export default function App() {
   const handleOcrRegion = useCallback(async (idx: number) => {
     const region = selectedRegion?.idx === idx ? selectedRegion : null;
     const resp = region
-      ? await runForRegionOwner(region, () => api.ocrRegion(idx))
-      : await api.ocrRegion(idx);
+      ? await runForRegionOwner(region, pageIdx => api.ocrRegion(idx, pageIdx))
+      : await api.ocrRegion(idx, activePage);
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
       setActivePage(activePage);
@@ -4556,8 +5029,8 @@ export default function App() {
   const handleTranslateRegion = useCallback(async (idx: number) => {
     const region = selectedRegion?.idx === idx ? selectedRegion : null;
     const resp = region
-      ? await runForRegionOwner(region, () => api.translateRegion(idx))
-      : await api.translateRegion(idx);
+      ? await runForRegionOwner(region, pageIdx => api.translateRegion(idx, pageIdx))
+      : await api.translateRegion(idx, activePage);
     if (resp.ok) {
       applyBootstrap(resp as unknown as Bootstrap);
       setActivePage(activePage);
@@ -4566,7 +5039,7 @@ export default function App() {
   }, [activePage, runForRegionOwner, selectedRegion]);
 
   const handlePreviewCleanup = useCallback(async (region: Region, manualMask?: CleanupMaskPayload) => {
-    const resp = await runForRegionOwner(region, () => api.previewRegionCleanup(region.idx, manualMask ?? null));
+    const resp = await runForRegionOwner(region, pageIdx => api.previewRegionCleanup(region.idx, manualMask ?? null, pageIdx));
     if (resp.ok) {
       setCleanupPreview({ ...resp, regionId: region.id });
       showToast("Cleanup preview ready");
@@ -4578,7 +5051,7 @@ export default function App() {
   }, [runForRegionOwner]);
 
   const handleSuggestSam2Mask = useCallback(async (region: Region, prompt: Record<string, unknown>) => {
-    const resp = await runForRegionOwner(region, () => api.proposeCleanupMaskSam2(region.idx, prompt));
+    const resp = await runForRegionOwner(region, pageIdx => api.proposeCleanupMaskSam2(region.idx, prompt, pageIdx));
     if (resp.ok) {
       showToast("SAM2 mask suggested");
       return resp as Sam2MaskResponse;
@@ -4588,7 +5061,7 @@ export default function App() {
   }, [runForRegionOwner]);
 
   const handleRefreshCleanupDebug = useCallback(async (region: Region, manualMask?: CleanupMaskPayload) => {
-    const resp = await runForRegionOwner(region, () => api.getRegionCleanupDebug(region.idx, manualMask ?? null));
+    const resp = await runForRegionOwner(region, pageIdx => api.getRegionCleanupDebug(region.idx, manualMask ?? null, pageIdx));
     if (resp.ok) {
       setCleanupDebug({ ...resp, regionId: region.id });
       return resp;
@@ -4598,7 +5071,7 @@ export default function App() {
   }, [runForRegionOwner]);
 
   const handleRecordMaskQaLabel = useCallback(async (region: Region, label: string) => {
-    const resp = await runForRegionOwner(region, () => api.recordMaskQaLabel(region.idx, label));
+    const resp = await runForRegionOwner(region, pageIdx => api.recordMaskQaLabel(region.idx, label, "", pageIdx));
     if (resp.ok) {
       showToast(`Mask QA label saved: ${resp.label ?? label}`);
     } else {
@@ -4620,7 +5093,7 @@ export default function App() {
   const handleCompareCleanupCandidates = useCallback(async (region: Region, manualMask?: CleanupMaskPayload) => {
     setCleanupCompareLoading(true);
     try {
-      const resp = await runForRegionOwner(region, () => api.compareRegionCleanupCandidates(region.idx, manualMask ?? null));
+      const resp = await runForRegionOwner(region, pageIdx => api.compareRegionCleanupCandidates(region.idx, manualMask ?? null, pageIdx));
       if (resp.ok) {
         setCleanupCandidates({ ...resp, regionId: region.id });
         const first = (resp.candidates ?? []).find(c => c.candidate_id === resp.recommended_candidate_id && c.is_available)
@@ -4663,8 +5136,8 @@ export default function App() {
   const handleApplyCleanupCandidate = useCallback(async (idx: number, candidateId: string, manualMask?: CleanupMaskPayload) => {
     const region = selectedRegion?.idx === idx ? selectedRegion : null;
     const resp = region
-      ? await runForRegionOwner(region, () => api.applyRegionCleanupCandidate(idx, candidateId, manualMask ?? null))
-      : await api.applyRegionCleanupCandidate(idx, candidateId, manualMask ?? null);
+      ? await runForRegionOwner(region, pageIdx => api.applyRegionCleanupCandidate(idx, candidateId, manualMask ?? null, pageIdx))
+      : await api.applyRegionCleanupCandidate(idx, candidateId, manualMask ?? null, activePage);
     if (resp.ok) {
       setCleanupPreview(null);
       setCleanupDebug(null);
@@ -4682,8 +5155,8 @@ export default function App() {
   const handleApplyCleanup = useCallback(async (idx: number, manualMask?: CleanupMaskPayload) => {
     const region = selectedRegion?.idx === idx ? selectedRegion : null;
     const resp = region
-      ? await runForRegionOwner(region, () => api.applyRegionCleanup(idx, manualMask ?? null))
-      : await api.applyRegionCleanup(idx, manualMask ?? null);
+      ? await runForRegionOwner(region, pageIdx => api.applyRegionCleanup(idx, manualMask ?? null, pageIdx))
+      : await api.applyRegionCleanup(idx, manualMask ?? null, activePage);
     if (resp.ok) {
       setCleanupPreview(null);
       setCleanupDebug(null);
@@ -4699,8 +5172,8 @@ export default function App() {
   const handleRerunCleanup = useCallback(async (idx: number, manualMask?: CleanupMaskPayload) => {
     const region = selectedRegion?.idx === idx ? selectedRegion : null;
     const resp = region
-      ? await runForRegionOwner(region, () => api.rerunRegionCleanup(idx, manualMask ?? null))
-      : await api.rerunRegionCleanup(idx, manualMask ?? null);
+      ? await runForRegionOwner(region, pageIdx => api.rerunRegionCleanup(idx, manualMask ?? null, pageIdx))
+      : await api.rerunRegionCleanup(idx, manualMask ?? null, activePage);
     if (resp.ok) {
       setCleanupPreview(null);
       setCleanupDebug(null);
@@ -4716,8 +5189,8 @@ export default function App() {
   const handleDeleteCleanup = useCallback(async (idx: number) => {
     const region = selectedRegion?.idx === idx ? selectedRegion : null;
     const resp = region
-      ? await runForRegionOwner(region, () => api.deleteRegionCleanup(idx))
-      : await api.deleteRegionCleanup(idx);
+      ? await runForRegionOwner(region, pageIdx => api.deleteRegionCleanup(idx, pageIdx))
+      : await api.deleteRegionCleanup(idx, activePage);
     if (resp.ok) {
       setCleanupPreview(null);
       setCleanupDebug(null);
@@ -4861,6 +5334,7 @@ export default function App() {
           pageVersions={pageVersions}
           cleanupDebug={cleanupDebug?.regionId === selectedRegion?.id ? cleanupDebug : null}
           debugOverlays={debugOverlays}
+          onPageSizeChange={handlePageSizeChange}
         />
 
         <div
@@ -4872,6 +5346,7 @@ export default function App() {
             region={selectedRegion}
             issues={data.issues}
             pageIndex={activePage}
+            pageSize={pageSizes[activePage] ?? null}
             fontOptions={fontOptions}
             onSelectRegion={handleSelectRegion}
             onUpdateRegion={handleUpdateRegion}

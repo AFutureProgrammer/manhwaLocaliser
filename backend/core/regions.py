@@ -95,6 +95,20 @@ class TextStyle:
     shadow_color:   Tuple[int, int, int] = (0, 0, 0)
     shadow_offset:  Tuple[int, int]      = (1, 2)
     shadow_opacity: float                = 0.55       # 0.0–1.0
+    shadow_blur:    float                = 0.0
+
+    # ── Glow / halo ──────────────────────────────────────────────────────────
+    glow_on:        bool                 = False
+    glow_color:     Tuple[int, int, int] = (255, 255, 255)
+    glow_radius:    int                  = 4
+    glow_intensity: float                = 0.45       # 0.0–1.0
+
+    # ── Reflection layer effect ──────────────────────────────────────────────
+    reflection_on:      bool             = False
+    reflection_opacity: float            = 0.32       # 0.0–1.0
+    reflection_offset:  int              = 4
+    reflection_blur:    float            = 1.5
+    reflection_fade:    float            = 0.78       # 0.0–1.0
 
     # ── Background plate (behind text, boosts legibility on complex art) ──────
     plate_on:       bool                 = False
@@ -118,6 +132,16 @@ class TextStyle:
             "shadow_color":   list(self.shadow_color),
             "shadow_offset":  list(self.shadow_offset),
             "shadow_opacity": self.shadow_opacity,
+            "shadow_blur":    self.shadow_blur,
+            "glow_on":        self.glow_on,
+            "glow_color":     list(self.glow_color),
+            "glow_radius":    self.glow_radius,
+            "glow_intensity": self.glow_intensity,
+            "reflection_on":      self.reflection_on,
+            "reflection_opacity": self.reflection_opacity,
+            "reflection_offset":  self.reflection_offset,
+            "reflection_blur":    self.reflection_blur,
+            "reflection_fade":    self.reflection_fade,
             "plate_on":       self.plate_on,
             "plate_color":    list(self.plate_color),
             "plate_opacity":  self.plate_opacity,
@@ -145,6 +169,16 @@ class TextStyle:
             shadow_color   = _t3("shadow_color",   [0,   0,   0  ]),
             shadow_offset  = _t2("shadow_offset",  [1,   2       ]),
             shadow_opacity = float(d.get("shadow_opacity", 0.55)),
+            shadow_blur    = float(d.get("shadow_blur", 0.0)),
+            glow_on        = bool(d.get("glow_on",        False)),
+            glow_color     = _t3("glow_color",     [255, 255, 255]),
+            glow_radius    = int(d.get("glow_radius",     4)),
+            glow_intensity = float(d.get("glow_intensity", 0.45)),
+            reflection_on      = bool(d.get("reflection_on", False)),
+            reflection_opacity = float(d.get("reflection_opacity", 0.32)),
+            reflection_offset  = int(d.get("reflection_offset", 4)),
+            reflection_blur    = float(d.get("reflection_blur", 1.5)),
+            reflection_fade    = float(d.get("reflection_fade", 0.78)),
             plate_on       = bool(d.get("plate_on",       False)),
             plate_color    = _t3("plate_color",    [255, 255, 255]),
             plate_opacity  = float(d.get("plate_opacity",  0.78)),
@@ -155,7 +189,8 @@ class TextStyle:
     def is_default(self) -> bool:
         """True when this style is functionally equivalent to auto-derived defaults."""
         return (
-            not self.gradient_on and not self.shadow_on and not self.plate_on
+            not self.gradient_on and not self.shadow_on and not self.glow_on
+            and not self.reflection_on and not self.plate_on
             and self.source == "auto"
         )
 
@@ -182,7 +217,8 @@ STYLE_PRESETS: Dict[str, "TextStyle"] = {
     "sfx_color":     TextStyle(
         fg_color=(255, 220, 0), outline_color=(0, 0, 0), outline_width=2,
         gradient_on=True, gradient_start=(255, 240, 50), gradient_end=(210, 120, 0),
-        gradient_angle=90, source="preset:sfx_color"),
+        gradient_angle=90, glow_on=True, glow_color=(255, 120, 0), glow_radius=5,
+        glow_intensity=0.45, source="preset:sfx_color"),
     "sfx_dark":      TextStyle(
         fg_color=(20, 20, 20), outline_color=(255, 80, 0), outline_width=2,
         source="preset:sfx_dark"),
@@ -444,11 +480,13 @@ class OCRBlock:
     # ── Mask cache (populated by classify_region; None until then) ────────────
     text_mask:       Optional[np.ndarray] = field(default=None)
     safe_text_mask:  Optional[np.ndarray] = field(default=None)  # reserved Phase 2
+    raw_style_match: Dict[str, Any]       = field(default_factory=dict)
 
     # ── Placement geometry (reserved for Phase 2 typesetting redesign) ────────
     safe_center:     Optional[Tuple[int, int]]           = field(default=None)
     safe_rect:       Optional[Tuple[int, int, int, int]] = field(default=None)
     text_angle:      float                               = 0.0
+    rotation_angle:  float                               = 0.0
 
     # ── Phase 3: manual overrides + text style ────────────────────────────────
     # override=None → fully automatic; any non-None field in the override wins.
@@ -681,8 +719,36 @@ def _block_to_dict(block: "OCRBlock") -> dict:
     }
     existing_meta = getattr(block, "cleanup_meta", {}) or {}
     persisted_meta_flags = False
+    cleanup_meta_persist_keys = (
+        "review_required",
+        "typeset_box_source",
+        "cross_page_cleanup_limited",
+        "cross_page_cleanup_split",
+        "cross_page_secondary",
+        "diagnostic_only",
+        "diagnostic_cleanup_ran",
+        "destructive_cleanup_executed",
+        "production_patch_accepted",
+        "proposal_valid",
+        "proposal_failure_reason",
+        "cleanup_failure_reason",
+        "gate_violation",
+        "residual_text_visible",
+        "visual_quality_ok",
+        "fill_patch_visible",
+        "cleanup_effective",
+        "selected_mask_source",
+        "selected_mask_reason",
+        "selected_mask_score",
+        "selected_backend",
+        "backend_called",
+        "cleanup_backend_succeeded",
+        "outside_changed_px",
+        "residual_score_bad",
+        "damage_score",
+    )
     if isinstance(existing_meta, dict):
-        for key in ("review_required", "typeset_box_source", "cross_page_cleanup_limited", "cross_page_cleanup_split", "cross_page_secondary"):
+        for key in cleanup_meta_persist_keys:
             val = existing_meta.get(key)
             if isinstance(val, (str, int, float, bool)) or val is None:
                 meta[key] = val
@@ -697,6 +763,12 @@ def _block_to_dict(block: "OCRBlock") -> dict:
         d["typeset_reason"] = typeset_reason
     if bool(getattr(block, "typeset_override", False)):
         d["typeset_override"] = True
+    rotation_angle = float(getattr(block, "rotation_angle", 0.0) or 0.0)
+    if abs(rotation_angle) > 0.001:
+        d["rotation_angle"] = rotation_angle
+    raw_style = getattr(block, "raw_style_match", {}) or {}
+    if isinstance(raw_style, dict) and raw_style:
+        d["raw_style_match"] = raw_style
     typeset_meta = getattr(block, "typeset_meta", {}) or {}
     if isinstance(typeset_meta, dict):
         safe_typeset_meta = {}
@@ -846,6 +918,12 @@ def _apply_block_dict(block: "OCRBlock", d: dict) -> None:
     block.typeset_status = str(d.get("typeset_status", getattr(block, "typeset_status", "")) or "")
     block.typeset_reason = str(d.get("typeset_reason", getattr(block, "typeset_reason", "")) or "")
     block.typeset_override = bool(d.get("typeset_override", getattr(block, "typeset_override", False)))
+    try:
+        block.rotation_angle = float(d.get("rotation_angle", getattr(block, "rotation_angle", 0.0)) or 0.0) % 360.0
+    except Exception:
+        block.rotation_angle = 0.0
+    raw_style = d.get("raw_style_match", {})
+    block.raw_style_match = raw_style if isinstance(raw_style, dict) else {}
     raw_typeset_meta = d.get("typeset_meta", {})
     if isinstance(raw_typeset_meta, dict):
         block.typeset_meta = {}
@@ -902,7 +980,34 @@ def _apply_block_dict(block: "OCRBlock", d: dict) -> None:
                 "status": block.cleanup_status,
                 "reason": block.cleanup_reason,
             }
-            for key in ("review_required", "typeset_box_source", "cross_page_cleanup_limited", "cross_page_cleanup_split", "cross_page_secondary"):
+            for key in (
+                "review_required",
+                "typeset_box_source",
+                "cross_page_cleanup_limited",
+                "cross_page_cleanup_split",
+                "cross_page_secondary",
+                "diagnostic_only",
+                "diagnostic_cleanup_ran",
+                "destructive_cleanup_executed",
+                "production_patch_accepted",
+                "proposal_valid",
+                "proposal_failure_reason",
+                "cleanup_failure_reason",
+                "gate_violation",
+                "residual_text_visible",
+                "visual_quality_ok",
+                "fill_patch_visible",
+                "cleanup_effective",
+                "selected_mask_source",
+                "selected_mask_reason",
+                "selected_mask_score",
+                "selected_backend",
+                "backend_called",
+                "cleanup_backend_succeeded",
+                "outside_changed_px",
+                "residual_score_bad",
+                "damage_score",
+            ):
                 val = meta.get(key)
                 if isinstance(val, (str, int, float, bool)) or val is None:
                     block.cleanup_meta[key] = val

@@ -48,31 +48,31 @@ type PywebviewBridge = {
     detect_all:           ()                              => Promise<BootstrapResponse>;
     export_project:       (dir?: string)                  => Promise<ApiResponse & { export_dir: string }>;
     export_yolo_finetune_dataset: ()                      => Promise<ApiResponse & { dataset_dir?: string; manifest?: string; pages?: number }>;
-    set_yolo_train_class: (idx: number, classId: number)  => Promise<BootstrapResponse>;
+    set_yolo_train_class: (idx: number, classId: number, pageIdx?: number | null) => Promise<BootstrapResponse>;
     train_yolo_detector:  ()                              => Promise<ApiResponse & { status?: string; dataset_dir?: string; status_path?: string; log?: string; running?: boolean; pid?: number; pages?: number }>;
     get_yolo_training_status: ()                          => Promise<ApiResponse & { status?: string; running?: boolean; dataset_dir?: string; status_path?: string; log?: string; onnx?: string; error?: string }>;
     reveal_export_folder: ()                              => Promise<ApiResponse>;
     get_page_image:       (idx: number, mode?: "best" | "raw" | "cleaned" | "typeset") => Promise<ApiResponse & { b64: string | null }>;
-    update_region:        (idx: number, field: string, value: unknown) => Promise<BootstrapResponse>;
-    update_region_bbox:   (idx: number, x: number, y: number, w: number, h: number, pageIdx?: number | null) => Promise<BootstrapResponse>;
+    update_region:        (idx: number, field: string, value: unknown, pageIdx?: number | null) => Promise<BootstrapResponse>;
+    update_region_bbox:   (idx: number, x: number, y: number, w: number, h: number, pageIdx?: number | null, editPageIdx?: number | null) => Promise<BootstrapResponse>;
     get_region_preview_sprite: (idx: number, draft?: Record<string, unknown>, pageIdx?: number | null) => Promise<RegionPreviewSprite>;
     list_fonts:           ()                              => Promise<FontOptionsResponse>;
-    add_region:           (x: number, y: number, w: number, h: number, text?: string) => Promise<BootstrapResponse>;
-    delete_region:        (idx: number, yoloRejectReason?: string) => Promise<BootstrapResponse>;
-    ocr_region:           (idx: number)                   => Promise<BootstrapResponse>;
-    translate_region:     (idx: number)                   => Promise<BootstrapResponse>;
-    preview_region_cleanup: (idx: number, manualMask?: Record<string, unknown> | null) => Promise<CleanupPreviewResponse>;
-    propose_cleanup_mask_sam2: (idx: number, prompt?: Record<string, unknown> | null) => Promise<Sam2MaskResponse>;
+    add_region:           (x: number, y: number, w: number, h: number, text?: string, pageIdx?: number | null) => Promise<BootstrapResponse>;
+    delete_region:        (idx: number, yoloRejectReason?: string, pageIdx?: number | null) => Promise<BootstrapResponse>;
+    ocr_region:           (idx: number, pageIdx?: number | null) => Promise<BootstrapResponse>;
+    translate_region:     (idx: number, pageIdx?: number | null) => Promise<BootstrapResponse>;
+    preview_region_cleanup: (idx: number, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) => Promise<CleanupPreviewResponse>;
+    propose_cleanup_mask_sam2: (idx: number, prompt?: Record<string, unknown> | null, pageIdx?: number | null) => Promise<Sam2MaskResponse>;
     get_sam2_status:     (load?: boolean)                 => Promise<ApiResponse & { status?: string; loaded?: boolean }>;
-    get_region_cleanup_debug: (idx: number, manualMask?: Record<string, unknown> | null) => Promise<CleanupDebugResponse>;
-    record_mask_qa_label: (idx: number, label: string, notes?: string) => Promise<ApiResponse & { labels_path?: string; label?: string }>;
+    get_region_cleanup_debug: (idx: number, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) => Promise<CleanupDebugResponse>;
+    record_mask_qa_label: (idx: number, label: string, notes?: string, pageIdx?: number | null) => Promise<ApiResponse & { labels_path?: string; label?: string }>;
     export_mask_qa_dataset: () => Promise<ApiResponse & { dataset_dir?: string; labels_path?: string; manifest?: string; records?: number }>;
     train_mask_qa_model: () => Promise<ApiResponse & { model_path?: string; log?: string; records?: number }>;
-    compare_region_cleanup_candidates: (idx: number, manualMask?: Record<string, unknown> | null) => Promise<CleanupCandidateCompareResponse>;
-    apply_region_cleanup_candidate: (idx: number, candidateId: string, manualMask?: Record<string, unknown> | null) => Promise<BootstrapResponse>;
-    apply_region_cleanup: (idx: number, manualMask?: Record<string, unknown> | null) => Promise<BootstrapResponse>;
-    rerun_region_cleanup: (idx: number, manualMask?: Record<string, unknown> | null) => Promise<BootstrapResponse>;
-    delete_region_cleanup: (idx: number)                  => Promise<BootstrapResponse>;
+    compare_region_cleanup_candidates: (idx: number, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) => Promise<CleanupCandidateCompareResponse>;
+    apply_region_cleanup_candidate: (idx: number, candidateId: string, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) => Promise<BootstrapResponse>;
+    apply_region_cleanup: (idx: number, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) => Promise<BootstrapResponse>;
+    rerun_region_cleanup: (idx: number, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) => Promise<BootstrapResponse>;
+    delete_region_cleanup: (idx: number, pageIdx?: number | null) => Promise<BootstrapResponse>;
     undo:                 ()                              => Promise<BootstrapResponse>;
     list_series_memory:   ()                              => Promise<ApiResponse & { memory: SeriesMemory }>;
     add_series_name:      (krName: string, enName: string, aliasesKr?: string[], note?: string) => Promise<BootstrapResponse>;
@@ -270,8 +270,8 @@ const api = {
   exportYoloFinetuneDataset: () =>
     call(() => getBridge().export_yolo_finetune_dataset()),
 
-  setYoloTrainClass: (idx: number, classId: number) =>
-    call(() => getBridge().set_yolo_train_class(idx, classId)),
+  setYoloTrainClass: (idx: number, classId: number, pageIdx?: number | null) =>
+    call(() => getBridge().set_yolo_train_class(idx, classId, pageIdx ?? null)),
 
   /** Start background YOLO training from the exported dataset. */
   trainYoloDetector: () =>
@@ -293,11 +293,11 @@ const api = {
     call(() => getBridge().get_page_image(idx, mode)),
 
   /** Edit a region field and get back updated bootstrap. */
-  updateRegion: (idx: number, field: string, value: unknown) =>
-    call(() => getBridge().update_region(idx, field, value)),
+  updateRegion: (idx: number, field: string, value: unknown, pageIdx?: number | null) =>
+    call(() => getBridge().update_region(idx, field, value, pageIdx ?? null)),
 
-  updateRegionBBox: (idx: number, x: number, y: number, w: number, h: number, pageIdx?: number | null) =>
-    call(() => getBridge().update_region_bbox(idx, x, y, w, h, pageIdx ?? null)),
+  updateRegionBBox: (idx: number, x: number, y: number, w: number, h: number, pageIdx?: number | null, editPageIdx?: number | null) =>
+    call(() => getBridge().update_region_bbox(idx, x, y, w, h, pageIdx ?? null, editPageIdx ?? null)),
 
   getRegionPreviewSprite: (idx: number, draft: Record<string, unknown> = {}, pageIdx?: number | null) =>
     call(() => getBridge().get_region_preview_sprite(idx, draft, pageIdx ?? null)),
@@ -305,32 +305,32 @@ const api = {
   listFonts: () =>
     call(() => getBridge().list_fonts()),
 
-  addRegion: (x: number, y: number, w: number, h: number, text = "") =>
-    call(() => getBridge().add_region(x, y, w, h, text)),
+  addRegion: (x: number, y: number, w: number, h: number, text = "", pageIdx?: number | null) =>
+    call(() => getBridge().add_region(x, y, w, h, text, pageIdx ?? null)),
 
-  deleteRegion: (idx: number, yoloRejectReason = "") =>
-    call(() => getBridge().delete_region(idx, yoloRejectReason)),
+  deleteRegion: (idx: number, yoloRejectReason = "", pageIdx?: number | null) =>
+    call(() => getBridge().delete_region(idx, yoloRejectReason, pageIdx ?? null)),
 
-  ocrRegion: (idx: number) =>
-    call(() => getBridge().ocr_region(idx)),
+  ocrRegion: (idx: number, pageIdx?: number | null) =>
+    call(() => getBridge().ocr_region(idx, pageIdx ?? null)),
 
-  translateRegion: (idx: number) =>
-    call(() => getBridge().translate_region(idx)),
+  translateRegion: (idx: number, pageIdx?: number | null) =>
+    call(() => getBridge().translate_region(idx, pageIdx ?? null)),
 
-  previewRegionCleanup: (idx: number, manualMask?: Record<string, unknown> | null) =>
-    call(() => getBridge().preview_region_cleanup(idx, manualMask ?? null)),
+  previewRegionCleanup: (idx: number, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) =>
+    call(() => getBridge().preview_region_cleanup(idx, manualMask ?? null, pageIdx ?? null)),
 
-  proposeCleanupMaskSam2: (idx: number, prompt?: Record<string, unknown> | null) =>
-    call(() => getBridge().propose_cleanup_mask_sam2(idx, prompt ?? null)),
+  proposeCleanupMaskSam2: (idx: number, prompt?: Record<string, unknown> | null, pageIdx?: number | null) =>
+    call(() => getBridge().propose_cleanup_mask_sam2(idx, prompt ?? null, pageIdx ?? null)),
 
   getSam2Status: (load = false) =>
     call(() => getBridge().get_sam2_status(load)),
 
-  getRegionCleanupDebug: (idx: number, manualMask?: Record<string, unknown> | null) =>
-    call(() => getBridge().get_region_cleanup_debug(idx, manualMask ?? null)),
+  getRegionCleanupDebug: (idx: number, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) =>
+    call(() => getBridge().get_region_cleanup_debug(idx, manualMask ?? null, pageIdx ?? null)),
 
-  recordMaskQaLabel: (idx: number, label: string, notes = "") =>
-    call(() => getBridge().record_mask_qa_label(idx, label, notes)),
+  recordMaskQaLabel: (idx: number, label: string, notes = "", pageIdx?: number | null) =>
+    call(() => getBridge().record_mask_qa_label(idx, label, notes, pageIdx ?? null)),
 
   exportMaskQaDataset: () =>
     call(() => getBridge().export_mask_qa_dataset()),
@@ -338,20 +338,20 @@ const api = {
   trainMaskQaModel: () =>
     call(() => getBridge().train_mask_qa_model()),
 
-  compareRegionCleanupCandidates: (idx: number, manualMask?: Record<string, unknown> | null) =>
-    call(() => getBridge().compare_region_cleanup_candidates(idx, manualMask ?? null)),
+  compareRegionCleanupCandidates: (idx: number, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) =>
+    call(() => getBridge().compare_region_cleanup_candidates(idx, manualMask ?? null, pageIdx ?? null)),
 
-  applyRegionCleanupCandidate: (idx: number, candidateId: string, manualMask?: Record<string, unknown> | null) =>
-    call(() => getBridge().apply_region_cleanup_candidate(idx, candidateId, manualMask ?? null)),
+  applyRegionCleanupCandidate: (idx: number, candidateId: string, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) =>
+    call(() => getBridge().apply_region_cleanup_candidate(idx, candidateId, manualMask ?? null, pageIdx ?? null)),
 
-  applyRegionCleanup: (idx: number, manualMask?: Record<string, unknown> | null) =>
-    call(() => getBridge().apply_region_cleanup(idx, manualMask ?? null)),
+  applyRegionCleanup: (idx: number, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) =>
+    call(() => getBridge().apply_region_cleanup(idx, manualMask ?? null, pageIdx ?? null)),
 
-  rerunRegionCleanup: (idx: number, manualMask?: Record<string, unknown> | null) =>
-    call(() => getBridge().rerun_region_cleanup(idx, manualMask ?? null)),
+  rerunRegionCleanup: (idx: number, manualMask?: Record<string, unknown> | null, pageIdx?: number | null) =>
+    call(() => getBridge().rerun_region_cleanup(idx, manualMask ?? null, pageIdx ?? null)),
 
-  deleteRegionCleanup: (idx: number) =>
-    call(() => getBridge().delete_region_cleanup(idx)),
+  deleteRegionCleanup: (idx: number, pageIdx?: number | null) =>
+    call(() => getBridge().delete_region_cleanup(idx, pageIdx ?? null)),
 
   undo: () =>
     call(() => getBridge().undo()),

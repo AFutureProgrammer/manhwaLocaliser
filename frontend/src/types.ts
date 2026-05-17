@@ -29,6 +29,26 @@ export interface Region {
   outline_width?: number;
   shadow?: string;   // hex color
   shadow_on?: boolean;
+  shadow_offset_x?: number;
+  shadow_offset_y?: number;
+  shadow_opacity?: number;
+  shadow_blur?: number;
+  glow?: string;
+  glow_on?: boolean;
+  glow_radius?: number;
+  glow_intensity?: number;
+  reflection_on?: boolean;
+  reflection_opacity?: number;
+  reflection_offset?: number;
+  reflection_blur?: number;
+  reflection_fade?: number;
+  gradient_on?: boolean;
+  gradient_start?: string;
+  gradient_end?: string;
+  gradient_angle?: number;
+  rotation_angle?: number;
+  style_source?: string;
+  raw_style_match?: RawStyleMatch;
   align:   "left" | "center" | "right";
   visible: boolean;
   locked:  boolean;
@@ -70,6 +90,7 @@ export interface Region {
   primary_region_id?: string | null;
   primary_region_idx?: number | null;
   source_page_idx?: number;
+  display_page_idx?: number;
   typeset_status?: string;
   typeset_reason?: string;
   /** Derived: "ok" | "flagged" | "skipped_sfx" | "pending". No fake numeric confidence. */
@@ -357,8 +378,13 @@ export interface MetaSettings {
   cleanup_solid_bubble_max_rectangularity?: number | string;
   cleanup_halo_mask_enabled?: boolean;
   cleanup_halo_max_px?: number | string;
+  cleanup_contrast_mask_completion_enabled?: boolean;
+  cleanup_contrast_mask_completion_radius?: number | string;
+  cleanup_mask_backend?: "auto" | "cv" | "sam2" | string;
   cleanup_residual_retry_enabled?: boolean;
   cleanup_residual_retry_dilate_px?: number | string;
+  cleanup_force_enabled?: boolean;
+  cleanup_status_enabled?: boolean;
   cleanup_allow_grouped_inpaint?: boolean;
   cleanup_manual_review_only?: boolean;
   cleanup_min_container_confidence?: number | string;
@@ -416,6 +442,18 @@ export interface Bootstrap {
   meta:     Meta;
 }
 
+export interface RawStyleMatch {
+  status?: "high" | "medium" | "low" | "fallback" | string;
+  summary?: string;
+  matched?: string[];
+  ignored?: string[];
+  downgrade_reasons?: string[];
+  role?: string;
+  confidence?: Record<string, string>;
+  auto_applied?: boolean;
+  style?: Record<string, unknown>;
+}
+
 // API response wrapper — every api.* call returns this
 export interface ApiResponse {
   ok:     boolean;
@@ -440,6 +478,20 @@ export interface RegionPreviewSprite extends ApiResponse {
   outline_width?: number;
   shadow?: string;
   shadow_on?: boolean;
+  shadow_offset_x?: number;
+  shadow_offset_y?: number;
+  shadow_opacity?: number;
+  shadow_blur?: number;
+  glow?: string;
+  glow_on?: boolean;
+  glow_radius?: number;
+  glow_intensity?: number;
+  reflection_on?: boolean;
+  reflection_opacity?: number;
+  reflection_offset?: number;
+  reflection_blur?: number;
+  reflection_fade?: number;
+  rotation_angle?: number;
   align?: Region["align"];
 }
 
