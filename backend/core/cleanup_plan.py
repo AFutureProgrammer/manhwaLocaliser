@@ -47,6 +47,7 @@ Audit note (engine.py / cleanup.py):
 """
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field, replace
 import json
 import os
@@ -216,6 +217,9 @@ class CleanupPolicy:
     cleanup_fallback_backend: str = "telea"
     cleanup_verbose_logs: bool = False
     cleanup_show_diagnostics: bool = False
+    cleanup_mask_backend: str = "auto"
+    cleanup_force_enabled: bool = False
+    cleanup_status_enabled: bool = True
 
     @classmethod
     def from_config(cls, cfg: Any) -> "CleanupPolicy":
@@ -255,6 +259,8 @@ class CleanupPolicy:
             cleanup_prefer_iopaint_for_translucent=_bool("cleanup_prefer_iopaint_for_translucent", False),
             cleanup_verbose_logs=_bool("cleanup_verbose_logs", False),
             cleanup_show_diagnostics=_bool("cleanup_show_diagnostics", False),
+            cleanup_force_enabled=_bool("cleanup_force_enabled", False),
+            cleanup_status_enabled=_bool("cleanup_status_enabled", True),
         )
         try:
             policy.cleanup_solid_bubble_min_container_confidence = float(
@@ -314,6 +320,11 @@ class CleanupPolicy:
         ).strip().lower()
         if policy.cleanup_fallback_backend not in {"telea", "ns", "iopaint"}:
             policy.cleanup_fallback_backend = "telea"
+        policy.cleanup_mask_backend = str(
+            getattr(cfg, "cleanup_mask_backend", "auto") or "auto"
+        ).strip().lower()
+        if policy.cleanup_mask_backend not in {"auto", "cv", "sam2"}:
+            policy.cleanup_mask_backend = "auto"
         if policy.sfx_experimental_cleanup_mode not in {"off", "tight_mask", "telea"}:
             policy.sfx_experimental_cleanup_mode = "off"
         if policy.busy_background_cleanup_mode not in {"off", "tight_mask", "telea"}:
@@ -2323,9 +2334,171 @@ def _candidate_source_from_reason(reason: str) -> str:
         return "dark_caption_path"
     if text.startswith("region_cv_no_bbox"):
         return "fallback_cv_no_bbox"
+    if text.startswith("sam2_cleanup_mask"):
+        return "sam2"
     if text in {"none", "no_candidates", ""}:
         return "none"
     return "fallback"
+
+
+def _cfg_bool_attr(cfg: Any, name: str, default: bool = False) -> bool:
+    value = getattr(cfg, name, default) if cfg is not None else default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _decode_mask_png_b64(mask_b64: str) -> Optional[np.ndarray]:
+    if not str(mask_b64 or "").strip():
+        return None
+    try:
+        raw = base64.b64decode(mask_b64)
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        mask = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            return None
+        return (mask > 0).astype(np.uint8) * 255
+    except Exception:
+        return None
+
+
+def _component_centers(mask: Optional[np.ndarray], bbox: Tuple[int, int, int, int], limit: int = 3) -> List[Tuple[float, float]]:
+    if mask is None or not np.any(mask):
+        x, y, w, h = bbox
+        return [(x + w * 0.50, y + h * 0.50)]
+    x, y, w, h = bbox
+    roi = mask[max(0, y):max(0, y + h), max(0, x):max(0, x + w)]
+    if roi.size == 0:
+        return [(x + w * 0.50, y + h * 0.50)]
+    num, labels, stats, cent = cv2.connectedComponentsWithStats((roi > 0).astype(np.uint8), 8)
+    comps: List[Tuple[int, Tuple[float, float]]] = []
+    for idx in range(1, num):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area >= 8:
+            comps.append((area, (float(x + cent[idx][0]), float(y + cent[idx][1]))))
+    comps.sort(key=lambda item: item[0], reverse=True)
+    if not comps:
+        return [(x + w * 0.50, y + h * 0.50)]
+    return [pt for _area, pt in comps[:limit]]
+
+
+def _sam2_cleanup_candidate(
+    img_cv: np.ndarray,
+    plan: CleanupPlan,
+    model_config: Optional[Any],
+) -> Optional[Tuple[np.ndarray, float, str]]:
+    if model_config is None or not _cfg_bool_attr(model_config, "sam2_enabled", False):
+        plan.debug_metrics["sam2_mask_skipped_reason"] = "sam2_disabled"
+        return None
+    mode = str(getattr(model_config, "sam2_mask_mode", "manual_only") or "manual_only").strip().lower()
+    if mode not in {"cleanup_assist", "container_assist"}:
+        plan.debug_metrics["sam2_mask_skipped_reason"] = f"sam2_mode_{mode}"
+        return None
+    if plan.region_bbox is None:
+        plan.debug_metrics["sam2_mask_skipped_reason"] = "missing_region_bbox"
+        return None
+
+    prompt_bbox = _expand_bbox(plan.text_bbox or plan.region_bbox, 10, img_cv.shape)
+    x, y, w, h = prompt_bbox
+    positive = _component_centers(plan.text_mask, prompt_bbox, limit=3)
+    negative = [
+        (x + 3.0, y + 3.0),
+        (x + max(1, w) - 4.0, y + 3.0),
+        (x + 3.0, y + max(1, h) - 4.0),
+        (x + max(1, w) - 4.0, y + max(1, h) - 4.0),
+    ]
+    try:
+        url = str(getattr(model_config, "sam2_backend_url", "") or "").strip()
+        if url:
+            ok_img, img_buf = cv2.imencode(".png", img_cv)
+            if not ok_img:
+                raise RuntimeError("image_encode_failed")
+            payload = {
+                "mode": "cleanup",
+                "bbox": [int(v) for v in prompt_bbox],
+                "positive_clicks": positive,
+                "negative_clicks": negative,
+                "image_b64": base64.b64encode(img_buf.tobytes()).decode("utf-8"),
+            }
+            timeout = max(1.0, float(getattr(model_config, "sam2_timeout_sec", 30) or 30))
+            endpoint = url.rstrip("/")
+            if not endpoint.endswith("/propose_cleanup_mask"):
+                endpoint += "/propose_cleanup_mask"
+            resp = requests.post(endpoint, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            response = resp.json()
+        else:
+            from backend.core import sam2_mask
+            response = sam2_mask.propose_mask(
+                img_cv,
+                prompt_bbox,
+                positive_clicks=positive,
+                negative_clicks=negative,
+                mode="cleanup",
+                config=model_config,
+            )
+        if not bool(response.get("ok", False)):
+            plan.debug_metrics["sam2_mask_skipped_reason"] = str(response.get("error") or response.get("status") or "proposal_failed")
+            return None
+        mask_b64 = str(response.get("mask_b64") or response.get("mask_crop_b64") or response.get("b64") or "")
+        mask = _decode_mask_png_b64(mask_b64)
+        bbox = response.get("bbox") or response.get("mask_bbox") or [0, 0, img_cv.shape[1], img_cv.shape[0]]
+        if mask is None or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            plan.debug_metrics["sam2_mask_skipped_reason"] = "invalid_response_mask"
+            return None
+        bx, by, bw, bh = [int(v) for v in bbox]
+        if mask.shape[:2] == img_cv.shape[:2]:
+            full = mask
+        else:
+            full = np.zeros(img_cv.shape[:2], dtype=np.uint8)
+            x1, y1 = max(0, bx), max(0, by)
+            x2, y2 = min(img_cv.shape[1], bx + bw), min(img_cv.shape[0], by + bh)
+            if x2 <= x1 or y2 <= y1:
+                plan.debug_metrics["sam2_mask_skipped_reason"] = "invalid_response_bbox"
+                return None
+            full[y1:y2, x1:x2] = mask[: y2 - y1, : x2 - x1]
+        full = (full > 0).astype(np.uint8) * 255
+        mask_px = int(np.count_nonzero(full))
+        prompt_area = max(1, int(w * h))
+        if mask_px <= 0:
+            plan.debug_metrics["sam2_mask_skipped_reason"] = "empty_mask"
+            return None
+        region_area = max(1, int(plan.region_bbox[2] * plan.region_bbox[3]))
+        region_ratio = mask_px / region_area
+        container_ratio = 0.0
+        if plan.container_mask is not None and np.any(plan.container_mask):
+            container_ratio = mask_px / max(1, int(np.count_nonzero(plan.container_mask)))
+        backend_mode = str(getattr(model_config, "cleanup_mask_backend", "auto") or "auto").strip().lower()
+        if (
+            backend_mode == "auto"
+            and not _cfg_bool_attr(model_config, "cleanup_force_enabled", False)
+            and (region_ratio > 0.45 or container_ratio > 0.65)
+        ):
+            plan.debug_metrics["sam2_mask_skipped_reason"] = "oversized_auto_mask"
+            plan.debug_metrics["sam2_mask_rejected_ratio"] = round(float(region_ratio), 4)
+            if container_ratio:
+                plan.debug_metrics["sam2_mask_rejected_container_ratio"] = round(float(container_ratio), 4)
+            return None
+        if mask_px / prompt_area > 0.95 and not _cfg_bool_attr(model_config, "cleanup_force_enabled", False):
+            plan.debug_metrics["sam2_mask_skipped_reason"] = "near_full_prompt_mask"
+            return None
+        conf = float(response.get("confidence", 0.0) or 0.0)
+        plan.debug_metrics.update({
+            "cleanup_mask_backend": "sam2",
+            "sam2_mask_prompt_bbox": [int(v) for v in prompt_bbox],
+            "sam2_positive_clicks": [[round(float(px), 2), round(float(py), 2)] for px, py in positive],
+            "sam2_negative_clicks": [[round(float(px), 2), round(float(py), 2)] for px, py in negative],
+            "sam2_mask_used": True,
+            "sam2_mask_px": mask_px,
+            "sam2_mask_bbox": _bbox_list(_mask_bbox(full)),
+            "sam2_mask_rejected_reason": "",
+        })
+        return full, max(0.62, min(0.95, conf if conf > 0 else 0.78)), "sam2_cleanup_mask(embedded)"
+    except Exception as exc:
+        plan.debug_metrics["sam2_mask_skipped_reason"] = str(exc)
+        if _cfg_bool_attr(model_config, "sam2_required", False):
+            plan.debug_metrics["sam2_required_failed"] = True
+        return None
 
 
 def _json_safe(value: Any) -> Any:
@@ -3049,12 +3222,17 @@ def _write_cleanup_metadata_to_block(
     quality = _refresh_cleanup_quality(plan, img_cv)
     tier, status, reason = classify_cleanup_tier(plan, policy=policy)
     block.cleanup_tier = tier
-    block.cleanup_status = status
-    block.cleanup_reason = reason
+    if policy.cleanup_status_enabled:
+        block.cleanup_status = status
+        block.cleanup_reason = reason
+    else:
+        block.cleanup_status = ""
+        block.cleanup_reason = ""
     block.cleanup_meta = {
         "tier": int(tier),
         "status": str(status),
         "reason": str(reason),
+        "status_visible": bool(policy.cleanup_status_enabled),
         "review_required": bool(tier == 2 and policy.require_review_for_tier2),
         "diagnostic_only": bool(plan.debug_metrics.get("diagnostic_only", False)),
         "diagnostic_cleanup_ran": bool(plan.debug_metrics.get("diagnostic_cleanup_ran", False)),
@@ -5287,7 +5465,34 @@ def _hybrid_cleanup_route(
         plan.debug_metrics["cleanup_route"] = "protected_region"
         return
 
+    configured_backend = str(getattr(model_config, "cleanup_backend", "") or "").strip().lower()
+    prefers_lama = configured_backend in {"lama_pt", "lama_onnx"}
+    prefers_iopaint = (
+        configured_backend == "iopaint"
+        or policy.cleanup_fallback_backend == "iopaint"
+        or (bg == "halftone_texture" and policy.cleanup_prefer_iopaint_for_texture)
+        or (bg == "translucent_gradient" and policy.cleanup_prefer_iopaint_for_translucent)
+    )
+
     if bg in {"flat_light", "flat_colored", "dark_bubble"}:
+        region_kind = str(plan.debug_metrics.get("region_kind", "") or "")
+        textured_solid = bg == "dark_bubble" and region_kind == "TEXTURED_BUBBLE"
+        if textured_solid and (prefers_lama or prefers_iopaint):
+            plan.debug_metrics["cleanup_route"] = "model_inpaint_solid_bubble"
+            plan.debug_metrics["model_inpaint_required"] = True
+            plan.cleanup_backend = "iopaint" if prefers_iopaint and not prefers_lama else configured_backend
+            if model_config is not None:
+                plan.iopaint_url = str(getattr(model_config, "iopaint_url", "") or "")
+                plan.lama_model_path = str(getattr(model_config, "lama_model_path", "") or "")
+                try:
+                    plan.max_tile_size = int(getattr(model_config, "max_tile_size", plan.max_tile_size) or plan.max_tile_size)
+                except (TypeError, ValueError):
+                    pass
+            if plan.cleanup_strategy in {"skip", "review"}:
+                plan.cleanup_strategy = "flat_fill"
+                plan.inpaint_method = "local_sample"
+                plan.skip_reason = ""
+            return
         plan.debug_metrics["cleanup_route"] = "solid_bubble_cv"
         return
     if bg == "smooth_gradient":
@@ -5299,14 +5504,6 @@ def _hybrid_cleanup_route(
         plan.debug_metrics["cleanup_route"] = "opencv_fallback"
         return
 
-    configured_backend = str(getattr(model_config, "cleanup_backend", "") or "").strip().lower()
-    prefers_lama = configured_backend in {"lama_pt", "lama_onnx"}
-    prefers_iopaint = (
-        configured_backend == "iopaint"
-        or policy.cleanup_fallback_backend == "iopaint"
-        or (bg == "halftone_texture" and policy.cleanup_prefer_iopaint_for_texture)
-        or (bg == "translucent_gradient" and policy.cleanup_prefer_iopaint_for_translucent)
-    )
     if prefers_lama and not prefers_iopaint:
         plan.debug_metrics["cleanup_route"] = "model_inpaint"
         plan.debug_metrics["model_inpaint_required"] = True
@@ -5504,6 +5701,9 @@ def build_cleanup_plan(
     plan.debug_metrics["cleanup_residual_retry_enabled"] = bool(
         policy.cleanup_residual_retry_enabled
     )
+    plan.debug_metrics["cleanup_force_enabled"] = bool(policy.cleanup_force_enabled)
+    plan.debug_metrics["cleanup_mask_backend"] = str(policy.cleanup_mask_backend)
+    plan.debug_metrics["cleanup_status_enabled"] = bool(policy.cleanup_status_enabled)
     plan.debug_metrics["region_role"] = str(getattr(block, "bubble_role", "") or "")
     plan.debug_metrics["detector_source"] = str(getattr(block, "detector_source", "") or "")
     plan.debug_metrics["yolo_class"] = str(getattr(block, "yolo_kind", "") or "")
@@ -5542,6 +5742,9 @@ def build_cleanup_plan(
     # ── text_bbox: union of OCR boxes; never fall back to region_bbox ────────
     plan.text_bbox = _text_bbox_from_boxes(plan.ocr_boxes, img_cv.shape)
     has_text_signal = bool(str(getattr(block, "text", "") or "").strip())
+    if plan.text_bbox is None and not has_text_signal and policy.cleanup_force_enabled:
+        plan.text_bbox = plan.region_bbox
+        plan.debug_metrics["force_cleanup_no_text_signal"] = True
     if plan.text_bbox is None and not has_text_signal and plan.region_class != "sfx":
         plan.cleanup_strategy = "review"
         plan.inpaint_method = "skip"
@@ -5603,6 +5806,24 @@ def build_cleanup_plan(
         debug_metrics=candidate_debug,
     )
     candidate_rows = candidate_debug.get("text_mask_candidate_scores", [])
+    if policy.cleanup_mask_backend in {"auto", "sam2"}:
+        sam2_candidate = _sam2_cleanup_candidate(img_cv, plan, model_config)
+        if sam2_candidate is not None:
+            sam2_mask, sam2_conf, sam2_reason = sam2_candidate
+            candidates.insert(0, sam2_candidate)
+            candidate_rows.append({
+                "reason": sam2_reason,
+                "source": "sam2",
+                "confidence": round(float(sam2_conf), 4),
+                "mask_px": int(np.count_nonzero(sam2_mask)),
+                "accepted": True,
+                "selected": True,
+                "rejection_reason": "",
+            })
+        elif policy.cleanup_mask_backend == "sam2":
+            plan.debug_metrics.setdefault("sam2_mask_used", False)
+    elif policy.cleanup_mask_backend == "cv":
+        plan.debug_metrics["sam2_mask_skipped_reason"] = "cleanup_mask_backend_cv"
     if plan.debug_metrics.get("legacy_block_text_mask_rejected_reason"):
         candidate_rows = [
             {
@@ -5634,12 +5855,32 @@ def build_cleanup_plan(
             plan.text_bbox = _mask_bbox(best_mask)
             plan.debug_metrics["text_bbox_source"] = "cv_mask"
     else:
-        plan.text_mask            = None
-        plan.text_mask_confidence = 0.0
-        plan.text_mask_reason     = "no_candidates"
-        plan.debug_metrics["selected_candidate"] = "none"
-        plan.debug_metrics["selected_text_mask_candidate"] = "none"
-        plan.debug_metrics["selected_text_mask_candidate_source"] = "none"
+        if policy.cleanup_force_enabled and plan.text_bbox is not None:
+            mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
+            x, y, w, h = _expand_bbox(plan.text_bbox, 2, img_cv.shape)
+            mask[y:y + h, x:x + w] = 255
+            plan.text_mask = mask
+            plan.text_mask_confidence = 0.20
+            plan.text_mask_reason = "force_cleanup_bbox_mask"
+            plan.debug_metrics["selected_candidate"] = plan.text_mask_reason
+            plan.debug_metrics["selected_text_mask_candidate"] = plan.text_mask_reason
+            plan.debug_metrics["selected_text_mask_candidate_source"] = "force_bbox"
+            plan.debug_metrics.setdefault("text_mask_candidate_scores", []).append({
+                "reason": plan.text_mask_reason,
+                "source": "force_bbox",
+                "confidence": 0.20,
+                "mask_px": int(np.count_nonzero(mask)),
+                "accepted": True,
+                "selected": True,
+                "rejection_reason": "",
+            })
+        else:
+            plan.text_mask            = None
+            plan.text_mask_confidence = 0.0
+            plan.text_mask_reason     = "no_candidates"
+            plan.debug_metrics["selected_candidate"] = "none"
+            plan.debug_metrics["selected_text_mask_candidate"] = "none"
+            plan.debug_metrics["selected_text_mask_candidate_source"] = "none"
 
     # ── Container mask ────────────────────────────────────────────────────────
     # FIX-5: SFX and text_on_art have no meaningful bubble container.
@@ -5855,6 +6096,21 @@ def build_cleanup_plan(
             plan.inpaint_method = "telea"
         plan.skip_reason = "cleanup_override_force_review"
         plan.debug_metrics["review_required_after_cleanup"] = True
+    if (
+        policy.cleanup_force_enabled
+        and override_mode not in {"skip", "review"}
+        and plan.cleanup_strategy in {"skip", "review"}
+        and plan.text_mask is not None
+        and np.any(plan.text_mask)
+    ):
+        if plan.background_model in {"flat_light", "flat_colored", "dark_bubble"}:
+            plan.cleanup_strategy = "flat_fill"
+            plan.inpaint_method = "local_sample"
+        else:
+            plan.cleanup_strategy = "mask_inpaint"
+            plan.inpaint_method = "telea"
+        plan.skip_reason = ""
+        plan.debug_metrics["force_cleanup_applied"] = True
 
     if (
         plan.cleanup_strategy not in ("skip", "review")
@@ -5862,6 +6118,7 @@ def build_cleanup_plan(
         and plan.region_class in ("speech_bubble", "caption_box")
         and float(plan.container_confidence or 0.0) < policy.cleanup_min_container_confidence
         and override_mode != "force_allow"
+        and not policy.cleanup_force_enabled
         and not bool(plan.debug_metrics.get("cleanup_allow_low_confidence", False))
     ):
         reason = f"cleanup_container_confidence_low({plan.container_confidence:.2f})"
@@ -5939,6 +6196,9 @@ def build_cleanup_plan(
         cleanup = _optimize_flat_fill_cleanup_mask(img_cv, plan, cleanup, policy)
         cleanup = _constrain_flat_fill_boundary_mask(img_cv, plan, cleanup)
         reject_reason = _reject_unsafe_cleanup_mask(plan, cleanup, policy=policy, img_cv=img_cv)
+        if reject_reason and policy.cleanup_force_enabled:
+            plan.debug_metrics["force_cleanup_bypassed_rejection"] = str(reject_reason)
+            reject_reason = ""
         plan.debug_metrics["cleanup_mask_rejected"] = bool(reject_reason)
         plan.debug_metrics["cleanup_mask_rejection_reason"] = str(reject_reason or "")
         if reject_reason:
@@ -6058,7 +6318,7 @@ def execute_cleanup_plan(
 
     if strategy == "flat_fill":
         if (
-            str(plan.cleanup_backend or "").strip().lower() in {"lama_pt", "lama_onnx"}
+            str(plan.cleanup_backend or "").strip().lower() in {"lama_pt", "lama_onnx", "iopaint"}
             and plan.region_class in {"speech_bubble", "caption_box"}
             and _try_external_inpaint_backend(img_cv, result, mask, plan)
         ):

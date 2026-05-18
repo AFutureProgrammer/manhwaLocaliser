@@ -1,0 +1,68 @@
+{
+  "objective": "Build the RAW-style QA confidence milestone: cropped RAW-style fixtures and deterministic regression tests, backend RAW match QA summary metadata, and compact Issues/RAW Match review queue UX with validation.",
+  "current_state": {
+    "worktree_notes": [
+      "Only .venv was untracked before new work began.",
+      "backend/engine.py has in-progress backend RAW QA helper edits.",
+      "No validation has been run after the in-progress backend edits yet."
+    ],
+    "repo_instructions": [
+      "Work small and prefer minimal diffs.",
+      "Do not refactor unrelated code.",
+      "Run python -m compileall backend memory when backend changes.",
+      "Run npm run build in frontend/ when frontend changes.",
+      "Final response should include changed files, short summary, and tests run."
+    ]
+  },
+  "in_progress_changes": [
+    {
+      "file": "backend/engine.py",
+      "summary": "Added RAW-style crop signature, review status normalization, derived needs_review/auto_state/fallback metadata, stale marker, and RAW match QA summary helper methods near the existing RAW style analysis helpers.",
+      "status": "partial",
+      "remaining": [
+        "Wire _finalize_raw_style_match into _analyze_raw_style_for_block fallback/success/error paths.",
+        "Decorate RAW metadata in bootstrap region serialization.",
+        "Add RAW QA issue entries for risky current-page regions.",
+        "Add update_region_field handling for raw_review_status, raw_review_note, and rematch_stale_raw_styles.",
+        "Mark existing RAW matches stale when region bboxes/crops change."
+      ]
+    }
+  ],
+  "planned_backend_work": [
+    "Preserve existing RAW auto-apply and manual style override behavior.",
+    "Add analysis_crop_signature to new RAW matches and mark stale when bbox changes.",
+    "Expose raw_match_qa through existing bootstrap region metadata, not a broad new service.",
+    "Support review_status values: unreviewed, accepted, rejected.",
+    "Keep SFX/text-over-art proposal-only and never make SFX auto-render more aggressive."
+  ],
+  "planned_fixture_work": [
+    "Add a dedicated small cropped fixture folder under backend/core.",
+    "Store cropped PNGs plus JSON metadata, not full pages.",
+    "Add fixture categories: plain dialogue, black outline, colored outline, shadow, glow, gradient, noisy/low-contrast background, mixed styles, SFX/text-over-art.",
+    "Add deterministic fixture runner tests that feed crops into the existing RAW analysis path without OCR, LLM, or model calls.",
+    "Assert behavior bands/effects/reasons/auto state/proposal/fallback/manual pinning rather than exact pixels."
+  ],
+  "planned_frontend_work": [
+    "Extend frontend types for RAW QA metadata.",
+    "Extend Issues tab into a compact RAW QA jump list with filters.",
+    "Rows should show page/region, style summary, confidence/status, downgrade chips, and auto/proposed/fallback label.",
+    "Row actions: jump to region, compare RAW/Cleaned/Typeset, apply RAW proposal, reset to auto, mark reviewed.",
+    "Add Needs Review badges on region boxes for medium/low/fallback/risky RAW matches.",
+    "Add RAW QA summary in status bar: RAW QA: N ok, M review."
+  ],
+  "validation_plan": [
+    "python -m compileall backend memory",
+    "python -m unittest backend.core.test_raw_style_matching",
+    "python -m unittest backend.core.test_cleanup_pipeline",
+    "cd frontend && npm run build"
+  ],
+  "important_files": [
+    "backend/engine.py",
+    "backend/core/regions.py",
+    "backend/core/test_raw_style_matching.py",
+    "frontend/src/App.tsx",
+    "frontend/src/types.ts",
+    "frontend/src/api.ts",
+    "backend/api.py"
+  ]
+}

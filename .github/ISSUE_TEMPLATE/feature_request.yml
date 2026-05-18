@@ -1,0 +1,56 @@
+name: Feature request
+description: Propose a scoped improvement.
+title: "[Feature]: "
+labels: ["feature"]
+body:
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - p0
+        - p1
+        - p2
+        - p3
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - cleanup
+        - OCR
+        - translation
+        - typeset
+        - frontend
+        - backend
+        - source-sync
+        - memory
+        - packaging
+        - test
+        - documentation
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is slow, unsafe, or missing?
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What user-visible outcome should exist?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Use checkable bullets.
+    validations:
+      required: true

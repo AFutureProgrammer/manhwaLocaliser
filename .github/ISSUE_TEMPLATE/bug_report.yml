@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a reproducible app or pipeline bug.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - cleanup
+        - OCR
+        - translation
+        - typeset
+        - frontend
+        - backend
+        - source-sync
+        - memory
+        - packaging
+        - other
+    validations:
+      required: true
+  - type: input
+    id: page-region
+    attributes:
+      label: Page / region
+      description: Include page number and region id when the bug is region-specific.
+      placeholder: "page 6, R-01"
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Artifacts
+      description: Attach screenshots, report.json, cleanup lab output, logs, or sample state as appropriate.
+  - type: textarea
+    id: config
+    attributes:
+      label: Config profile
+      description: Include relevant model_config fields without secrets.

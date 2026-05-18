@@ -94,12 +94,15 @@ class ModelConfig:
     cleanup_fallback_backend: str = "telea"
     cleanup_verbose_logs: bool = False
     cleanup_show_diagnostics: bool = False
-    cleanup_candidate_timeout_sec: int = 8
+    cleanup_candidate_timeout_sec: int = 30
     cleanup_iopaint_candidate_timeout_sec: int = 5
     cleanup_skip_unavailable_iopaint_candidate: bool = True
+    cleanup_mask_backend: str = "auto"
+    cleanup_force_enabled: bool = False
+    cleanup_status_enabled: bool = True
 
     # Optional SAM2 mask assist. SAM2 is never used as an inpainting backend;
-    # it only proposes masks for the existing manual cleanup flow.
+    # it only proposes cleanup masks for the existing cleanup route.
     sam2_enabled: bool = True
     sam2_load_mode: str = "lazy"
     sam2_required: bool = False

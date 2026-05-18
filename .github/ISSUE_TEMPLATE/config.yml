@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Cleanup lab documentation
+    url: https://github.com/AFutureProgrammer/manhwaLocaliser/blob/main/tools/cleanup_lab/README.md
+    about: Use this when attaching cleanup artifacts or report.json output.

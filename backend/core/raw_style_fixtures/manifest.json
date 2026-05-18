@@ -1,0 +1,204 @@
+{
+  "description": "Cropped synthetic RAW-style fixtures for deterministic LocalizerEngine RAW match QA tests.",
+  "fixtures": [
+    {
+      "id": "plain_dialogue",
+      "file": "plain_dialogue.png",
+      "bbox": [
+        20,
+        20,
+        220,
+        100
+      ],
+      "role": "dialog",
+      "kind": "PLAIN_BUBBLE",
+      "expect_status": [
+        "high"
+      ],
+      "expect_matched": [
+        "fill"
+      ],
+      "expect_reasons_any": [],
+      "expect_auto_apply": true,
+      "expect_proposal_only": false
+    },
+    {
+      "id": "black_outline",
+      "file": "black_outline.png",
+      "bbox": [
+        20,
+        20,
+        220,
+        100
+      ],
+      "role": "dialog",
+      "kind": "PLAIN_BUBBLE",
+      "expect_status": [
+        "high",
+        "medium"
+      ],
+      "expect_matched": [
+        "fill"
+      ],
+      "expect_reasons_any": [],
+      "expect_auto_apply": false,
+      "expect_proposal_only": false
+    },
+    {
+      "id": "colored_outline",
+      "file": "colored_outline.png",
+      "bbox": [
+        20,
+        20,
+        220,
+        100
+      ],
+      "role": "dialog",
+      "kind": "PLAIN_BUBBLE",
+      "expect_status": [
+        "high",
+        "medium"
+      ],
+      "expect_matched": [
+        "fill"
+      ],
+      "expect_reasons_any": [],
+      "expect_auto_apply": false,
+      "expect_proposal_only": false
+    },
+    {
+      "id": "shadow",
+      "file": "shadow.png",
+      "bbox": [
+        20,
+        20,
+        220,
+        100
+      ],
+      "role": "dialog",
+      "kind": "PLAIN_BUBBLE",
+      "expect_status": [
+        "high",
+        "medium"
+      ],
+      "expect_matched": [
+        "fill"
+      ],
+      "expect_reasons_any": [],
+      "expect_auto_apply": false,
+      "expect_proposal_only": false
+    },
+    {
+      "id": "glow",
+      "file": "glow.png",
+      "bbox": [
+        20,
+        20,
+        220,
+        100
+      ],
+      "role": "dialog",
+      "kind": "PLAIN_BUBBLE",
+      "expect_status": [
+        "high",
+        "medium"
+      ],
+      "expect_matched": [
+        "fill"
+      ],
+      "expect_reasons_any": [],
+      "expect_auto_apply": false,
+      "expect_proposal_only": false
+    },
+    {
+      "id": "gradient",
+      "file": "gradient.png",
+      "bbox": [
+        20,
+        20,
+        220,
+        100
+      ],
+      "role": "dialog",
+      "kind": "PLAIN_BUBBLE",
+      "expect_status": [
+        "high",
+        "medium"
+      ],
+      "expect_matched": [
+        "fill"
+      ],
+      "expect_reasons_any": [],
+      "expect_auto_apply": true,
+      "expect_proposal_only": false
+    },
+    {
+      "id": "noisy_low_contrast",
+      "file": "noisy_low_contrast.png",
+      "bbox": [
+        20,
+        20,
+        220,
+        100
+      ],
+      "role": "dialog",
+      "kind": "PLAIN_BUBBLE",
+      "expect_status": [
+        "medium",
+        "fallback"
+      ],
+      "expect_matched": [],
+      "expect_reasons_any": [
+        "noisy_background",
+        "low_contrast",
+        "insufficient_glyph_pixels"
+      ],
+      "expect_auto_apply": false,
+      "expect_proposal_only": false
+    },
+    {
+      "id": "mixed_styles",
+      "file": "mixed_styles.png",
+      "bbox": [
+        20,
+        20,
+        220,
+        100
+      ],
+      "role": "dialog",
+      "kind": "PLAIN_BUBBLE",
+      "expect_status": [
+        "medium",
+        "fallback"
+      ],
+      "expect_matched": [],
+      "expect_reasons_any": [
+        "mixed_styles"
+      ],
+      "expect_auto_apply": false,
+      "expect_proposal_only": false
+    },
+    {
+      "id": "sfx_text_over_art",
+      "file": "sfx_text_over_art.png",
+      "bbox": [
+        20,
+        20,
+        220,
+        100
+      ],
+      "role": "sfx",
+      "kind": "SFX_OVER_ART",
+      "expect_status": [
+        "medium",
+        "fallback"
+      ],
+      "expect_matched": [],
+      "expect_reasons_any": [
+        "unsafe_role"
+      ],
+      "expect_auto_apply": false,
+      "expect_proposal_only": true
+    }
+  ]
+}

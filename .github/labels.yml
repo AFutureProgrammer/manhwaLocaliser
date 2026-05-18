@@ -1,0 +1,57 @@
+- name: bug
+  color: d73a4a
+  description: Reproducible broken behavior.
+- name: feature
+  color: a2eeef
+  description: New or expanded behavior.
+- name: regression
+  color: b60205
+  description: Behavior that used to work and now fails.
+- name: cleanup
+  color: 1d76db
+  description: Cleanup, masking, inpainting, and cleanup QA.
+- name: ocr
+  color: 0e8a16
+  description: OCR extraction, confidence, and source text review.
+- name: translation
+  color: 5319e7
+  description: Translation, glossary, memory, and consistency.
+- name: typeset
+  color: fbca04
+  description: Rendering translated text and layout quality.
+- name: qa
+  color: c5def5
+  description: Review queues, reports, validation, or evaluation.
+- name: frontend
+  color: 006b75
+  description: React UI and editor behavior.
+- name: backend
+  color: 0052cc
+  description: Python engine, API, persistence, and pipeline code.
+- name: source-sync
+  color: 5319e7
+  description: Source providers, imports, and chapter sync.
+- name: memory
+  color: 7057ff
+  description: Series memory, glossary, names, and chapter TM.
+- name: test
+  color: 0e8a16
+  description: Test coverage, fixtures, and regression checks.
+- name: documentation
+  color: 0075ca
+  description: Docs, runbooks, and contributor guidance.
+- name: packaging
+  color: fef2c0
+  description: Release, installer, startup, and system checks.
+- name: p0
+  color: b60205
+  description: Highest priority.
+- name: p1
+  color: d93f0b
+  description: High priority.
+- name: p2
+  color: fbca04
+  description: Medium priority.
+- name: p3
+  color: cccccc
+  description: Lower priority.

@@ -1,0 +1,54 @@
+name: Regression
+description: Report behavior that used to work and now fails.
+title: "[Regression]: "
+labels: ["regression"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - cleanup
+        - OCR
+        - translation
+        - typeset
+        - frontend
+        - backend
+        - source-sync
+        - memory
+        - packaging
+        - test
+        - other
+    validations:
+      required: true
+  - type: input
+    id: last-good
+    attributes:
+      label: Last known good version or commit
+  - type: input
+    id: first-bad
+    attributes:
+      label: First known bad version or commit
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Evidence
+      description: Attach screenshots, report.json, logs, and sample state as needed.
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected previous behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Current behavior
+    validations:
+      required: true

@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -51,9 +52,36 @@ def _mixed_style_raw() -> np.ndarray:
 
 
 def _engine_with_raw(img: np.ndarray) -> LocalizerEngine:
-    engine = LocalizerEngine()
+    engine = LocalizerEngine.__new__(LocalizerEngine)
     engine._raw_cv = img
     return engine
+
+
+def _fixture_block(meta) -> OCRBlock:
+    x, y, w, h = [int(v) for v in meta["bbox"]]
+    block = OCRBlock(
+        text="테스트",
+        boxes=[[
+            [float(x), float(y)],
+            [float(x + w), float(y)],
+            [float(x + w), float(y + h)],
+            [float(x), float(y + h)],
+        ]],
+        confidence=0.95,
+        detector_source="fixture",
+        bubble_role=str(meta.get("role") or "dialog"),
+        region_kind=getattr(RegionKind, str(meta.get("kind") or "PLAIN_BUBBLE")),
+    )
+    block.bbox_override = (x, y, w, h)
+    block.bubble_bbox = (x, y, w, h)
+    return block
+
+
+def _raw_style_fixtures():
+    root = os.path.join(os.path.dirname(__file__), "raw_style_fixtures")
+    with open(os.path.join(root, "manifest.json"), "r", encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    return root, manifest["fixtures"]
 
 
 class RawStyleMatchingTests(unittest.TestCase):
@@ -103,6 +131,73 @@ class RawStyleMatchingTests(unittest.TestCase):
 
         self.assertIn("mixed_styles", match.get("downgrade_reasons", []))
         self.assertNotEqual(match.get("status"), "high")
+
+    def test_raw_style_fixture_manifest_regression(self) -> None:
+        root, fixtures = _raw_style_fixtures()
+
+        for meta in fixtures:
+            with self.subTest(meta["id"]):
+                img = cv2.imread(os.path.join(root, meta["file"]))
+                self.assertIsNotNone(img)
+                engine = _engine_with_raw(img)
+                block = _fixture_block(meta)
+
+                match = engine._analyze_raw_style_for_block(block, force=True)
+                self.assertIn(match.get("status"), set(meta.get("expect_status") or []))
+                for effect in meta.get("expect_matched") or []:
+                    self.assertIn(effect, match.get("matched", []))
+                expected_reasons = set(meta.get("expect_reasons_any") or [])
+                if expected_reasons:
+                    self.assertTrue(expected_reasons.intersection(set(match.get("downgrade_reasons", []))))
+                self.assertTrue(match.get("analysis_crop_signature"))
+                self.assertEqual(match.get("review_status"), "unreviewed")
+
+                qa = engine._raw_match_quality_summary(0, 0, block, img)
+                self.assertEqual(qa.get("status"), match.get("status"))
+                self.assertIn(qa.get("auto_state"), {"auto_applied", "proposed", "fallback"})
+
+                auto_applied = engine._auto_apply_raw_style_if_safe(block, force_analysis=True)
+                if meta.get("expect_auto_apply"):
+                    self.assertTrue(auto_applied)
+                    self.assertEqual(block.raw_style_match.get("auto_state"), "auto_applied")
+                else:
+                    self.assertFalse(auto_applied)
+                if meta.get("expect_proposal_only"):
+                    self.assertIn("unsafe_role", block.raw_style_match.get("downgrade_reasons", []))
+                    self.assertNotEqual(block.raw_style_match.get("auto_state"), "auto_applied")
+
+    def test_raw_review_metadata_and_stale_rematch_flow(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        img = _raw_dialogue()
+        Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).save(os.path.join(tmp.name, "000.png"))
+        mgr = ChapterManager()
+        self.assertEqual(mgr.load_from_folder(tmp.name), 1)
+        block = _region_block()
+        mgr.pages[0].regions = [block]
+        mgr.pages[0].translations = [""]
+        engine = LocalizerEngine()
+        engine.chapter_mgr = mgr
+        engine._load_page_into_working_state()
+
+        match = engine._analyze_raw_style_for_block(block, force=True)
+        self.assertTrue(match.get("analysis_crop_signature"))
+        bootstrap = engine.get_bootstrap()
+        self.assertIsNotNone(bootstrap["regions"][0].get("raw_match_qa"))
+
+        engine.update_region_field(0, "raw_review_status", "accepted")
+        self.assertEqual(block.raw_style_match.get("review_status"), "accepted")
+        self.assertFalse(block.raw_style_match.get("needs_review"))
+
+        engine.update_region_bbox(0, 35, 30, 170, 70)
+        self.assertTrue(block.raw_style_match.get("analysis_crop_signature_stale"))
+        self.assertEqual(block.raw_style_match.get("review_status"), "unreviewed")
+        stale_bootstrap = engine.get_bootstrap()
+        self.assertTrue(any(issue.get("kind") == "raw_match_qa" for issue in stale_bootstrap["issues"]))
+
+        engine.update_region_field(0, "rematch_stale_raw_styles", True)
+        self.assertFalse(block.raw_style_match.get("analysis_crop_signature_stale"))
+        self.assertTrue(block.raw_style_match.get("analysis_crop_signature"))
 
     def test_geometry_and_rotation_do_not_create_typeset_override(self) -> None:
         tmp = tempfile.TemporaryDirectory()

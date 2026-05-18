@@ -1,5 +1,5 @@
 @echo off
-set "DEEPSEEK_API_KEY=sk-f4a611dc64e94f6587ef1ccd169ee38a"
+set "DEEPSEEK_API_KEY=sk-22497600591844cab54cef7ec091d48a"
 
 start cmd /k "cd frontend && npm run dev"
 timeout /t 5

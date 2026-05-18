@@ -865,6 +865,203 @@ class LocalizerEngine:
             "style": style.to_dict(),
         }
 
+    def _raw_style_crop_signature_for_block(self, block: OCRBlock, raw_cv: Optional[np.ndarray] = None) -> str:
+        raw = raw_cv if raw_cv is not None else self._raw_cv
+        if raw is None:
+            return ""
+        try:
+            x, y, w, h = block.bbox()
+            x1 = max(0, int(x)); y1 = max(0, int(y))
+            x2 = min(raw.shape[1], int(x + w)); y2 = min(raw.shape[0], int(y + h))
+            if x2 <= x1 or y2 <= y1:
+                return ""
+            crop = raw[y1:y2, x1:x2]
+            hasher = hashlib.sha1()
+            hasher.update(f"{x1}:{y1}:{x2 - x1}:{y2 - y1}:".encode("ascii"))
+            hasher.update(crop.tobytes())
+            return hasher.hexdigest()[:20]
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _raw_style_review_status(match: Dict[str, Any]) -> str:
+        status = str(match.get("review_status", "unreviewed") or "unreviewed").lower()
+        return status if status in {"unreviewed", "accepted", "rejected"} else "unreviewed"
+
+    @staticmethod
+    def _raw_style_optional_ignored(ignored: List[str]) -> List[str]:
+        optional: List[str] = []
+        for item in ignored:
+            text = str(item or "")
+            low = text.lower()
+            if "no distinct outline" in low or "no consistent offset" in low or "no consistent halo" in low:
+                continue
+            if "weak_gradient" in low:
+                continue
+            if any(token in low for token in ("outline:", "shadow:", "glow:", "gradient:", "effects:", "weak_gradient", "ambiguous")):
+                optional.append(text)
+        return optional
+
+    def _decorate_raw_style_match(
+        self,
+        block: OCRBlock,
+        match: Dict[str, Any],
+        raw_cv: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        decorated = dict(match or {})
+        role = str(getattr(block, "bubble_role", "dialog") or "dialog").lower()
+        kind = str(getattr(getattr(block, "region_kind", None), "name", "") or "")
+        status = str(decorated.get("status", "fallback") or "fallback").lower()
+        matched = [str(v) for v in (decorated.get("matched") or []) if str(v)]
+        ignored = [str(v) for v in (decorated.get("ignored") or []) if str(v)]
+        downgrades = sorted({str(v) for v in (decorated.get("downgrade_reasons") or []) if str(v)})
+        current_signature = self._raw_style_crop_signature_for_block(block, raw_cv)
+        stored_signature = str(decorated.get("analysis_crop_signature") or "")
+        stale = bool(decorated.get("analysis_crop_signature_stale"))
+        if stored_signature and current_signature and stored_signature != current_signature:
+            stale = True
+            decorated.setdefault("stale_reason", "crop_changed")
+        optional_ignored = self._raw_style_optional_ignored(ignored)
+        unsafe_role = role in {"sfx", "sound"} or kind in {"SFX_OVER_ART", "DIALOGUE_OVER_ART"}
+        review_status = self._raw_style_review_status(decorated)
+        fallback_reason = ""
+        if status == "fallback":
+            fallback_reason = downgrades[0] if downgrades else (ignored[0] if ignored else "fallback")
+        review_downgrades = [reason for reason in downgrades if reason != "weak_gradient"]
+        auto_state = (
+            "fallback" if status == "fallback"
+            else ("auto_applied" if bool(decorated.get("auto_applied", False)) else "proposed")
+        )
+        needs_review = (
+            status in {"medium", "low", "fallback"}
+            or bool(review_downgrades)
+            or bool(optional_ignored)
+            or unsafe_role
+            or stale
+            or review_status == "rejected"
+        )
+        if review_status == "accepted" and not stale:
+            needs_review = False
+        decorated.update({
+            "status": status,
+            "role": role,
+            "category": kind or role or "dialog",
+            "matched": matched,
+            "ignored": ignored,
+            "downgrade_reasons": downgrades,
+            "review_status": review_status,
+            "review_note": str(decorated.get("review_note", "") or ""),
+            "analysis_crop_signature": stored_signature or current_signature,
+            "analysis_crop_signature_stale": bool(stale),
+            "needs_review": bool(needs_review),
+            "optional_effects_ignored": optional_ignored,
+            "auto_state": auto_state,
+            "fallback_reason": fallback_reason,
+        })
+        return decorated
+
+    def _finalize_raw_style_match(
+        self,
+        block: OCRBlock,
+        match: Dict[str, Any],
+        existing: Optional[Dict[str, Any]] = None,
+        crop_signature: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        previous = existing if isinstance(existing, dict) else {}
+        review_status = self._raw_style_review_status(previous)
+        if bool(previous.get("analysis_crop_signature_stale")):
+            review_status = "unreviewed"
+        match["review_status"] = review_status
+        match["review_note"] = str(previous.get("review_note", "") or "")
+        if crop_signature is None:
+            crop_signature = self._raw_style_crop_signature_for_block(block)
+        if crop_signature:
+            match["analysis_crop_signature"] = crop_signature
+        match["analysis_crop_signature_stale"] = False
+        match.pop("stale_reason", None)
+        match = self._decorate_raw_style_match(block, match)
+        block.raw_style_match = match
+        return match
+
+    def _mark_raw_style_match_stale(self, block: OCRBlock, reason: str = "crop_changed") -> None:
+        match = getattr(block, "raw_style_match", {}) or {}
+        if not isinstance(match, dict) or not match:
+            return
+        match = dict(match)
+        match["analysis_crop_signature_stale"] = True
+        match["stale_reason"] = reason
+        match["review_status"] = "unreviewed"
+        match["needs_review"] = True
+        block.raw_style_match = match
+
+    def _raw_match_quality_summary(
+        self,
+        page_idx: int,
+        idx: int,
+        block: OCRBlock,
+        raw_cv: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        match = self._decorate_raw_style_match(block, getattr(block, "raw_style_match", {}) or {}, raw_cv)
+        status = str(match.get("status", "fallback") or "fallback")
+        downgrades = [str(v) for v in (match.get("downgrade_reasons") or []) if str(v)]
+        fallback_reason = str(match.get("fallback_reason", "") or "")
+        readable = status in {"high", "medium"} and "low_contrast" not in downgrades
+        return {
+            "region_id": f"r{idx+1}",
+            "region_label": f"R-{idx+1:02d}",
+            "region_idx": int(idx),
+            "page": int(page_idx) + 1,
+            "role": str(match.get("role", "") or getattr(block, "bubble_role", "dialog") or "dialog"),
+            "category": str(match.get("category", "") or ""),
+            "status": status,
+            "auto_state": str(match.get("auto_state", "") or "fallback"),
+            "auto_applied": bool(match.get("auto_applied", False)),
+            "matched_effects": list(match.get("matched") or []),
+            "downgrade_reasons": downgrades,
+            "ignored_effects": list(match.get("optional_effects_ignored") or []),
+            "needs_review": bool(match.get("needs_review", False)),
+            "review_status": str(match.get("review_status", "unreviewed") or "unreviewed"),
+            "review_note": str(match.get("review_note", "") or ""),
+            "readable": bool(readable),
+            "fallback_reason": fallback_reason,
+            "raw_style_match": match,
+        }
+
+    def _raw_cv_for_page(self, page_idx: int) -> Optional[np.ndarray]:
+        try:
+            active = int(getattr(self.chapter_mgr, "current_idx", 0) or 0)
+            if page_idx == active and self._raw_cv is not None:
+                return self._raw_cv
+        except Exception:
+            return None
+        return None
+
+    def _raw_style_bootstrap_payload(
+        self,
+        page_idx: int,
+        idx: int,
+        block: OCRBlock,
+        raw_cv: Optional[np.ndarray] = None,
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        match = getattr(block, "raw_style_match", {}) or {}
+        if not isinstance(match, dict) or not match:
+            return {}, None
+        raw = raw_cv if raw_cv is not None else self._raw_cv_for_page(page_idx)
+        decorated = self._decorate_raw_style_match(block, match, raw)
+        block.raw_style_match = decorated
+        return decorated, self._raw_match_quality_summary(page_idx, idx, block, raw)
+
+    @staticmethod
+    def _raw_match_issue_message(raw_qa: Dict[str, Any]) -> str:
+        status = str(raw_qa.get("status", "fallback") or "fallback")
+        auto_state = str(raw_qa.get("auto_state", "") or "fallback")
+        reasons = [str(v) for v in (raw_qa.get("downgrade_reasons") or []) if str(v)]
+        if not reasons:
+            reason = str(raw_qa.get("fallback_reason", "") or "")
+            reasons = [reason] if reason else []
+        suffix = f" ({', '.join(reasons[:2])})" if reasons else ""
+        return f"RAW match needs review: {status} / {auto_state}{suffix}"
+
     @staticmethod
     def _style_allows_raw_auto(block: OCRBlock) -> bool:
         style = getattr(block, "style", None)
@@ -887,6 +1084,8 @@ class LocalizerEngine:
         match = self._analyze_raw_style_for_block(block, force=force_analysis)
         if match.get("status") != "high":
             return False
+        if bool(match.get("analysis_crop_signature_stale", False)) or self._raw_style_review_status(match) == "rejected":
+            return False
         if not self._raw_auto_role_allowed(block):
             return False
         if not self._style_allows_raw_auto(block):
@@ -897,19 +1096,21 @@ class LocalizerEngine:
         block.style = TextStyle.from_dict(style_data)
         block.style.source = "raw:auto"
         match["auto_applied"] = True
-        block.raw_style_match = match
+        block.raw_style_match = self._decorate_raw_style_match(block, match)
         return True
 
     def _analyze_raw_style_for_block(self, block: OCRBlock, force: bool = False) -> Dict[str, Any]:
         existing = getattr(block, "raw_style_match", {}) or {}
         if existing and not force:
-            return existing
-        if self._raw_cv is None:
-            match = {"status": "fallback", "summary": "RAW unavailable; using readable defaults", "matched": [], "ignored": ["raw image unavailable"], "downgrade_reasons": ["raw_unavailable"]}
+            match = self._decorate_raw_style_match(block, existing)
             block.raw_style_match = match
             return match
+        if self._raw_cv is None:
+            match = {"status": "fallback", "summary": "RAW unavailable; using readable defaults", "matched": [], "ignored": ["raw image unavailable"], "downgrade_reasons": ["raw_unavailable"]}
+            return self._finalize_raw_style_match(block, match, existing)
 
         try:
+            crop_signature = self._raw_style_crop_signature_for_block(block)
             mask = build_text_mask_for_block(self._raw_cv.shape, block, pad=0)
             x, y, w, h = block.bbox()
             x1 = max(0, int(x)); y1 = max(0, int(y))
@@ -1206,12 +1407,10 @@ class LocalizerEngine:
             match["confidence"] = confidence
             match["downgrade_reasons"] = sorted(set(downgrade_reasons))
             match["auto_applied"] = False
-            block.raw_style_match = match
-            return match
+            return self._finalize_raw_style_match(block, match, existing, crop_signature)
         except Exception as exc:
             match = {"status": "fallback", "summary": "RAW style match failed; using readable defaults", "matched": [], "ignored": [str(exc)], "downgrade_reasons": ["analysis_error"]}
-            block.raw_style_match = match
-            return match
+            return self._finalize_raw_style_match(block, match, existing)
 
     def _apply_raw_style_match(self, block: OCRBlock) -> bool:
         match = self._analyze_raw_style_for_block(block, force=False)
@@ -1221,7 +1420,7 @@ class LocalizerEngine:
         block.style = TextStyle.from_dict(style_data)
         block.style.source = "manual"
         match["auto_applied"] = False
-        block.raw_style_match = match
+        block.raw_style_match = self._decorate_raw_style_match(block, match)
         return True
 
     def _load_page_into_working_state(self) -> None:
@@ -1695,6 +1894,8 @@ class LocalizerEngine:
         block.page_local_bboxes = {int(k): tuple(int(v) for v in val) for k, val in local.items()}
         if not self._recompute_cross_page_from_local_bboxes(block):
             self._touch_region_geometry(block, bbox)
+        else:
+            self._mark_raw_style_match_stale(block, "crop_changed")
 
     def _ocr_composite_crop(self, crop: np.ndarray, group_id: str) -> str:
         if crop.size == 0:
@@ -5369,6 +5570,14 @@ class LocalizerEngine:
         heuristic = heuristic_localize_line(kr)
         if heuristic:
             return heuristic
+        provider = str(getattr(self.model_config, "translation_provider", "ollama") or "ollama").lower()
+        if provider == "deepseek":
+            try:
+                result = self._translate_texts_deepseek([kr], page_idx=0)
+                return str(result[0] or "") if result else ""
+            except Exception as exc:
+                debug_print(f"[translate] deepseek repair region={region_idx} failed={exc}")
+                return ""
         region_prefix = self._build_region_prefix(
             batch_ctx if batch_ctx is not None else self._last_batch_ctx,
             region_idx,
@@ -5439,7 +5648,7 @@ class LocalizerEngine:
         batch_ctx     = self._retrieve_batch_context(active_texts)
         self._last_batch_ctx = batch_ctx
         prompt_prefix = self._build_prompt_prefix(batch_ctx)
-        fallback = bool(getattr(self.model_config, "deepseek_fallback_to_ollama", True))
+        fallback = _config_bool(getattr(self.model_config, "deepseek_fallback_to_ollama", True))
         try:
             raw = _ds_translate(active_texts, config=self.model_config, prompt_prefix=prompt_prefix)
             # Map DeepSeek results back to original slot positions.
@@ -5970,6 +6179,23 @@ class LocalizerEngine:
             f"Run All stopped: Page {page_idx + 1} has OCR text but no translation "
             f"for region(s) {region_list}{suffix}."
         )
+
+    def _mark_missing_required_translations(self, page_idx: int, missing: List[int]) -> None:
+        for idx in missing:
+            while len(self._translations) <= idx:
+                self._translations.append("")
+            if 0 <= idx < len(self._regions):
+                block = self._regions[idx]
+                if hasattr(block, "flag"):
+                    block.flag(
+                        "empty_translation",
+                        {
+                            "page": int(page_idx) + 1,
+                            "stage": "run_all",
+                            "reason": "translation_missing_after_retry",
+                        },
+                    )
+        self._flag_translations(missing)
 
     def typeset_current_page(self) -> dict:
         page = self.chapter_mgr.current_page
@@ -7554,10 +7780,32 @@ class LocalizerEngine:
                     self._set_progress(running=True, job="run_all", stage="translate", page_idx=idx, page_total=total, updated_pages=[])
                     self._notify(f"Run All Translate: Page {idx + 1}/{total}...", idx, total)
                     self.go_to_page(idx)
-                    self.translate_current_page()
+                    try:
+                        self.translate_current_page()
+                    except RuntimeError as exc:
+                        if not str(exc).startswith("Translation failed:"):
+                            raise
+                        missing_translations = self._missing_required_translation_indices()
+                        if not missing_translations:
+                            raise
+                        self._mark_missing_required_translations(idx, missing_translations)
+                        self._flush_working_state_to_page()
+                        self._notify(
+                            f"Run All Translate: Page {idx + 1}/{total} has missing translation(s); flagged for review.",
+                            idx + 1,
+                            total,
+                            updated_pages=[idx],
+                        )
                     missing_translations = self._missing_required_translation_indices()
                     if missing_translations:
-                        self._raise_missing_required_translation(idx, missing_translations)
+                        self._mark_missing_required_translations(idx, missing_translations)
+                        self._flush_working_state_to_page()
+                        self._notify(
+                            f"Run All Translate: Page {idx + 1}/{total} has missing translation(s); continuing.",
+                            idx + 1,
+                            total,
+                            updated_pages=[idx],
+                        )
                     self._notify(f"Run All Translate: checkpointing page {idx + 1}/{total}...", idx + 1, total)
                     self.chapter_mgr.save_state()
                     mark_checkpoint("translate", idx)
@@ -7581,7 +7829,8 @@ class LocalizerEngine:
                     if page is not None and translations is not None and not any(t and t.strip() for t in translations):
                         missing_translations = self._missing_required_translation_indices()
                         if missing_translations:
-                            self._raise_missing_required_translation(idx, missing_translations)
+                            self._mark_missing_required_translations(idx, missing_translations)
+                            self._flush_working_state_to_page()
                         base_cv = page.cleaned_cv if page.cleaned_cv is not None else self._raw_cv
                         if base_cv is not None:
                             page.typeset_pil = Image.fromarray(cv2.cvtColor(base_cv, cv2.COLOR_BGR2RGB))
@@ -7741,6 +7990,7 @@ class LocalizerEngine:
         block.safe_text_mask = None
         block.safe_center = None
         block.safe_rect = None
+        self._mark_raw_style_match_stale(block, "crop_changed")
         page_idx = int(getattr(self.chapter_mgr, "current_idx", 0) or 0)
         self._update_cross_page_metadata(block, page_idx, bbox)
         if self._raw_cv is not None and not bool(getattr(block, "cross_page", False)):
@@ -7799,7 +8049,14 @@ class LocalizerEngine:
         elif field == "style_preset":
             existing = ""
             next_value = str(value or "")
-        elif field in {"reset_style", "rematch_raw_style", "apply_raw_match", "reset_rotation", "reset_transform"}:
+        elif field == "raw_review_status":
+            existing = self._raw_style_review_status(getattr(block, "raw_style_match", {}) or {})
+            next_value = self._raw_style_review_status({"review_status": value})
+        elif field == "raw_review_note":
+            match = getattr(block, "raw_style_match", {}) or {}
+            existing = str(match.get("review_note", "") or "") if isinstance(match, dict) else ""
+            next_value = str(value or "")
+        elif field in {"reset_style", "rematch_raw_style", "apply_raw_match", "rematch_stale_raw_styles", "reset_rotation", "reset_transform"}:
             existing = object()
             next_value = str(value)
         elif field == "rotation_angle":
@@ -7906,6 +8163,23 @@ class LocalizerEngine:
                 self._analyze_raw_style_for_block(block, force=True)
                 self._apply_raw_style_match(block)
             self._invalidate_page_outputs(preserve_cleanup=True)
+        elif field == "raw_review_status":
+            match = getattr(block, "raw_style_match", {}) or {}
+            if isinstance(match, dict) and match:
+                match = dict(match)
+                match["review_status"] = self._raw_style_review_status({"review_status": value})
+                block.raw_style_match = self._decorate_raw_style_match(block, match)
+        elif field == "raw_review_note":
+            match = getattr(block, "raw_style_match", {}) or {}
+            if isinstance(match, dict) and match:
+                match = dict(match)
+                match["review_note"] = str(value or "")
+                block.raw_style_match = self._decorate_raw_style_match(block, match)
+        elif field == "rematch_stale_raw_styles":
+            for candidate in self._regions:
+                match = getattr(candidate, "raw_style_match", {}) or {}
+                if isinstance(match, dict) and match and bool(match.get("analysis_crop_signature_stale", False)):
+                    self._analyze_raw_style_for_block(candidate, force=True)
         elif field == "style_preset":
             preset = str(value or "")
             if preset == "reset_auto":
@@ -9376,6 +9650,7 @@ class LocalizerEngine:
         font_name = getattr(block, "font_name", "") or getattr(block, "bubble_role", "dialog") or "auto"
         style = block.effective_style() if hasattr(block, "effective_style") else None
         process_sfx = _config_bool(getattr(self.model_config, "process_sfx_regions", False))
+        raw_match, raw_qa = self._raw_style_bootstrap_payload(page_idx, idx, block)
         return {
             "id":      rid,
             "label":   f"R-{idx+1:02d}",
@@ -9412,7 +9687,8 @@ class LocalizerEngine:
             "gradient_angle": int(getattr(style, "gradient_angle", 90) if style else 90),
             "rotation_angle": float(getattr(block, "rotation_angle", 0.0) or 0.0),
             "style_source": str(getattr(style, "source", "auto") if style else "auto"),
-            "raw_style_match": getattr(block, "raw_style_match", {}) or {},
+            "raw_style_match": raw_match,
+            "raw_match_qa": raw_qa,
             "align":   getattr(block, "align", "center") or "center",
             "visible": bool(getattr(block, "visible", True)),
             "locked":  bool(getattr(block, "locked", False)),
@@ -9654,6 +9930,7 @@ class LocalizerEngine:
             label = f"R-{idx+1:02d}"
             font_name = getattr(block, "font_name", "") or getattr(block, "bubble_role", "dialog") or "auto"
             style = block.effective_style() if hasattr(block, "effective_style") else None
+            raw_match, raw_qa = self._raw_style_bootstrap_payload(active_page_idx, idx, block, self._raw_cv)
             region_entries.append({
                 "id":      rid,
                 "label":   label,
@@ -9690,7 +9967,8 @@ class LocalizerEngine:
                 "gradient_angle": int(getattr(style, "gradient_angle", 90) if style else 90),
                 "rotation_angle": float(getattr(block, "rotation_angle", 0.0) or 0.0),
                 "style_source": str(getattr(style, "source", "auto") if style else "auto"),
-                "raw_style_match": getattr(block, "raw_style_match", {}) or {},
+                "raw_style_match": raw_match,
+                "raw_match_qa": raw_qa,
                 "align":   getattr(block, "align", "center") or "center",
                 "visible": bool(getattr(block, "visible", True)),
                 "locked":  bool(getattr(block, "locked", False)),
@@ -9761,6 +10039,18 @@ class LocalizerEngine:
                     {"id": f"{rid}-cleanup", "type": "cleanup", "name": f"Cleanup – {idx+1}", "vis": True,  "locked": False},
                 ],
             })
+
+            if raw_qa and bool(raw_qa.get("needs_review", False)):
+                sev = "warn" if str(raw_qa.get("status", "")) in {"low", "fallback"} or raw_qa.get("review_status") == "rejected" else "info"
+                issues.append({
+                    "id": f"raw-match-qa-{idx+1}",
+                    "sev": sev,
+                    "msg": self._raw_match_issue_message(raw_qa),
+                    "region": label,
+                    "page": active_page_idx + 1,
+                    "kind": "raw_match_qa",
+                    "raw_match_qa": raw_qa,
+                })
 
             if bool(getattr(block, "typeset_overflow", False)):
                 issues.append({

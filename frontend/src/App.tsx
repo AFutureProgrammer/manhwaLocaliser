@@ -30,6 +30,7 @@ import type {
   Sam2MaskResponse,
   BrowseCard,
   Series,
+  RawMatchQa,
 } from "./types";
 import api, { onProgress, onBusyChange } from "./api";
 import { BrowseModal } from "./components/BrowseModal";
@@ -292,6 +293,24 @@ const GLOBAL_CSS = `
   .issue-item.info { border-left-color: var(--teal); }
   .issue-msg { font-size: 11.5px; color: var(--t2); line-height: 1.4; }
   .issue-ref { font-family: var(--fnt-mono); font-size: 9px; color: var(--t3); margin-top: 3px; }
+  .raw-qa-toolbar { display: flex; gap: 5px; padding: 8px 8px 6px; border-bottom: 1px solid var(--br-0); }
+  .raw-qa-filter { border: 1px solid var(--br-1); background: var(--bg-2); color: var(--t3); border-radius: var(--r); font-family: var(--fnt-mono); font-size: 9px; padding: 4px 6px; cursor: pointer; }
+  .raw-qa-filter.active { color: var(--accent); border-color: var(--accent-dim); background: var(--bg-4); }
+  .raw-qa-row { padding: 8px 10px; margin: 2px 6px; border-left: 2px solid var(--amr); border-radius: 0 var(--r) var(--r) 0; background: var(--bg-1); cursor: pointer; display: grid; gap: 5px; }
+  .raw-qa-row:hover { background: var(--bg-3); }
+  .raw-qa-row.ok { border-left-color: var(--teal); }
+  .raw-qa-row.cleanup { border-left-color: var(--blue); }
+  .raw-qa-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+  .raw-qa-title { font-family: var(--fnt-mono); font-size: 10px; color: var(--t1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .raw-qa-status { font-family: var(--fnt-mono); font-size: 9px; color: var(--t3); white-space: nowrap; }
+  .raw-qa-summary { font-size: 11px; color: var(--t2); line-height: 1.35; overflow-wrap: anywhere; }
+  .raw-qa-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+  .raw-qa-chip { border: 1px solid var(--br-1); border-radius: var(--r); color: var(--t3); background: var(--bg-0); font-family: var(--fnt-mono); font-size: 8.5px; padding: 2px 5px; }
+  .raw-qa-actions { display: flex; gap: 4px; flex-wrap: wrap; }
+  .raw-qa-actions .btn-ghost { padding: 4px 6px; font-size: 9px; }
+  .region-qa-badge { margin-left: 5px; padding: 1px 4px; border-radius: 2px; color: var(--bg-0); font-size: 8px; }
+  .region-raw-badge { background: var(--amr); }
+  .region-cleanup-badge { background: var(--blue); }
 
   .mem-list { display: flex; flex-direction: column; gap: 6px; padding: 0 10px 10px; }
   .mem-card { border: 1px solid var(--br-1); border-radius: var(--r2); background: var(--bg-2); padding: 7px; }
@@ -445,6 +464,24 @@ type BackendPreviewSprite = RegionPreviewSprite & {
      </span>
    );
  }
+const setCanvasImageMode = (mode: ImageMode) => {
+  window.dispatchEvent(new CustomEvent("ml:set-image-mode", { detail: mode }));
+};
+const cleanupReviewReasons = (region: Region): string[] => {
+  const reasons: string[] = [];
+  const status = String(region.cleanup_patch?.cleanup_status ?? region.cleanup_status ?? "").toLowerCase();
+  const reason = String(region.cleanup_patch?.cleanup_reason ?? region.cleanup_reason ?? "").toLowerCase();
+  const patch = region.cleanup_patch ?? null;
+  if (patch?.review_required) reasons.push("review_required");
+  if (patch?.fallback_error) reasons.push("fallback_error");
+  if ((region.cleanup_tier ?? 0) >= 2) reasons.push(`tier_${region.cleanup_tier}`);
+  if (status && !["ok", "applied", "done"].includes(status)) reasons.push(status);
+  if (reason && /(reject|unsafe|protect|disabled|manual|review|fallback|border|ratio|low_conf)/.test(reason)) {
+    reasons.push(reason.replace(/\s+/g, "_"));
+  }
+  return Array.from(new Set(reasons)).slice(0, 5);
+};
+const needsCleanupReview = (region: Region) => cleanupReviewReasons(region).length > 0;
 const EDITOR_DEBUG = (() => {
   try { return localStorage.getItem("manhwa.renderDebug") === "1"; }
   catch { return false; }
@@ -1513,6 +1550,8 @@ const ContinuousPage = ({
             const sprite = previewSprites[`${idx}:${region.id}`];
             const isLiveEdit = isSelected || Boolean(regionDrafts[region.id]) || dragBox?.id === region.id;
             const showLiveText = showOverlayBoxes && showEnglishOverlay && isLiveEdit && r.visible && Boolean(r.tl);
+            const rawNeedsReview = Boolean(r.raw_match_qa?.needs_review);
+            const cleanupNeedsReview = needsCleanupReview(r);
             return (
               <div
                 key={r.id}
@@ -1531,6 +1570,8 @@ const ContinuousPage = ({
               >
                 <div className={`region-label ${isSelected ? "gold" : "teal"}`}>
                   {r.label}{r.locked ? " · LOCK" : ""}
+                  {rawNeedsReview && <span className="region-qa-badge region-raw-badge" title="RAW match needs review">RAW</span>}
+                  {cleanupNeedsReview && <span className="region-qa-badge region-cleanup-badge" title={cleanupReviewReasons(r).join(" · ")}>CLN</span>}
                 </div>
                 {showLiveText && sprite?.b64 ? (
                   <img
@@ -2583,6 +2624,8 @@ const CanvasArea = ({
               const allowCssFallback = !expectsBackendSprite || Boolean(cssPreviewFallbacks[spriteSlot(r.id)]);
               const showChrome = showOverlayBoxes;
               const liveBox = dragPreview?.id === r.id ? dragPreview.bbox : r;
+              const rawNeedsReview = Boolean(r.raw_match_qa?.needs_review);
+              const cleanupNeedsReview = needsCleanupReview(r);
               return (
                 <div
                   key={r.id}
@@ -2613,6 +2656,8 @@ const CanvasArea = ({
                         ? ` · YOLO ${Math.round(r.detector_confidence * 100)}%`
                         : ""}
                       {r.locked ? " · LOCK" : ""}
+                      {rawNeedsReview && <span className="region-qa-badge region-raw-badge" title="RAW match needs review">RAW</span>}
+                      {cleanupNeedsReview && <span className="region-qa-badge region-cleanup-badge" title={cleanupReviewReasons(r).join(" · ")}>CLN</span>}
                     </div>
                   )}
                   {showEnglishOverlay && liveBackendSprite && (
@@ -3035,6 +3080,9 @@ const InspectorTab = ({
   const rawDowngrades = Array.isArray(rawMatch.downgrade_reasons) ? rawMatch.downgrade_reasons : [];
   const rawMatched = Array.isArray(rawMatch.matched) ? rawMatch.matched : [];
   const rawConfidence = rawMatch.confidence && typeof rawMatch.confidence === "object" ? rawMatch.confidence as Record<string, string> : {};
+  const rawQa = region?.raw_match_qa ?? null;
+  const rawAutoState = String(rawMatch.auto_state ?? rawQa?.auto_state ?? (rawMatch.auto_applied ? "auto_applied" : "proposed"));
+  const rawReviewStatus = String(rawMatch.review_status ?? rawQa?.review_status ?? "unreviewed");
   const previewAndCommit = (patch: RegionDraft, field: string, value: unknown) => {
     if (!region) return;
     onPreviewRegion(region.id, patch, { requestSprite: true, reason: "style_change" });
@@ -3104,18 +3152,21 @@ const InspectorTab = ({
               confidence: {Object.keys(rawConfidence).length ? Object.entries(rawConfidence).map(([k, v]) => `${k} ${v}`).join(" · ") : "not measured"}<br />
               downgrades: {rawDowngrades.length ? rawDowngrades.join(" · ") : "none"}<br />
               ignored: {rawIgnored.length ? rawIgnored.join(" · ") : "none"}<br />
-              auto: {rawMatch.auto_applied ? "applied" : "not applied"}<br />
+              auto: {rawAutoState}<br />
+              review: {rawReviewStatus}{rawMatch.analysis_crop_signature_stale ? " · stale crop" : ""}<br />
               source: {region.style_source ?? "auto"}
             </div>
             <div className="style-row">
               <button className="btn-ghost" onClick={() => onUpdateRegion(region.idx, "rematch_raw_style", true)}>Re-match RAW Style</button>
               <button className="btn-ghost" onClick={() => onUpdateRegion(region.idx, "apply_raw_match", true)}>Apply RAW Match</button>
               <button className="btn-ghost" onClick={() => onUpdateRegion(region.idx, "reset_style", true)}>Reset to Auto</button>
+              <button className="btn-ghost" onClick={() => onUpdateRegion(region.idx, "raw_review_status", "accepted")}>Mark Reviewed</button>
+              <button className="btn-ghost" onClick={() => onUpdateRegion(region.idx, "raw_review_status", "rejected")}>Reject Match</button>
             </div>
             <div className="style-row">
-              <button className="btn-ghost" onClick={() => window.dispatchEvent(new CustomEvent("ml:set-image-mode", { detail: "raw" }))}>RAW</button>
-              <button className="btn-ghost" onClick={() => window.dispatchEvent(new CustomEvent("ml:set-image-mode", { detail: "cleaned" }))}>Cleaned</button>
-              <button className="btn-ghost" onClick={() => window.dispatchEvent(new CustomEvent("ml:set-image-mode", { detail: "typeset" }))}>Typeset</button>
+              <button className="btn-ghost" onClick={() => setCanvasImageMode("raw")}>RAW</button>
+              <button className="btn-ghost" onClick={() => setCanvasImageMode("cleaned")}>Cleaned</button>
+              <button className="btn-ghost" onClick={() => setCanvasImageMode("typeset")}>Typeset</button>
             </div>
           </div>
         </div>
@@ -3884,21 +3935,125 @@ const LayersTab = ({
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  REVIEW TAB                                                                 */
 /* ─────────────────────────────────────────────────────────────────────────── */
-const ReviewTab = ({ issues }: { issues: Issue[] }) => (
-  <div style={{ overflowY: "auto", flex: 1 }}>
-    {issues.length === 0 ? (
-      <div className="empty-state"><div>✓</div><div>No issues</div></div>
-    ) : issues.map(iss => (
-      <div key={iss.id} className={`issue-item ${iss.sev}`}>
-        <div className="issue-msg">{iss.msg}</div>
-        <div className="issue-ref">
-          {iss.region && <span>{iss.region} · </span>}
-          Page {iss.page}
-        </div>
+type ReviewFilter = "raw_review" | "raw_all" | "cleanup" | "issues";
+
+const ReviewTab = ({
+  issues, regions, onSelectRegion, onUpdateRegion,
+}: {
+  issues: Issue[];
+  regions: Region[];
+  onSelectRegion: (region: Region) => void;
+  onUpdateRegion: (idx: number, field: string, value: unknown) => void;
+}) => {
+  const rawRegions = regions.filter(r => r.raw_match_qa);
+  const rawNeedsReview = rawRegions.filter(r => r.raw_match_qa?.needs_review);
+  const cleanupNeedsReview = regions.filter(needsCleanupReview);
+  const generalIssues = issues.filter(iss => iss.kind !== "raw_match_qa");
+  const [filter, setFilter] = useState<ReviewFilter>(rawNeedsReview.length ? "raw_review" : cleanupNeedsReview.length ? "cleanup" : "issues");
+  useEffect(() => {
+    if (filter === "issues" && rawNeedsReview.length > 0) setFilter("raw_review");
+    else if (filter === "issues" && cleanupNeedsReview.length > 0) setFilter("cleanup");
+  }, [filter, rawNeedsReview.length, cleanupNeedsReview.length]);
+  const visibleRaw = filter === "raw_all" ? rawRegions : rawNeedsReview;
+  const showRaw = filter === "raw_review" || filter === "raw_all";
+  const chipsFor = (qa: RawMatchQa) => {
+    const values = [
+      ...(qa.downgrade_reasons || []),
+      ...(qa.ignored_effects || []),
+      qa.review_status === "rejected" ? "rejected" : "",
+      qa.raw_style_match?.analysis_crop_signature_stale ? "stale_crop" : "",
+    ].filter(Boolean);
+    return values.length ? values.slice(0, 4) : [qa.readable ? "readable" : "readability"];
+  };
+  const jumpIssue = (iss: Issue) => {
+    const region = regions.find(r => r.label === iss.region);
+    if (region) onSelectRegion(region);
+  };
+  return (
+    <div style={{ overflowY: "auto", flex: 1 }}>
+      <div className="raw-qa-toolbar">
+        <button className={`raw-qa-filter ${filter === "raw_review" ? "active" : ""}`} onClick={() => setFilter("raw_review")}>RAW Review {rawNeedsReview.length}</button>
+        <button className={`raw-qa-filter ${filter === "raw_all" ? "active" : ""}`} onClick={() => setFilter("raw_all")}>RAW All {rawRegions.length}</button>
+        <button className={`raw-qa-filter ${filter === "cleanup" ? "active" : ""}`} onClick={() => setFilter("cleanup")}>Cleanup {cleanupNeedsReview.length}</button>
+        <button className={`raw-qa-filter ${filter === "issues" ? "active" : ""}`} onClick={() => setFilter("issues")}>Issues {generalIssues.length}</button>
       </div>
-    ))}
-  </div>
-);
+      {showRaw ? (
+        visibleRaw.length === 0 ? (
+          <div className="empty-state"><div>✓</div><div>No RAW review items</div></div>
+        ) : visibleRaw.map(region => {
+          const qa = region.raw_match_qa as RawMatchQa;
+          const match = qa.raw_style_match || region.raw_style_match || {};
+          return (
+            <div key={`raw-${region.id}`} className={`raw-qa-row ${qa.needs_review ? "" : "ok"}`} onClick={() => onSelectRegion(region)}>
+              <div className="raw-qa-head">
+                <div className="raw-qa-title">{region.label} · Page {qa.page}</div>
+                <div className="raw-qa-status">{qa.status} · {qa.auto_state}</div>
+              </div>
+              <div className="raw-qa-summary">{String(match.summary ?? "No RAW style summary")}</div>
+              <div className="raw-qa-chips">
+                {chipsFor(qa).map(chip => <span key={chip} className="raw-qa-chip">{chip}</span>)}
+              </div>
+              <div className="raw-qa-actions">
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onSelectRegion(region); }}>Jump</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("raw"); }}>RAW</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("cleaned"); }}>Cleaned</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("typeset"); }}>Typeset</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "apply_raw_match", true); }}>Apply</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "rematch_raw_style", true); }}>Re-match</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "reset_style", true); }}>Reset</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "raw_review_status", "accepted"); }}>Reviewed</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "raw_review_status", "rejected"); }}>Reject</button>
+              </div>
+            </div>
+          );
+        })
+      ) : filter === "cleanup" ? (
+        cleanupNeedsReview.length === 0 ? (
+          <div className="empty-state"><div>✓</div><div>No cleanup review items</div></div>
+        ) : cleanupNeedsReview.map(region => {
+          const reasons = cleanupReviewReasons(region);
+          const patch = region.cleanup_patch;
+          const status = patch?.cleanup_status || region.cleanup_status || "review";
+          const reason = patch?.cleanup_reason || region.cleanup_reason || patch?.fallback_error || reasons[0] || "";
+          return (
+            <div key={`cleanup-${region.id}`} className="raw-qa-row cleanup" onClick={() => onSelectRegion(region)}>
+              <div className="raw-qa-head">
+                <div className="raw-qa-title">{region.label} · Page {(region.source_page_idx ?? 0) + 1}</div>
+                <div className="raw-qa-status">{status}</div>
+              </div>
+              <div className="raw-qa-summary">
+                {reason || "Cleanup needs visual review."}
+                {patch?.strategy ? ` · ${patch.strategy}` : ""}
+                {patch?.inpaint_method ? ` / ${patch.inpaint_method}` : ""}
+              </div>
+              <div className="raw-qa-chips">
+                {reasons.map(chip => <span key={chip} className="raw-qa-chip">{chip}</span>)}
+              </div>
+              <div className="raw-qa-actions">
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onSelectRegion(region); }}>Jump</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("raw"); }}>RAW</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("cleaned"); }}>Cleaned</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("typeset"); }}>Typeset</button>
+              </div>
+            </div>
+          );
+        })
+      ) : (
+        generalIssues.length === 0 ? (
+          <div className="empty-state"><div>✓</div><div>No issues</div></div>
+        ) : generalIssues.map(iss => (
+          <div key={iss.id} className={`issue-item ${iss.sev}`} onClick={() => jumpIssue(iss)}>
+            <div className="issue-msg">{iss.msg}</div>
+            <div className="issue-ref">
+              {iss.region && <span>{iss.region} · </span>}
+              Page {iss.page}
+            </div>
+          </div>
+        ))
+      )}
+    </div>
+  );
+};
 
 const splitCsv = (value: string) =>
   value.split(",").map(v => v.trim()).filter(Boolean);
@@ -4191,7 +4346,7 @@ const RightPanel = ({
             onUpdateRegion={onUpdateRegion}
           />
         )}
-        {tab === "issues"    && <ReviewTab issues={issues} />}
+        {tab === "issues"    && <ReviewTab issues={issues} regions={data.regions} onSelectRegion={onSelectRegion} onUpdateRegion={onUpdateRegion} />}
         {tab === "memory"    && <MemoryTab data={data} region={region} onMemoryMutation={onMemoryMutation} />}
       </div>
     </div>
@@ -4221,6 +4376,10 @@ const StatusBar = ({
   const progressLabel = pipelineProgress?.job
     ? `${pipelineProgress.job === "run_all" ? "Run All" : pipelineProgress.job === "run_page" ? "Run Page" : pipelineProgress.job}: ${pipelineProgress.stage ?? "working"}${progressPage ? ` page ${progressPage} / ${progressTotal}` : ""}${progressRegion}`
     : "";
+  const rawQa = data.regions.map(r => r.raw_match_qa).filter((qa): qa is RawMatchQa => Boolean(qa));
+  const rawReviewCount = rawQa.filter(qa => qa.needs_review).length;
+  const rawOkCount = rawQa.length - rawReviewCount;
+  const cleanupReviewCount = data.regions.filter(needsCleanupReview).length;
   return (
     <div className="ml-statusbar no-select">
       <div className="sb-item">
@@ -4246,6 +4405,16 @@ const StatusBar = ({
           {data.issues.filter(i => i.sev !== "info").length}
         </span>
       </div>
+      {rawQa.length > 0 && (
+        <div className="sb-item">
+          RAW QA <span>{rawOkCount} ok</span>, <span style={{ color: rawReviewCount ? "var(--amr)" : "var(--t2)" }}>{rawReviewCount} review</span>
+        </div>
+      )}
+      {cleanupReviewCount > 0 && (
+        <div className="sb-item">
+          Cleanup <span style={{ color: "var(--amr)" }}>{cleanupReviewCount} review</span>
+        </div>
+      )}
       {selectedRegion && <div className="sb-item">Selected <span>{selectedRegion.label}</span></div>}
       <div style={{ flex: 1 }} />
       {data.meta.chapterDir && (

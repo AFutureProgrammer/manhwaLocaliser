@@ -247,6 +247,68 @@ def _assert_changed_pixels_within_mask(testcase, before, after, mask):
 
 
 class CleanupPipelineTests(unittest.TestCase):
+    def test_sam2_cleanup_mask_can_drive_planner(self):
+        img = _white_bubble_page()
+        block = _dialogue_block((40, 40, 180, 100))
+        sam_mask = np.zeros(img.shape[:2], np.uint8)
+        cv2.putText(sam_mask, "TEXT", (82, 99), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 255, 4, cv2.LINE_AA)
+        ok, buf = cv2.imencode(".png", sam_mask)
+        self.assertTrue(ok)
+        cfg = ModelConfig()
+        cfg.sam2_enabled = True
+        cfg.sam2_mask_mode = "cleanup_assist"
+        cfg.cleanup_mask_backend = "sam2"
+
+        with patch("backend.core.sam2_mask.propose_mask", return_value={
+            "ok": True,
+            "mask_b64": __import__("base64").b64encode(buf.tobytes()).decode("utf-8"),
+            "bbox": [0, 0, img.shape[1], img.shape[0]],
+            "confidence": 0.91,
+        }):
+            plan = build_cleanup_plan(img, block, page_index=0, region_id="R-01", model_config=cfg)
+
+        self.assertEqual(plan.debug_metrics.get("selected_text_mask_candidate_source"), "sam2")
+        self.assertTrue(plan.debug_metrics.get("sam2_mask_used"))
+        self.assertIsNotNone(plan.cleanup_mask)
+
+    def test_force_cleanup_falls_back_to_bbox_without_text_signal(self):
+        img = _white_bubble_page()
+        block = _dialogue_block((40, 40, 180, 100), text="")
+        cfg = ModelConfig()
+        cfg.sam2_enabled = False
+        cfg.cleanup_force_enabled = True
+
+        plan = build_cleanup_plan(img, block, page_index=0, region_id="R-01", model_config=cfg)
+
+        self.assertIsNotNone(plan.cleanup_mask)
+        self.assertNotIn(plan.cleanup_strategy, {"skip", "review"})
+        self.assertEqual(plan.skip_reason, "")
+        self.assertTrue(plan.debug_metrics.get("force_cleanup_no_text_signal"))
+
+    def test_textured_dark_caption_routes_to_model_backend(self):
+        img = _dark_caption_page(fill_bgr=(7, 3, 105))
+        block = OCRBlock(
+            text="테스트",
+            boxes=[],
+            confidence=0.9,
+            detector_source="yolo",
+            bubble_bbox=(40, 45, 180, 50),
+            bubble_mask=np.ones((50, 180), dtype=np.uint8) * 255,
+            bubble_role="thought",
+            region_kind=RegionKind.TEXTURED_BUBBLE,
+        )
+        block.bbox_override = (40, 45, 180, 50)
+        block.yolo_kind = "narration"
+        cfg = ModelConfig()
+        cfg.sam2_enabled = False
+        cfg.cleanup_backend = "lama_pt"
+
+        plan = build_cleanup_plan(img, block, page_index=0, region_id="R-01", model_config=cfg)
+
+        self.assertEqual(plan.debug_metrics.get("cleanup_route"), "model_inpaint_solid_bubble")
+        self.assertEqual(plan.cleanup_backend, "lama_pt")
+        self.assertTrue(plan.debug_metrics.get("model_inpaint_required"))
+
     def test_yolo_dialogue_without_qwen_text_skips_cleanup(self):
         img = _white_bubble_page()
         block = _dialogue_block((40, 40, 180, 100), text="")
@@ -1768,6 +1830,99 @@ class CleanupPipelineTests(unittest.TestCase):
                 ("detect", 1), ("ocr", 1), ("translate", 1), ("cleanup", 1), ("typeset", 1),
             ],
         )
+
+    def test_run_all_flags_missing_translation_and_continues(self):
+        engine = LocalizerEngine.__new__(LocalizerEngine)
+        calls = []
+        block = _dialogue_block((40, 40, 180, 100), text="테스트")
+        page = ChapterPage(image_path="p0.png")
+        page.regions = [block]
+        page.translations = [""]
+        chapter_mgr = SimpleNamespace(
+            pages=[page],
+            current_page=page,
+            current_idx=0,
+            total_pages=lambda: 1,
+            save_state=lambda: None,
+            save_run_all_checkpoint=lambda checkpoint: None,
+            clear_run_all_checkpoint=lambda: None,
+        )
+        engine.chapter_mgr = chapter_mgr
+        engine.model_config = ModelConfig()
+        engine._raw_cv = _white_bubble_page()
+        engine._regions = page.regions
+        engine._translations = page.translations
+        engine._progress_ctx = {}
+        engine._active_op_depth = 0
+        engine._active_ops = set()
+        engine._notify = lambda *args, **kwargs: None
+        engine._set_progress = lambda **updates: engine._progress_ctx.update(updates)
+        engine._begin_active_operation = lambda name: None
+        engine._end_active_operation = lambda name: None
+        engine._flush_working_state_to_page = lambda: setattr(page, "translations", list(engine._translations))
+        engine.get_bootstrap = lambda: {"ok": True}
+        engine.go_to_page = lambda idx: calls.append(("go", idx))
+        engine.detect_current_page = lambda: calls.append(("detect", 0)) or {"ok": True}
+        engine.ocr_current_page = lambda: calls.append(("ocr", 0)) or {"ok": True}
+        engine.translate_current_page = lambda: calls.append(("translate", 0)) or {"ok": True}
+        engine.cleanup_current_page = lambda: calls.append(("cleanup", 0)) or {"ok": True}
+        engine.typeset_current_page = lambda: calls.append(("typeset", 0)) or {"ok": True}
+
+        resp = engine._run_all_steps_from(None, 0)
+
+        self.assertTrue(resp["ok"])
+        self.assertIn(("cleanup", 0), calls)
+        self.assertIsNotNone(page.typeset_pil)
+        self.assertTrue(block.is_flagged)
+        self.assertEqual(block.review.flag_reason, "empty_translation")
+
+    def test_run_all_catches_translate_empty_failure_and_continues(self):
+        engine = LocalizerEngine.__new__(LocalizerEngine)
+        calls = []
+        block = _dialogue_block((40, 40, 180, 100), text="테스트")
+        page = ChapterPage(image_path="p0.png")
+        page.regions = [block]
+        page.translations = [""]
+        chapter_mgr = SimpleNamespace(
+            pages=[page],
+            current_page=page,
+            current_idx=0,
+            total_pages=lambda: 1,
+            save_state=lambda: None,
+            save_run_all_checkpoint=lambda checkpoint: None,
+            clear_run_all_checkpoint=lambda: None,
+        )
+        engine.chapter_mgr = chapter_mgr
+        engine.model_config = ModelConfig()
+        engine._raw_cv = _white_bubble_page()
+        engine._regions = page.regions
+        engine._translations = page.translations
+        engine._progress_ctx = {}
+        engine._active_op_depth = 0
+        engine._active_ops = set()
+        engine._notify = lambda *args, **kwargs: None
+        engine._set_progress = lambda **updates: engine._progress_ctx.update(updates)
+        engine._begin_active_operation = lambda name: None
+        engine._end_active_operation = lambda name: None
+        engine._flush_working_state_to_page = lambda: setattr(page, "translations", list(engine._translations))
+        engine.get_bootstrap = lambda: {"ok": True}
+        engine.go_to_page = lambda idx: calls.append(("go", idx))
+        engine.detect_current_page = lambda: calls.append(("detect", 0)) or {"ok": True}
+        engine.ocr_current_page = lambda: calls.append(("ocr", 0)) or {"ok": True}
+        def fail_translate():
+            calls.append(("translate", 0))
+            raise RuntimeError("Translation failed: OCR text exists but translation is empty for region(s) 1.")
+        engine.translate_current_page = fail_translate
+        engine.cleanup_current_page = lambda: calls.append(("cleanup", 0)) or {"ok": True}
+        engine.typeset_current_page = lambda: calls.append(("typeset", 0)) or {"ok": True}
+
+        resp = engine._run_all_steps_from(None, 0)
+
+        self.assertTrue(resp["ok"])
+        self.assertIn(("cleanup", 0), calls)
+        self.assertIsNotNone(page.typeset_pil)
+        self.assertTrue(block.is_flagged)
+        self.assertEqual(block.review.flag_reason, "empty_translation")
 
     def test_sfx_font_fallback_uses_bold_when_primary_fails_sanity(self):
         calls = []

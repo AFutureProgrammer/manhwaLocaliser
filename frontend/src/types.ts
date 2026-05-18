@@ -49,6 +49,7 @@ export interface Region {
   rotation_angle?: number;
   style_source?: string;
   raw_style_match?: RawStyleMatch;
+  raw_match_qa?: RawMatchQa | null;
   align:   "left" | "center" | "right";
   visible: boolean;
   locked:  boolean;
@@ -350,6 +351,8 @@ export interface Issue {
   msg:    string;
   region: string | null;
   page:   number;
+  kind?:  string;
+  raw_match_qa?: RawMatchQa;
 }
 
 export interface MetaSettings {
@@ -448,10 +451,40 @@ export interface RawStyleMatch {
   matched?: string[];
   ignored?: string[];
   downgrade_reasons?: string[];
+  optional_effects_ignored?: string[];
   role?: string;
+  category?: string;
   confidence?: Record<string, string>;
   auto_applied?: boolean;
+  auto_state?: "auto_applied" | "proposed" | "fallback" | string;
+  needs_review?: boolean;
+  review_status?: "unreviewed" | "accepted" | "rejected" | string;
+  review_note?: string;
+  analysis_crop_signature?: string;
+  analysis_crop_signature_stale?: boolean;
+  fallback_reason?: string;
   style?: Record<string, unknown>;
+}
+
+export interface RawMatchQa {
+  region_id: string;
+  region_label: string;
+  region_idx: number;
+  page: number;
+  role?: string;
+  category?: string;
+  status: string;
+  auto_state: string;
+  auto_applied: boolean;
+  matched_effects: string[];
+  downgrade_reasons: string[];
+  ignored_effects: string[];
+  needs_review: boolean;
+  review_status: string;
+  review_note: string;
+  readable: boolean;
+  fallback_reason: string;
+  raw_style_match: RawStyleMatch;
 }
 
 // API response wrapper — every api.* call returns this

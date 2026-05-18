@@ -1,0 +1,56 @@
+name: Cleanup failure
+description: Report a cleanup, mask, inpaint, or cleanup QA failure.
+title: "[Cleanup]: "
+labels: ["cleanup", "qa"]
+body:
+  - type: input
+    id: page-region
+    attributes:
+      label: Page / region
+      placeholder: "page 6, R-01"
+    validations:
+      required: true
+  - type: dropdown
+    id: failure-class
+    attributes:
+      label: Suspected failure class
+      options:
+        - bad_text_mask
+        - bad_container_mask
+        - unsafe_mask_rejection
+        - bad_cleanup_routing
+        - bad_flat_fill
+        - bad_inpaint_backend
+        - halo_residual
+        - leftover_glyphs
+        - art_damage
+        - overcleanup
+        - undercleanup
+        - needs_manual_mask
+        - unknown
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Required artifacts
+      description: Attach report.json plus original_crop.png, text_mask.png, container_mask.png, cleanup_mask.png, overlay.png, and cleaned_crop.png when available.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected cleanup result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual cleanup result
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Cleanup configuration
+      description: Include backend, cleanup mode, review flags, and optional backend status. Do not paste secrets.
