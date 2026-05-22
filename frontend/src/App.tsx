@@ -25,6 +25,7 @@ import type {
   RegionPreviewSprite,
   CleanupPreviewResponse,
   CleanupDebugResponse,
+  CleanupDebugPreview,
   CleanupCandidateCompareResponse,
   CleanupCandidate,
   Sam2MaskResponse,
@@ -300,6 +301,9 @@ const GLOBAL_CSS = `
   .raw-qa-row:hover { background: var(--bg-3); }
   .raw-qa-row.ok { border-left-color: var(--teal); }
   .raw-qa-row.cleanup { border-left-color: var(--blue); }
+  .raw-qa-row.ocr { border-left-color: var(--amr); }
+  .raw-qa-row.translation { border-left-color: var(--red); }
+  .raw-qa-row.typeset { border-left-color: var(--teal); }
   .raw-qa-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
   .raw-qa-title { font-family: var(--fnt-mono); font-size: 10px; color: var(--t1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .raw-qa-status { font-family: var(--fnt-mono); font-size: 9px; color: var(--t3); white-space: nowrap; }
@@ -308,6 +312,17 @@ const GLOBAL_CSS = `
   .raw-qa-chip { border: 1px solid var(--br-1); border-radius: var(--r); color: var(--t3); background: var(--bg-0); font-family: var(--fnt-mono); font-size: 8.5px; padding: 2px 5px; }
   .raw-qa-actions { display: flex; gap: 4px; flex-wrap: wrap; }
   .raw-qa-actions .btn-ghost { padding: 4px 6px; font-size: 9px; }
+  .region-compare-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-bottom: 8px; }
+  .region-compare-meta { color: var(--t3); font-family: var(--fnt-mono); font-size: 10px; line-height: 1.5; margin-bottom: 8px; }
+  .region-compare-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .region-compare-tile { border: 1px solid var(--br-1); background: var(--bg-2); min-height: 112px; display: flex; flex-direction: column; }
+  .region-compare-head { display: flex; justify-content: space-between; gap: 6px; padding: 5px 6px; border-bottom: 1px solid var(--br-0); font-family: var(--fnt-mono); font-size: 9px; color: var(--t3); }
+  .region-compare-img { flex: 1; width: 100%; min-height: 82px; display: flex; align-items: center; justify-content: center; overflow: hidden; border: 0; background: transparent; cursor: zoom-in; }
+  .region-compare-img:disabled { cursor: default; }
+  .region-compare-img img { display: block; max-width: 100%; max-height: 158px; object-fit: contain; image-rendering: auto; }
+  .region-compare-empty { color: var(--t4); font-size: 10px; padding: 12px; text-align: center; }
+  .region-compare-popout { border: 1px solid var(--br-2); background: var(--bg-1); padding: 8px; margin-bottom: 8px; }
+  .region-compare-popout img { display: block; width: 100%; max-height: 360px; object-fit: contain; background: var(--bg-0); }
   .region-qa-badge { margin-left: 5px; padding: 1px 4px; border-radius: 2px; color: var(--bg-0); font-size: 8px; }
   .region-raw-badge { background: var(--amr); }
   .region-cleanup-badge { background: var(--blue); }
@@ -467,8 +482,17 @@ type BackendPreviewSprite = RegionPreviewSprite & {
 const setCanvasImageMode = (mode: ImageMode) => {
   window.dispatchEvent(new CustomEvent("ml:set-image-mode", { detail: mode }));
 };
+const cleanupFailureClasses = (region: Region): string[] => {
+  const values = [
+    ...(region.failure_classes ?? []),
+    ...(region.cleanup_patch?.failure_classes ?? []),
+    region.failure_class,
+    region.cleanup_patch?.failure_class,
+  ];
+  return Array.from(new Set(values.map(v => String(v || "").trim()).filter(Boolean)));
+};
 const cleanupReviewReasons = (region: Region): string[] => {
-  const reasons: string[] = [];
+  const reasons: string[] = cleanupFailureClasses(region);
   const status = String(region.cleanup_patch?.cleanup_status ?? region.cleanup_status ?? "").toLowerCase();
   const reason = String(region.cleanup_patch?.cleanup_reason ?? region.cleanup_reason ?? "").toLowerCase();
   const patch = region.cleanup_patch ?? null;
@@ -642,6 +666,44 @@ const editorRegionsForPage = (data: Bootstrap, pageIdx: number): Region[] => {
       const segmented = regionSegmentForPage(r, pageIdx);
       return { ...segmented, id: editorRegionId(segmented, pageIdx), display_page_idx: pageIdx };
     });
+};
+const chapterRegionItems = (data: Bootstrap, fallbackPage = 0) => {
+  const items = data.pages.flatMap((_, pageIdx) =>
+    editorRegionsForPage(data, pageIdx).map(region => ({ region, pageIdx })),
+  );
+  return items.length ? items : data.regions.map(region => ({ region, pageIdx: fallbackPage }));
+};
+const chapterQaCounts = (data: Bootstrap, fallbackPage = 0) => {
+  const items = chapterRegionItems(data, fallbackPage);
+  const ocr = items.filter(({ region }) => (
+    !region.pipeline_disabled
+    && (!String(region.src || "").trim() || (Number(region.ocr_confidence ?? 0) > 0 && Number(region.ocr_confidence ?? 0) < 0.45))
+  )).length;
+  const translation = items.filter(({ region }) => (
+    !region.pipeline_disabled
+    && Boolean(String(region.src || "").trim())
+    && (String(region.translation_status || "").toLowerCase() === "flagged"
+      || !String(region.tl || "").trim()
+      || String(region.translation_status || "").toLowerCase() === "pending")
+  )).length;
+  const typeset = items.filter(({ region }) => {
+    const status = String(region.typeset_status || "").toLowerCase();
+    return Boolean(status && !["ok", "done", "typeset_ok", "skipped"].includes(status));
+  }).length;
+  const rawReview = items.filter(({ region }) => Boolean(region.raw_match_qa?.needs_review)).length;
+  const rawAll = items.filter(({ region }) => Boolean(region.raw_match_qa)).length;
+  const cleanup = items.filter(({ region }) => needsCleanupReview(region)).length;
+  const other = data.issues.filter(issue => issue.kind !== "raw_match_qa" && issue.sev !== "info").length;
+  return {
+    rawReview,
+    rawAll,
+    cleanup,
+    ocr,
+    translation,
+    typeset,
+    other,
+    total: rawReview + cleanup + ocr + translation + typeset + other,
+  };
 };
 
 /* ── Empty bootstrap ─────────────────────────────────────────────────────── */
@@ -1379,7 +1441,8 @@ const ContinuousPage = ({
     let cancelled = false;
     regions.forEach(region => {
       if (!region.visible || !region.tl) return;
-      if (regionOwnerPage(region, idx) !== idx) return;
+      const ownerPage = regionOwnerPage(region, idx);
+      if (ownerPage !== idx) return;
       if (selectedRegion?.id !== region.id && !regionDrafts[region.id]) return;
       const draft = {
         ...(regionDrafts[region.id] ?? {}),
@@ -1392,7 +1455,7 @@ const ContinuousPage = ({
       if (cached?.styleKey === styleKey && cached.b64) return;
       if (pendingSpriteKeysRef.current.has(requestKey)) return;
       pendingSpriteKeysRef.current.add(requestKey);
-      api.getRegionPreviewSprite(region.idx, draft, idx).then(resp => {
+      api.getRegionPreviewSprite(region.idx, draft, ownerPage).then(resp => {
         pendingSpriteKeysRef.current.delete(requestKey);
         if (cancelled || !showOverlayBoxes || !showEnglishOverlay || !resp.ok || !resp.b64) return;
         setPreviewSprites(prev => ({
@@ -2762,6 +2825,7 @@ const InspectorTab = ({
   const [sam2Status, setSam2Status] = useState("");
   const [brushMode, setBrushMode] = useState<"add" | "erase">("add");
   const [brushSize, setBrushSize] = useState(18);
+  const [comparePopout, setComparePopout] = useState<{ title: string; b64: string } | null>(null);
   const commitTimers = useRef<Record<string, number>>({});
   const maskCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const maskDrawingRef = useRef(false);
@@ -2773,6 +2837,7 @@ const InspectorTab = ({
   useEffect(() => {
     if (region) setBboxDraft({ x: region.x, y: region.y, w: region.w, h: region.h });
   }, [region]);
+  useEffect(() => { setComparePopout(null); }, [region?.id]);
   useEffect(() => {
     if (!region || cleanupPreview?.regionId !== region.id || !cleanupPreview.mask_b64) return;
     const canvas = maskCanvasRef.current;
@@ -3023,7 +3088,8 @@ const InspectorTab = ({
     ["patchBox", "Applied cleanup patch", Boolean(region?.cleanup_patch?.bbox)],
     ["groupedMask", "Grouped inpaint mask", Boolean(cleanupDebug?.masks?.grouped_mask?.available)],
   ];
-  const qa = cleanupDebug?.regionId === region?.id ? cleanupDebug?.analysis : undefined;
+  const activeCleanupDebug = cleanupDebug?.regionId === region?.id ? cleanupDebug : null;
+  const qa = activeCleanupDebug?.analysis;
   const qaValue = (value: unknown) => {
     if (value === null || value === undefined || value === "") return "—";
     if (typeof value === "number") return Number.isFinite(value) ? value.toFixed(value > 1 ? 2 : 3) : "—";
@@ -3052,6 +3118,7 @@ const InspectorTab = ({
       `candidate_warnings: ${candidateWarnings.length ? candidateWarnings.join("; ") : "—"}`,
       `cleanup_status: ${qaValue(qa?.cleanup_status ?? region?.cleanup_status)}`,
       `cleanup_reason: ${qaValue(qa?.cleanup_reason ?? region?.cleanup_reason ?? qa?.skip_reason)}`,
+      `failure_classes: ${(qa?.failure_classes ?? (region ? cleanupFailureClasses(region) : [])).length ? (qa?.failure_classes ?? (region ? cleanupFailureClasses(region) : [])).join("; ") : "—"}`,
       `background_model: ${qaValue(qa?.background_model)}`,
       `container_confidence: ${qaValue(qa?.container_confidence ?? region?.cleanup_container_confidence)}`,
       `text_mask_confidence: ${qaValue(qa?.text_mask_confidence)}`,
@@ -3083,6 +3150,41 @@ const InspectorTab = ({
   const rawQa = region?.raw_match_qa ?? null;
   const rawAutoState = String(rawMatch.auto_state ?? rawQa?.auto_state ?? (rawMatch.auto_applied ? "auto_applied" : "proposed"));
   const rawReviewStatus = String(rawMatch.review_status ?? rawQa?.review_status ?? "unreviewed");
+  const activeCleanupPreview = cleanupPreview?.regionId === region?.id ? cleanupPreview : null;
+  const comparePreviews = activeCleanupDebug?.previews ?? {};
+  const compareMasks = activeCleanupDebug?.masks ?? {};
+  const cleanupPreviewTile: CleanupDebugPreview | undefined = activeCleanupPreview?.b64
+    ? { b64: activeCleanupPreview.b64, bbox: activeCleanupPreview.bbox, available: true }
+    : undefined;
+  const cleanupMaskTile: CleanupDebugPreview | undefined = activeCleanupPreview?.mask_b64
+    ? { b64: activeCleanupPreview.mask_b64, bbox: activeCleanupPreview.mask_bbox, available: true }
+    : compareMasks.cleanup_mask;
+  const compareWarnings = [
+    ...candidateWarnings,
+    qa?.cleanup_mask_rejected ? `mask rejected${qa.cleanup_mask_rejection_reason ? `: ${qa.cleanup_mask_rejection_reason}` : ""}` : "",
+    qa?.last_patch_reason ? `patch: ${qa.last_patch_reason}` : "",
+  ].filter(Boolean).join(" · ");
+  const renderCompareTile = (title: string, preview?: CleanupDebugPreview | null, empty = "Unavailable") => {
+    const b64 = preview?.b64 ?? "";
+    const available = Boolean(b64 && preview?.available !== false);
+    return (
+      <div className="region-compare-tile" key={title}>
+        <div className="region-compare-head">
+          <span>{title}</span>
+          <span>{qaBox(preview?.bbox)}</span>
+        </div>
+        <button
+          type="button"
+          className="region-compare-img"
+          disabled={!available}
+          onClick={() => available && setComparePopout({ title, b64 })}
+          title={available ? `Open ${title}` : empty}
+        >
+          {available ? <img src={`data:image/png;base64,${b64}`} alt={title} draggable={false} /> : <span className="region-compare-empty">{empty}</span>}
+        </button>
+      </div>
+    );
+  };
   const previewAndCommit = (patch: RegionDraft, field: string, value: unknown) => {
     if (!region) return;
     onPreviewRegion(region.id, patch, { requestSprite: true, reason: "style_change" });
@@ -3168,6 +3270,42 @@ const InspectorTab = ({
               <button className="btn-ghost" onClick={() => setCanvasImageMode("cleaned")}>Cleaned</button>
               <button className="btn-ghost" onClick={() => setCanvasImageMode("typeset")}>Typeset</button>
             </div>
+          </div>
+        </div>
+      </details>
+
+      <details className="editor-section" open>
+        <summary>Region Compare</summary>
+        <div className="editor-section-body">
+          <div className="region-compare-actions">
+            <button className="btn-ghost" onClick={() => setCanvasImageMode("raw")}>RAW</button>
+            <button className="btn-ghost" onClick={() => setCanvasImageMode("cleaned")}>Cleaned</button>
+            <button className="btn-ghost" onClick={() => setCanvasImageMode("typeset")}>Typeset</button>
+          </div>
+          <div className="region-compare-meta">
+            RAW {rawStatus} · review {rawReviewStatus} · candidate {qaValue(selectedCandidate?.candidate_id ?? qa?.selected_cleanup_candidate ?? region.cleanup_patch?.candidate_id)}
+            <br />
+            Cleanup {qaValue(qa?.effective_cleanup_action)} / {qaValue(qa?.effective_cleanup_mode)} · backend {qaValue(selectedCandidate?.backend ?? qa?.cleanup_backend)} · bg {qaValue(qa?.background_model)}
+            <br />
+            Mask c/r {qaValue(qa?.mask_container_ratio)} / {qaValue(qa?.mask_region_ratio)} · pixels {qaValue(qa?.mask_area)}
+            {compareWarnings ? <><br />Warnings {compareWarnings}</> : null}
+          </div>
+          {comparePopout && (
+            <div className="region-compare-popout">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span className="insp-section-title" style={{ margin: 0 }}>{comparePopout.title}</span>
+                <button className="btn-ghost" onClick={() => setComparePopout(null)}>Close</button>
+              </div>
+              <img src={`data:image/png;base64,${comparePopout.b64}`} alt={comparePopout.title} draggable={false} />
+            </div>
+          )}
+          <div className="region-compare-grid">
+            {renderCompareTile("RAW", comparePreviews.raw_crop, "No RAW crop")}
+            {renderCompareTile("Cleaned", comparePreviews.cleaned_crop, "No cleaned crop")}
+            {renderCompareTile("Typeset", comparePreviews.typeset_crop, "No typeset crop")}
+            {renderCompareTile("Cleanup preview", cleanupPreviewTile, "Preview cleanup first")}
+            {renderCompareTile("Cleanup mask", cleanupMaskTile, "No cleanup mask")}
+            {renderCompareTile("Overlay", comparePreviews.overlay, "No debug overlay")}
           </div>
         </div>
       </details>
@@ -3935,25 +4073,181 @@ const LayersTab = ({
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  REVIEW TAB                                                                 */
 /* ─────────────────────────────────────────────────────────────────────────── */
-type ReviewFilter = "raw_review" | "raw_all" | "cleanup" | "issues";
+type ReviewFilter = "raw_review" | "raw_all" | "cleanup" | "ocr" | "translation" | "typeset" | "issues";
+type ReviewQueue = Exclude<ReviewFilter, "raw_all">;
+type ReviewSeverity = Issue["sev"];
+type ReviewRow = {
+  id: string;
+  queue: ReviewQueue;
+  pageIdx: number;
+  region: Region | null;
+  regionLabel: string;
+  issueClass: string;
+  reason: string;
+  severity: ReviewSeverity;
+  status?: string;
+  chips?: string[];
+  issue?: Issue;
+};
 
 const ReviewTab = ({
-  issues, regions, onSelectRegion, onUpdateRegion,
+  data, activePage, onJumpRegion, onUpdateRegion,
 }: {
-  issues: Issue[];
-  regions: Region[];
-  onSelectRegion: (region: Region) => void;
+  data: Bootstrap;
+  activePage: number;
+  onJumpRegion: (region: Region, pageIdx: number) => void;
   onUpdateRegion: (idx: number, field: string, value: unknown) => void;
 }) => {
-  const rawRegions = regions.filter(r => r.raw_match_qa);
-  const rawNeedsReview = rawRegions.filter(r => r.raw_match_qa?.needs_review);
-  const cleanupNeedsReview = regions.filter(needsCleanupReview);
-  const generalIssues = issues.filter(iss => iss.kind !== "raw_match_qa");
-  const [filter, setFilter] = useState<ReviewFilter>(rawNeedsReview.length ? "raw_review" : cleanupNeedsReview.length ? "cleanup" : "issues");
+  const pageRegions = data.pages.flatMap((_, pageIdx) =>
+    editorRegionsForPage(data, pageIdx).map(region => ({ region, pageIdx })),
+  );
+  const allRegions = pageRegions.length
+    ? pageRegions
+    : data.regions.map(region => ({ region, pageIdx: activePage }));
+  const pageRegionByLabel = (pageIdx: number, label: string | null | undefined) =>
+    label ? allRegions.find(item => item.pageIdx === pageIdx && item.region.label === label)?.region ?? null : null;
+
+  const rawRegions = allRegions.filter(item => item.region.raw_match_qa);
+  const rawNeedsReview = rawRegions.filter(item => item.region.raw_match_qa?.needs_review);
+  const cleanupRows: ReviewRow[] = allRegions
+    .filter(item => needsCleanupReview(item.region))
+    .map(({ region, pageIdx }) => {
+      const reasons = cleanupReviewReasons(region);
+      const patch = region.cleanup_patch;
+      return {
+        id: `cleanup-${pageIdx}-${region.id}`,
+        queue: "cleanup",
+        pageIdx,
+        region,
+        regionLabel: region.label,
+        issueClass: "cleanup_review",
+        reason: patch?.cleanup_reason || region.cleanup_reason || patch?.fallback_error || reasons[0] || "Cleanup needs visual review.",
+        severity: patch?.fallback_error || region.cleanup_status === "error" ? "err" : "warn",
+        status: patch?.cleanup_status || region.cleanup_status || "review",
+        chips: reasons,
+      };
+    });
+  const ocrRows: ReviewRow[] = allRegions.flatMap(({ region, pageIdx }) => {
+    if (region.pipeline_disabled) return [];
+    const rows: ReviewRow[] = [];
+    const source = String(region.src || "").trim();
+    const confidence = Number(region.ocr_confidence ?? 0);
+    if (!source) {
+      rows.push({
+        id: `ocr-empty-${pageIdx}-${region.id}`,
+        queue: "ocr",
+        pageIdx,
+        region,
+        regionLabel: region.label,
+        issueClass: "empty_ocr",
+        reason: "Missing source OCR text.",
+        severity: "warn",
+        status: "empty",
+        chips: ["empty_ocr"],
+      });
+    } else if (confidence > 0 && confidence < 0.45) {
+      rows.push({
+        id: `ocr-low-${pageIdx}-${region.id}`,
+        queue: "ocr",
+        pageIdx,
+        region,
+        regionLabel: region.label,
+        issueClass: "low_confidence_ocr",
+        reason: `Low OCR confidence (${Math.round(confidence * 100)}%).`,
+        severity: "warn",
+        status: "low_confidence",
+        chips: ["low_confidence", `${Math.round(confidence * 100)}%`],
+      });
+    }
+    return rows;
+  });
+  const translationRows: ReviewRow[] = allRegions.flatMap(({ region, pageIdx }): ReviewRow[] => {
+    if (region.pipeline_disabled || !String(region.src || "").trim()) return [];
+    const status = String(region.translation_status || "").toLowerCase();
+    const translation = String(region.tl || "").trim();
+    if (status === "flagged") {
+      return [{
+        id: `translation-flagged-${pageIdx}-${region.id}`,
+        queue: "translation",
+        pageIdx,
+        region,
+        regionLabel: region.label,
+        issueClass: "flagged_translation",
+        reason: "Translation is flagged for review.",
+        severity: "err",
+        status: "flagged",
+        chips: ["flagged"],
+      }];
+    }
+    if (!translation || status === "pending") {
+      return [{
+        id: `translation-empty-${pageIdx}-${region.id}`,
+        queue: "translation",
+        pageIdx,
+        region,
+        regionLabel: region.label,
+        issueClass: "missing_translation",
+        reason: "Missing translation.",
+        severity: "warn",
+        status: "pending",
+        chips: ["missing_translation"],
+      }];
+    }
+    return [];
+  });
+  const typesetRows: ReviewRow[] = allRegions.flatMap(({ region, pageIdx }): ReviewRow[] => {
+    const status = String(region.typeset_status || "").toLowerCase();
+    const reason = String(region.typeset_reason || "").trim();
+    if (!status || ["ok", "done", "typeset_ok", "skipped"].includes(status)) return [];
+    return [{
+      id: `typeset-${pageIdx}-${region.id}`,
+      queue: "typeset",
+      pageIdx,
+      region,
+      regionLabel: region.label,
+      issueClass: status,
+      reason: reason || "Typeset output needs review.",
+      severity: /overflow|clip|error|fail/.test(status + " " + reason.toLowerCase()) ? "err" : "warn",
+      status,
+      chips: [status, reason].filter(Boolean).slice(0, 3),
+    }];
+  });
+  const generalRows: ReviewRow[] = data.issues
+    .filter(iss => iss.kind !== "raw_match_qa")
+    .map(iss => {
+      const pageIdx = Math.max(0, Number(iss.page || 1) - 1);
+      const region = pageRegionByLabel(pageIdx, iss.region);
+      const kind = String(iss.kind || "issue");
+      return {
+        id: iss.id,
+        queue: kind.includes("typeset") ? "typeset" : kind.includes("ocr") ? "ocr" : kind.includes("translation") ? "translation" : "issues",
+        pageIdx,
+        region,
+        regionLabel: iss.region || "",
+        issueClass: kind,
+        reason: iss.msg,
+        severity: iss.sev,
+        status: iss.sev,
+        chips: [kind],
+        issue: iss,
+      };
+    });
+  const otherRows = generalRows.filter(row => row.queue === "issues");
+  const combinedOcrRows = [...ocrRows, ...generalRows.filter(row => row.queue === "ocr")];
+  const combinedTranslationRows = [...translationRows, ...generalRows.filter(row => row.queue === "translation")];
+  const combinedTypesetRows = [...typesetRows, ...generalRows.filter(row => row.queue === "typeset")];
+  const [filter, setFilter] = useState<ReviewFilter>(
+    rawNeedsReview.length ? "raw_review"
+      : cleanupRows.length ? "cleanup"
+      : combinedOcrRows.length ? "ocr"
+      : combinedTranslationRows.length ? "translation"
+      : combinedTypesetRows.length ? "typeset"
+      : "issues",
+  );
   useEffect(() => {
     if (filter === "issues" && rawNeedsReview.length > 0) setFilter("raw_review");
-    else if (filter === "issues" && cleanupNeedsReview.length > 0) setFilter("cleanup");
-  }, [filter, rawNeedsReview.length, cleanupNeedsReview.length]);
+    else if (filter === "issues" && cleanupRows.length > 0) setFilter("cleanup");
+  }, [filter, rawNeedsReview.length, cleanupRows.length]);
   const visibleRaw = filter === "raw_all" ? rawRegions : rawNeedsReview;
   const showRaw = filter === "raw_review" || filter === "raw_all";
   const chipsFor = (qa: RawMatchQa) => {
@@ -3965,28 +4259,53 @@ const ReviewTab = ({
     ].filter(Boolean);
     return values.length ? values.slice(0, 4) : [qa.readable ? "readable" : "readability"];
   };
-  const jumpIssue = (iss: Issue) => {
-    const region = regions.find(r => r.label === iss.region);
-    if (region) onSelectRegion(region);
+  const jumpRow = (row: Pick<ReviewRow, "region" | "pageIdx">) => {
+    if (row.region) onJumpRegion(row.region, row.pageIdx);
   };
+  const renderRows = (rows: ReviewRow[], empty: string) => (
+    rows.length === 0 ? (
+      <div className="empty-state"><div>✓</div><div>{empty}</div></div>
+    ) : rows.map(row => (
+      <div key={row.id} className={`raw-qa-row ${row.queue} ${row.severity === "info" ? "ok" : ""}`} onClick={() => jumpRow(row)}>
+        <div className="raw-qa-head">
+          <div className="raw-qa-title">Page {row.pageIdx + 1}{row.regionLabel ? ` · ${row.regionLabel}` : ""}</div>
+          <div className="raw-qa-status">{row.severity} · {row.issueClass}</div>
+        </div>
+        <div className="raw-qa-summary">{row.reason}</div>
+        <div className="raw-qa-chips">
+          {(row.chips?.length ? row.chips : [row.status || row.issueClass]).map(chip => <span key={chip} className="raw-qa-chip">{chip}</span>)}
+        </div>
+        <div className="raw-qa-actions">
+          {row.region && <button className="btn-ghost" onClick={e => { e.stopPropagation(); jumpRow(row); }}>Jump</button>}
+          <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("raw"); if (row.region) jumpRow(row); }}>RAW</button>
+          <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("cleaned"); if (row.region) jumpRow(row); }}>Cleaned</button>
+          <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("typeset"); if (row.region) jumpRow(row); }}>Typeset</button>
+        </div>
+      </div>
+    ))
+  );
   return (
     <div style={{ overflowY: "auto", flex: 1 }}>
       <div className="raw-qa-toolbar">
         <button className={`raw-qa-filter ${filter === "raw_review" ? "active" : ""}`} onClick={() => setFilter("raw_review")}>RAW Review {rawNeedsReview.length}</button>
         <button className={`raw-qa-filter ${filter === "raw_all" ? "active" : ""}`} onClick={() => setFilter("raw_all")}>RAW All {rawRegions.length}</button>
-        <button className={`raw-qa-filter ${filter === "cleanup" ? "active" : ""}`} onClick={() => setFilter("cleanup")}>Cleanup {cleanupNeedsReview.length}</button>
-        <button className={`raw-qa-filter ${filter === "issues" ? "active" : ""}`} onClick={() => setFilter("issues")}>Issues {generalIssues.length}</button>
+        <button className={`raw-qa-filter ${filter === "cleanup" ? "active" : ""}`} onClick={() => setFilter("cleanup")}>Cleanup {cleanupRows.length}</button>
+        <button className={`raw-qa-filter ${filter === "ocr" ? "active" : ""}`} onClick={() => setFilter("ocr")}>OCR {combinedOcrRows.length}</button>
+        <button className={`raw-qa-filter ${filter === "translation" ? "active" : ""}`} onClick={() => setFilter("translation")}>Translation {combinedTranslationRows.length}</button>
+        <button className={`raw-qa-filter ${filter === "typeset" ? "active" : ""}`} onClick={() => setFilter("typeset")}>Typeset {combinedTypesetRows.length}</button>
+        <button className={`raw-qa-filter ${filter === "issues" ? "active" : ""}`} onClick={() => setFilter("issues")}>Other {otherRows.length}</button>
       </div>
       {showRaw ? (
         visibleRaw.length === 0 ? (
           <div className="empty-state"><div>✓</div><div>No RAW review items</div></div>
-        ) : visibleRaw.map(region => {
+        ) : visibleRaw.map(({ region, pageIdx }) => {
           const qa = region.raw_match_qa as RawMatchQa;
           const match = qa.raw_style_match || region.raw_style_match || {};
+          const activeRow = pageIdx === activePage;
           return (
-            <div key={`raw-${region.id}`} className={`raw-qa-row ${qa.needs_review ? "" : "ok"}`} onClick={() => onSelectRegion(region)}>
+            <div key={`raw-${pageIdx}-${region.id}`} className={`raw-qa-row ${qa.needs_review ? "" : "ok"}`} onClick={() => onJumpRegion(region, pageIdx)}>
               <div className="raw-qa-head">
-                <div className="raw-qa-title">{region.label} · Page {qa.page}</div>
+                <div className="raw-qa-title">Page {pageIdx + 1} · {region.label}</div>
                 <div className="raw-qa-status">{qa.status} · {qa.auto_state}</div>
               </div>
               <div className="raw-qa-summary">{String(match.summary ?? "No RAW style summary")}</div>
@@ -3994,62 +4313,33 @@ const ReviewTab = ({
                 {chipsFor(qa).map(chip => <span key={chip} className="raw-qa-chip">{chip}</span>)}
               </div>
               <div className="raw-qa-actions">
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onSelectRegion(region); }}>Jump</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("raw"); }}>RAW</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("cleaned"); }}>Cleaned</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("typeset"); }}>Typeset</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "apply_raw_match", true); }}>Apply</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "rematch_raw_style", true); }}>Re-match</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "reset_style", true); }}>Reset</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "raw_review_status", "accepted"); }}>Reviewed</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "raw_review_status", "rejected"); }}>Reject</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onJumpRegion(region, pageIdx); }}>Jump</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("raw"); onJumpRegion(region, pageIdx); }}>RAW</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("cleaned"); onJumpRegion(region, pageIdx); }}>Cleaned</button>
+                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("typeset"); onJumpRegion(region, pageIdx); }}>Typeset</button>
+                {activeRow && (
+                  <>
+                    <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "apply_raw_match", true); }}>Apply</button>
+                    <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "rematch_raw_style", true); }}>Re-match</button>
+                    <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "reset_style", true); }}>Reset</button>
+                    <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "raw_review_status", "accepted"); }}>Reviewed</button>
+                    <button className="btn-ghost" onClick={e => { e.stopPropagation(); onUpdateRegion(region.idx, "raw_review_status", "rejected"); }}>Reject</button>
+                  </>
+                )}
               </div>
             </div>
           );
         })
       ) : filter === "cleanup" ? (
-        cleanupNeedsReview.length === 0 ? (
-          <div className="empty-state"><div>✓</div><div>No cleanup review items</div></div>
-        ) : cleanupNeedsReview.map(region => {
-          const reasons = cleanupReviewReasons(region);
-          const patch = region.cleanup_patch;
-          const status = patch?.cleanup_status || region.cleanup_status || "review";
-          const reason = patch?.cleanup_reason || region.cleanup_reason || patch?.fallback_error || reasons[0] || "";
-          return (
-            <div key={`cleanup-${region.id}`} className="raw-qa-row cleanup" onClick={() => onSelectRegion(region)}>
-              <div className="raw-qa-head">
-                <div className="raw-qa-title">{region.label} · Page {(region.source_page_idx ?? 0) + 1}</div>
-                <div className="raw-qa-status">{status}</div>
-              </div>
-              <div className="raw-qa-summary">
-                {reason || "Cleanup needs visual review."}
-                {patch?.strategy ? ` · ${patch.strategy}` : ""}
-                {patch?.inpaint_method ? ` / ${patch.inpaint_method}` : ""}
-              </div>
-              <div className="raw-qa-chips">
-                {reasons.map(chip => <span key={chip} className="raw-qa-chip">{chip}</span>)}
-              </div>
-              <div className="raw-qa-actions">
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); onSelectRegion(region); }}>Jump</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("raw"); }}>RAW</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("cleaned"); }}>Cleaned</button>
-                <button className="btn-ghost" onClick={e => { e.stopPropagation(); setCanvasImageMode("typeset"); }}>Typeset</button>
-              </div>
-            </div>
-          );
-        })
+        renderRows(cleanupRows, "No cleanup review items")
+      ) : filter === "ocr" ? (
+        renderRows(combinedOcrRows, "No OCR review items")
+      ) : filter === "translation" ? (
+        renderRows(combinedTranslationRows, "No translation review items")
+      ) : filter === "typeset" ? (
+        renderRows(combinedTypesetRows, "No typeset review items")
       ) : (
-        generalIssues.length === 0 ? (
-          <div className="empty-state"><div>✓</div><div>No issues</div></div>
-        ) : generalIssues.map(iss => (
-          <div key={iss.id} className={`issue-item ${iss.sev}`} onClick={() => jumpIssue(iss)}>
-            <div className="issue-msg">{iss.msg}</div>
-            <div className="issue-ref">
-              {iss.region && <span>{iss.region} · </span>}
-              Page {iss.page}
-            </div>
-          </div>
-        ))
+        renderRows(otherRows, "No other issues")
       )}
     </div>
   );
@@ -4240,7 +4530,7 @@ const MemoryTab = ({
 /*  RIGHT PANEL                                                                */
 /* ─────────────────────────────────────────────────────────────────────────── */
 const RightPanel = ({
-  data, region, issues, pageIndex, pageSize, onSelectRegion, onUpdateRegion, onPreviewRegion, onCommitBBox, onAddRegion,
+  data, region, pageIndex, pageSize, onSelectRegion, onJumpRegion, onUpdateRegion, onPreviewRegion, onCommitBBox, onAddRegion,
   onDeleteRegion, onSetYoloTrainClass, onOcrRegion, onTranslateRegion, onMemoryMutation, fontOptions,
   cleanupPreview, cleanupDebug, debugOverlays, onDebugOverlayChange,
   cleanupCandidates, selectedCandidateId, onSelectCleanupCandidate,
@@ -4250,11 +4540,11 @@ const RightPanel = ({
 }: {
   data:           Bootstrap;
   region:         Region | null;
-  issues:         Issue[];
   pageIndex:      number;
   pageSize:       { w: number; h: number } | null;
   fontOptions:    FontOptions;
   onSelectRegion: (region: Region) => void;
+  onJumpRegion:   (region: Region, pageIdx: number) => void;
   onUpdateRegion: (idx: number, field: string, value: unknown) => void;
   onPreviewRegion: (regionId: string, patch: RegionDraft, options?: { requestSprite?: boolean; reason?: string }) => void;
   onCommitBBox:   (region: Region, bbox: RegionBBox) => Promise<boolean>;
@@ -4286,13 +4576,14 @@ const RightPanel = ({
 }) => {
   const [tab, setTab] = useState<"editor" | "layers" | "issues" | "memory">("editor");
   useEffect(() => { if (region) setTab("editor"); }, [region?.id]);
+  const reviewCounts = chapterQaCounts(data, pageIndex);
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
       <div className="tab-bar">
         {(["editor", "layers", "issues", "memory"] as const).map(t => (
           <div key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
             {t === "issues"
-              ? `Issues${issues.length > 0 ? ` (${issues.length})` : ""}`
+              ? `Issues${reviewCounts.total > 0 ? ` (${reviewCounts.total})` : ""}`
               : t === "memory"
                 ? `Memory${data.memory.names.length + data.memory.glossary.length > 0 ? ` (${data.memory.names.length + data.memory.glossary.length})` : ""}`
               : t.charAt(0).toUpperCase() + t.slice(1)}
@@ -4346,7 +4637,7 @@ const RightPanel = ({
             onUpdateRegion={onUpdateRegion}
           />
         )}
-        {tab === "issues"    && <ReviewTab issues={issues} regions={data.regions} onSelectRegion={onSelectRegion} onUpdateRegion={onUpdateRegion} />}
+        {tab === "issues"    && <ReviewTab data={data} activePage={pageIndex} onJumpRegion={onJumpRegion} onUpdateRegion={onUpdateRegion} />}
         {tab === "memory"    && <MemoryTab data={data} region={region} onMemoryMutation={onMemoryMutation} />}
       </div>
     </div>
@@ -4376,10 +4667,8 @@ const StatusBar = ({
   const progressLabel = pipelineProgress?.job
     ? `${pipelineProgress.job === "run_all" ? "Run All" : pipelineProgress.job === "run_page" ? "Run Page" : pipelineProgress.job}: ${pipelineProgress.stage ?? "working"}${progressPage ? ` page ${progressPage} / ${progressTotal}` : ""}${progressRegion}`
     : "";
-  const rawQa = data.regions.map(r => r.raw_match_qa).filter((qa): qa is RawMatchQa => Boolean(qa));
-  const rawReviewCount = rawQa.filter(qa => qa.needs_review).length;
-  const rawOkCount = rawQa.length - rawReviewCount;
-  const cleanupReviewCount = data.regions.filter(needsCleanupReview).length;
+  const qaCounts = chapterQaCounts(data, activePage);
+  const rawOkCount = qaCounts.rawAll - qaCounts.rawReview;
   return (
     <div className="ml-statusbar no-select">
       <div className="sb-item">
@@ -4402,17 +4691,24 @@ const StatusBar = ({
       )}
       <div className="sb-item">
         Issues <span style={{ color: data.issues.filter(i => i.sev === "err").length ? "var(--red)" : "var(--t2)" }}>
-          {data.issues.filter(i => i.sev !== "info").length}
+          {qaCounts.total}
         </span>
       </div>
-      {rawQa.length > 0 && (
+      {qaCounts.rawAll > 0 && (
         <div className="sb-item">
-          RAW QA <span>{rawOkCount} ok</span>, <span style={{ color: rawReviewCount ? "var(--amr)" : "var(--t2)" }}>{rawReviewCount} review</span>
+          RAW QA <span>{rawOkCount} ok</span>, <span style={{ color: qaCounts.rawReview ? "var(--amr)" : "var(--t2)" }}>{qaCounts.rawReview} review</span>
         </div>
       )}
-      {cleanupReviewCount > 0 && (
+      {qaCounts.cleanup > 0 && (
         <div className="sb-item">
-          Cleanup <span style={{ color: "var(--amr)" }}>{cleanupReviewCount} review</span>
+          Cleanup <span style={{ color: "var(--amr)" }}>{qaCounts.cleanup} review</span>
+        </div>
+      )}
+      {(qaCounts.ocr + qaCounts.translation + qaCounts.typeset) > 0 && (
+        <div className="sb-item">
+          Chapter QA <span style={{ color: "var(--amr)" }}>
+            OCR {qaCounts.ocr} · TL {qaCounts.translation} · TS {qaCounts.typeset}
+          </span>
         </div>
       )}
       {selectedRegion && <div className="sb-item">Selected <span>{selectedRegion.label}</span></div>}
@@ -5036,6 +5332,41 @@ export default function App() {
     setSelectedCandidateId("");
   }, [activePage]);
 
+  const handleJumpToRegion = useCallback((region: Region, pageIdx: number) => {
+    const maxIdx = Math.max(0, data.pages.length - 1);
+    const targetPage = clampNumber(pageIdx, 0, maxIdx);
+    renderDebug("select", {
+      action: "jumpToQaRegion",
+      page: targetPage,
+      region: region.idx,
+      style: regionStyleDebug(region),
+    });
+    setActivePage(targetPage);
+    setContinuousScrollTarget(targetPage);
+    setSelectedRegion(region);
+    setCleanupPreview(null);
+    setCleanupDebug(null);
+    setCleanupCandidates(null);
+    setSelectedCandidateId("");
+    if (targetPage === activePage) return;
+
+    pageSyncSeqRef.current += 1;
+    const seq = pageSyncSeqRef.current;
+    clearPageSyncTimer();
+    api.goToPage(targetPage).then(resp => {
+      if (!resp.ok) {
+        setLiveStatus(`Error: ${resp.error}`);
+        return;
+      }
+      if (seq !== pageSyncSeqRef.current) return;
+      const bootstrap = resp as unknown as Bootstrap;
+      applyBootstrap(bootstrap);
+      const refreshed = editorRegionsForPage(bootstrap, targetPage)
+        .find(r => r.id === region.id || (r.idx === region.idx && r.label === region.label));
+      setSelectedRegion(refreshed ?? region);
+    });
+  }, [activePage, data.pages.length, selectedSeriesKey]);
+
   const handleCommitBBox = useCallback(async (region: Region, bbox: RegionBBox) => {
     const ownerPage = regionOwnerPage(region, activePage);
     const editPage = typeof region.display_page_idx === "number" ? region.display_page_idx : activePage;
@@ -5513,11 +5844,11 @@ export default function App() {
           <RightPanel
             data={visiblePageData}
             region={selectedRegion}
-            issues={data.issues}
             pageIndex={activePage}
             pageSize={pageSizes[activePage] ?? null}
             fontOptions={fontOptions}
             onSelectRegion={handleSelectRegion}
+            onJumpRegion={handleJumpToRegion}
             onUpdateRegion={handleUpdateRegion}
             onPreviewRegion={handlePreviewRegion}
             onCommitBBox={handleCommitBBox}

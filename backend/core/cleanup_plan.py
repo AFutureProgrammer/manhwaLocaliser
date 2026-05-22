@@ -37,6 +37,39 @@ Fix log (applied in this file)
                                        exceeds 22 gray levels.
   FIX-8  IDW pixel cap:               gradient_reconstruct_idw bails to
                                        TELEA when fill pixel count > 8 000.
+  FIX-9  SAM2 mode gate:              accept "auto" so SAM2 runs without
+                                       explicit opt-in to cleanup_assist.
+  FIX-10 Dark bubble residual specks: _add_sam2_residual_specks now works on
+                                       dark/colored bubbles by computing stroke
+                                       contrast and flipping search polarity.
+  FIX-11 SAM2 refinement on art bg:   _refine_sam2_mask_to_glyphs skipped for
+                                       halftone_texture/busy_art/translucent/
+                                       unknown; retention bail raised 0.72→0.85.
+  FIX-12 Outline shadow thresholds:   contrast gate lowered 18→12, chroma 16→11
+                                       to catch soft/anti-aliased outlines.
+  FIX-13 Halo max_px default:         raised 2→3 for typical manhwa outline fonts.
+  FIX-14 LaMa pre-route:              select_strategy() short-circuits to
+                                       mask_inpaint for any non-SFX region when
+                                       LaMa backend is configured, preventing
+                                       text_on_art/texture/gradient from skipping.
+  FIX-15 Routing probes cleanup_mask: _route_model_backend_for_nontrivial_solid_mask
+                                       now probes cleanup_mask (post-halo) instead
+                                       of text_mask; nontrivial thresholds lowered.
+  FIX-16 Fragmented mask thresholds:  _mask_is_fragmented_broad_fallback widened
+                                       (ratio 0.22→0.20, count 5→4, LCR 0.55→0.60).
+  FIX-17 Tight mask growth radius:    raised max(1, 0.05x) → max(2, 0.08x).
+  FIX-18 SAM2 negative clicks:        placed at container/region boundary instead
+                                       of text_bbox corners.
+  FIX-19 solid_bubble_fill default:   cleanup_solid_bubble_fill_enabled False so
+                                       LaMa uses mask_inpaint not solid_bubble_cv.
+  FIX-20 Adaptive glow-radius:        _measure_glow_radius() probes expanding rings
+                                       around text_mask to find true chroma-glow
+                                       extent (up to 24 px).  build_text_halo_mask
+                                       uses the measured radius instead of the hard
+                                       min(4,max_px) cap, and relaxes rejection gates
+                                       (ratio 1.75→8.0, region_ratio 0.18→0.55) when
+                                       glow is confirmed.  Fixes neon/multi-layer glow
+                                       text leaving coloured halo residue after LaMa.
 ──────────────────────────────────────────────────────────────────────────────
 Audit note (engine.py / cleanup.py):
   All destructive pixel writes must go through erase_text_region_planned().
@@ -63,6 +96,7 @@ import requests
 # ── Optional AI/hardware dependencies (graceful fallback when absent) ──────────
 ort = None
 _ONNX_AVAILABLE = False
+_MODEL_INPAINT_BACKENDS = {"lama_pt", "lama_onnx", "iopaint"}
 
 
 def _get_onnxruntime():
@@ -78,13 +112,17 @@ def _get_onnxruntime():
     _ONNX_AVAILABLE = True
     return ort
 
+from backend.core.cleanup_failure_taxonomy import (
+    classify_cleanup_failure,
+    primary_cleanup_failure_class,
+)
+from backend.core.constants import debug_print
+
 try:
     import psutil as _psutil
     _PSUTIL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _PSUTIL_AVAILABLE = False
-
-from backend.core.constants import debug_print
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -187,7 +225,7 @@ class CleanupPolicy:
     t2_max_mask_region_ratio: float = 0.28
     t2_max_border_touch: float = 0.35
 
-    cleanup_solid_bubble_fill_enabled: bool = True
+    cleanup_solid_bubble_fill_enabled: bool = False  # FIX: LaMa must use mask_inpaint, not solid_bubble_cv
     cleanup_solid_bubble_min_container_confidence: float = 0.60
     cleanup_solid_bubble_max_mask_container_ratio: float = 0.15
     cleanup_solid_bubble_max_rectangularity: float = 0.45
@@ -199,7 +237,7 @@ class CleanupPolicy:
     cleanup_flat_fill_max_ring_chroma_std: float = 12.0
     cleanup_flat_fill_max_ring_edge_density: float = 0.08
     cleanup_halo_mask_enabled: bool = True
-    cleanup_halo_max_px: int = 2
+    cleanup_halo_max_px: int = 3  # FIX: 2px too small for typical manhwa outlined fonts (2-4px outlines)
     cleanup_residual_retry_enabled: bool = True
     cleanup_residual_retry_dilate_px: int = 1
     cleanup_allow_grouped_inpaint: bool = False
@@ -2348,6 +2386,24 @@ def _cfg_bool_attr(cfg: Any, name: str, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _coerce_config_bool_fields(cfg: Any) -> None:
+    if cfg is None:
+        return
+    annotations: Dict[str, Any] = {}
+    for cls in reversed(type(cfg).__mro__):
+        annotations.update(getattr(cls, "__annotations__", {}) or {})
+    for name, annotation in annotations.items():
+        annotation_text = str(annotation)
+        if annotation is not bool and annotation_text != "bool" and "bool" not in annotation_text:
+            continue
+        if not hasattr(cfg, name):
+            continue
+        value = getattr(cfg, name)
+        if isinstance(value, bool):
+            continue
+        setattr(cfg, name, _cfg_bool_attr(cfg, name, False))
+
+
 def _decode_mask_png_b64(mask_b64: str) -> Optional[np.ndarray]:
     if not str(mask_b64 or "").strip():
         return None
@@ -2382,6 +2438,115 @@ def _component_centers(mask: Optional[np.ndarray], bbox: Tuple[int, int, int, in
     return [pt for _area, pt in comps[:limit]]
 
 
+def _refine_sam2_mask_to_glyphs(
+    img_cv: np.ndarray,
+    plan: CleanupPlan,
+    sam2_mask: np.ndarray,
+    prompt_bbox: Tuple[int, int, int, int],
+) -> Optional[np.ndarray]:
+    support = (sam2_mask > 0).astype(np.uint8) * 255
+    if not np.any(support):
+        return None
+    x, y, w, h = prompt_bbox
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(img_cv.shape[1], x + w), min(img_cv.shape[0], y + h)
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    local_img = img_cv[y1:y2, x1:x2]
+    local_support = support[y1:y2, x1:x2] > 0
+    if int(np.count_nonzero(local_support)) < 8:
+        return None
+
+    ring = cv2.dilate(
+        local_support.astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        iterations=1,
+    ) > 0
+    ring &= ~local_support
+    if int(np.count_nonzero(ring)) < 24:
+        ring = ~local_support
+    if int(np.count_nonzero(ring)) < 24:
+        return None
+
+    gray = cv2.cvtColor(local_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    lab = cv2.cvtColor(local_img, cv2.COLOR_BGR2Lab).astype(np.float32)
+    hsv = cv2.cvtColor(local_img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    bg_gray = float(np.median(gray[ring]))
+    bg_lab = np.median(lab[ring].reshape(-1, 3), axis=0)
+    bg_sat = float(np.median(hsv[:, :, 1][ring]))
+    chroma = np.sqrt((lab[:, :, 1] - 128.0) ** 2 + (lab[:, :, 2] - 128.0) ** 2)
+    bg_chroma = float(np.median(chroma[ring]))
+    lab_dist = np.sqrt(np.sum((lab - bg_lab[None, None, :]) ** 2, axis=2))
+
+    dark = gray < max(96.0, bg_gray - 30.0)
+    light = (gray > min(245.0, bg_gray + 38.0)) & (lab_dist > 16.0)
+    saturated = (hsv[:, :, 1] > max(42.0, bg_sat + 20.0)) & (chroma > bg_chroma + 10.0)
+    contrast = lab_dist > 24.0
+    edges = cv2.Canny(gray.astype(np.uint8), 38, 118)
+    edge_band = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1) > 0
+    raw = np.where(
+        local_support
+        & (dark | light | saturated | contrast)
+        & (edge_band | (lab_dist > 36.0) | (np.abs(gray - bg_gray) > 34.0)),
+        255,
+        0,
+    ).astype(np.uint8)
+    raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+    if not np.any(raw):
+        return None
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(raw, 8)
+    kept = np.zeros_like(raw)
+    support_area = max(1, int(np.count_nonzero(local_support)))
+    support_bbox = _mask_bbox(local_support.astype(np.uint8) * 255)
+    sw = support_bbox[2] if support_bbox else local_img.shape[1]
+    sh = support_bbox[3] if support_bbox else local_img.shape[0]
+    for label in range(1, n):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        bw = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        bx = int(stats[label, cv2.CC_STAT_LEFT])
+        by = int(stats[label, cv2.CC_STAT_TOP])
+        if area < 2:
+            continue
+        if area > max(4200, int(support_area * 0.32)):
+            continue
+        if bw > max(48, int(sw * 0.96)) and bh > max(14, int(sh * 0.40)):
+            continue
+        if bh > max(48, int(sh * 0.88)) and bw > max(18, int(sw * 0.20)):
+            continue
+        density = area / max(1, bw * bh)
+        if density > 0.88 and area > 18:
+            continue
+        long_axis = max(bw / max(1, bh), bh / max(1, bw))
+        if long_axis > 28.0 and density < 0.28:
+            continue
+        touches_prompt_edge = bx <= 1 or by <= 1 or bx + bw >= raw.shape[1] - 1 or by + bh >= raw.shape[0] - 1
+        if touches_prompt_edge and area > max(24, int(support_area * 0.04)):
+            continue
+        kept[labels == label] = 255
+
+    kept_px = int(np.count_nonzero(kept))
+    if kept_px <= 0:
+        return None
+    retention = kept_px / support_area
+    if retention > 0.85:  # FIX: was 0.72; allow more retention before falling back to raw SAM2 mask
+        return None
+    if retention < 0.015 and support_area > 1200:
+        return None
+
+    refined = np.zeros_like(support)
+    refined[y1:y2, x1:x2] = kept
+    plan.debug_metrics["sam2_glyph_refinement"] = {
+        "support_px": int(support_area),
+        "refined_px": kept_px,
+        "retention": round(float(retention), 4),
+        "prompt_bbox": [int(v) for v in prompt_bbox],
+    }
+    return refined
+
+
 def _sam2_cleanup_candidate(
     img_cv: np.ndarray,
     plan: CleanupPlan,
@@ -2391,22 +2556,44 @@ def _sam2_cleanup_candidate(
         plan.debug_metrics["sam2_mask_skipped_reason"] = "sam2_disabled"
         return None
     mode = str(getattr(model_config, "sam2_mask_mode", "manual_only") or "manual_only").strip().lower()
-    if mode not in {"cleanup_assist", "container_assist"}:
+    if mode not in {"cleanup_assist", "container_assist", "auto"}:  # FIX: accept "auto" so SAM2 runs without explicit opt-in
         plan.debug_metrics["sam2_mask_skipped_reason"] = f"sam2_mode_{mode}"
         return None
     if plan.region_bbox is None:
         plan.debug_metrics["sam2_mask_skipped_reason"] = "missing_region_bbox"
         return None
+    if plan.region_class == "sfx":
+        plan.debug_metrics["sam2_mask_skipped_reason"] = "protected_region"
+        return None
 
     prompt_bbox = _expand_bbox(plan.text_bbox or plan.region_bbox, 10, img_cv.shape)
     x, y, w, h = prompt_bbox
     positive = _component_centers(plan.text_mask, prompt_bbox, limit=3)
-    negative = [
-        (x + 3.0, y + 3.0),
-        (x + max(1, w) - 4.0, y + 3.0),
-        (x + 3.0, y + max(1, h) - 4.0),
-        (x + max(1, w) - 4.0, y + max(1, h) - 4.0),
-    ]
+    # FIX: place negative clicks at container/region boundary rather than text_bbox corners,
+    # so SAM2 learns to avoid bubble walls and artwork rather than pixels near the text itself.
+    if plan.container_bbox is not None:
+        cx, cy, cw, ch = plan.container_bbox
+        negative = [
+            (cx + cw * 0.12, cy + ch * 0.12),
+            (cx + cw * 0.88, cy + ch * 0.12),
+            (cx + cw * 0.12, cy + ch * 0.88),
+            (cx + cw * 0.88, cy + ch * 0.88),
+        ]
+    elif plan.region_bbox is not None:
+        rx, ry, rw, rh = plan.region_bbox
+        negative = [
+            (rx + rw * 0.10, ry + rh * 0.10),
+            (rx + rw * 0.90, ry + rh * 0.10),
+            (rx + rw * 0.10, ry + rh * 0.90),
+            (rx + rw * 0.90, ry + rh * 0.90),
+        ]
+    else:
+        negative = [
+            (x + 3.0, y + 3.0),
+            (x + max(1, w) - 4.0, y + 3.0),
+            (x + 3.0, y + max(1, h) - 4.0),
+            (x + max(1, w) - 4.0, y + max(1, h) - 4.0),
+        ]
     try:
         url = str(getattr(model_config, "sam2_backend_url", "") or "").strip()
         if url:
@@ -2458,6 +2645,19 @@ def _sam2_cleanup_candidate(
                 return None
             full[y1:y2, x1:x2] = mask[: y2 - y1, : x2 - x1]
         full = (full > 0).astype(np.uint8) * 255
+        # FIX: skip glyph refinement on non-flat backgrounds (art, texture, gradient).
+        # Ring-based bg sampling is unreliable there → refinement over-strips outline pixels.
+        # Trust the raw SAM2 mask on those backgrounds instead.
+        _bg_for_refinement = str(plan.background_model or "")
+        _skip_refinement = _bg_for_refinement in {
+            "halftone_texture", "busy_art", "translucent_gradient", "unknown"
+        }
+        if _skip_refinement:
+            refined = None
+        else:
+            refined = _refine_sam2_mask_to_glyphs(img_cv, plan, full, prompt_bbox)
+        if refined is not None and np.any(refined):
+            full = refined
         mask_px = int(np.count_nonzero(full))
         prompt_area = max(1, int(w * h))
         if mask_px <= 0:
@@ -2491,6 +2691,7 @@ def _sam2_cleanup_candidate(
             "sam2_mask_used": True,
             "sam2_mask_px": mask_px,
             "sam2_mask_bbox": _bbox_list(_mask_bbox(full)),
+            "sam2_mask_refined_to_glyphs": bool(refined is not None),
             "sam2_mask_rejected_reason": "",
         })
         return full, max(0.62, min(0.95, conf if conf > 0 else 0.78)), "sam2_cleanup_mask(embedded)"
@@ -2618,6 +2819,106 @@ def _compute_mask_quality_metrics(
     if text_bbox is not None:
         metrics["text_bbox_area"] = int(max(1, text_bbox[2] * text_bbox[3]))
     return metrics
+
+
+def _mask_is_fragmented_broad_fallback(quality: Dict[str, Any]) -> bool:
+    mask_region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
+    component_count = int(quality.get("component_count", 0) or 0)
+    largest_component_ratio = float(quality.get("largest_component_ratio", 0.0) or 0.0)
+    rectangularity = float(quality.get("rectangularity", 0.0) or 0.0)
+    # FIX: widen thresholds — old 0.22/5/0.55 missed near-misses (e.g. 5 components, LCR=0.54)
+    return bool(
+        mask_region_ratio >= 0.20
+        and component_count >= 4
+        and largest_component_ratio <= 0.60
+        and rectangularity <= 0.72
+    )
+
+
+def _mask_is_nontrivial_for_model_inpaint(quality: Dict[str, Any]) -> bool:
+    mask_region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
+    mask_container_ratio = float(quality.get("mask_container_ratio", 0.0) or 0.0)
+    component_count = int(quality.get("component_count", 0) or 0)
+    largest_component_ratio = float(quality.get("largest_component_ratio", 0.0) or 0.0)
+    border_touch_ratio = float(quality.get("border_touch_ratio", 0.0) or 0.0)
+    # FIX: lower thresholds — text_mask is pre-expansion and already smaller than the
+    # actual cleanup mask; old 0.20/0.16 thresholds missed most routable cases.
+    return bool(
+        mask_region_ratio >= 0.12
+        or mask_container_ratio >= 0.09
+        or border_touch_ratio >= 0.25
+        or (component_count >= 3 and largest_component_ratio <= 0.70)
+    )
+
+
+def _sam2_undercovered_text_bbox(plan: CleanupPlan, mask: Optional[np.ndarray]) -> bool:
+    if mask is None or plan.text_bbox is None or plan.region_bbox is None:
+        return False
+    _tx, _ty, tw, th = plan.text_bbox
+    if tw * th < 500:
+        return False
+    mb = _mask_bbox(mask)
+    if mb is None:
+        return True
+    _mx, _my, mw, mh = mb
+    quality = _compute_mask_quality_metrics(mask, None, plan.region_bbox, plan.text_bbox)
+    mask_text_ratio = float(quality.get("mask_text_ratio", 0.0) or 0.0)
+    center_dx = abs((_mx + mw * 0.5) - (_tx + tw * 0.5)) / max(1, tw)
+    center_dy = abs((_my + mh * 0.5) - (_ty + th * 0.5)) / max(1, th)
+    return bool(
+        mask_text_ratio < 0.12
+        and (
+            (mw / max(1, tw)) < 0.35
+            or (mh / max(1, th)) < 0.30
+            or center_dx > 0.35
+            or center_dy > 0.30
+        )
+    )
+
+
+def _hard_texture_cleanup_guard_reason(
+    plan: CleanupPlan,
+    quality: Dict[str, Any],
+    policy: CleanupPolicy,
+) -> str:
+    if policy.cleanup_force_enabled:
+        return ""
+    mode = str(plan.debug_metrics.get("cleanup_override_mode", "") or "")
+    if mode in {"force_allow", "force_review", "force_telea", "force_ns", "force_iopaint"}:
+        return ""
+    source = str(plan.debug_metrics.get("selected_text_mask_candidate_source", "") or "")
+    hard_texture_hint = (
+        str(plan.debug_metrics.get("background_kind", "") or "").upper() == "TEXTURED"
+        or str(plan.debug_metrics.get("region_kind", "") or "").upper() == "TEXTURED_BUBBLE"
+        or str(plan.background_model or "") in {"halftone_texture", "busy_art", "unknown", "translucent_gradient"}
+    )
+    if not hard_texture_hint or plan.region_class not in {"speech_bubble", "caption_box"}:
+        return ""
+    mask_region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
+    mask_text_ratio = float(_cleanup_mask_metrics(
+        plan.cleanup_mask if plan.cleanup_mask is not None else plan.text_mask,
+        plan.region_bbox,
+        plan.text_bbox,
+    ).get("mask_text_ratio", 0.0) or 0.0)
+    border_touch_ratio = float(quality.get("border_touch_ratio", 0.0) or 0.0)
+    text_bbox_area = int(quality.get("text_bbox_area", 0) or 0)
+    if (
+        source in {"fallback_cv_no_bbox", "dark_caption_path"}
+        and mask_region_ratio <= 0.055
+        and (
+            border_touch_ratio >= 0.50
+            or mask_text_ratio <= 0.10
+            or text_bbox_area <= 250
+        )
+    ):
+        return "textured_cleanup_low_evidence_mask"
+    if (
+        source == "fallback_cv_no_bbox"
+        and _mask_is_fragmented_broad_fallback(quality)
+        and border_touch_ratio >= 0.25
+    ):
+        return "textured_cleanup_fragmented_border_fallback"
+    return ""
 
 
 def _select_safety_bbox(
@@ -2853,6 +3154,11 @@ def _reject_unsafe_cleanup_mask(
     border_touch_ratio = float(quality.get("border_touch_ratio", 0.0) or 0.0)
     rectangularity = float(quality.get("rectangularity", 0.0) or 0.0)
     long_bar_score = float(quality.get("long_bar_score", 0.0) or 0.0)
+    hard_texture_reason = _hard_texture_cleanup_guard_reason(plan, quality, policy)
+    if hard_texture_reason:
+        plan.debug_metrics["hard_texture_cleanup_guard"] = hard_texture_reason
+        plan.debug_metrics["review_required_after_cleanup"] = True
+        return hard_texture_reason
     easy_large_mask = bool(_easy_cleanup_large_mask_allowed(plan, policy, quality) and not boundary_damage_risk)
     if boundary_damage_risk:
         plan.debug_metrics["easy_cleanup_boundary_blocked"] = True
@@ -3209,6 +3515,33 @@ def classify_cleanup_tier(
     return 3, "skipped_unknown", "Cleanup outcome did not meet safe or cautious gates."
 
 
+def _cleanup_failure_taxonomy_for_plan(
+    plan: CleanupPlan,
+    quality: Dict[str, Any],
+    status: str = "",
+    reason: str = "",
+) -> Tuple[List[str], str]:
+    debug = plan.debug_metrics or {}
+    data = {
+        "cleanup_mask_rejected": bool(debug.get("cleanup_mask_rejected", False)),
+        "skip_reason": str(getattr(plan, "skip_reason", "") or reason or debug.get("cleanup_mask_rejection_reason", "") or ""),
+        "cleanup_strategy": str(getattr(plan, "cleanup_strategy", "") or ""),
+        "inpaint_method": str(getattr(plan, "inpaint_method", "") or ""),
+        "cleanup_backend": str(getattr(plan, "cleanup_backend", "") or debug.get("cleanup_backend", "") or ""),
+        "cleanup_failure_reason": str(debug.get("cleanup_failure_reason", "") or reason or status or ""),
+        "proposal_failure_reason": str(debug.get("proposal_failure_reason", "") or ""),
+        "cleanup_effective": bool(debug.get("cleanup_effective", False)),
+        "mask_region_ratio": quality.get("mask_region_ratio", 0.0),
+        "mask_container_ratio": quality.get("mask_container_ratio", 0.0),
+        "border_touch_ratio": quality.get("border_touch_ratio", 0.0),
+        "selected_text_mask_candidate_source": str(debug.get("selected_text_mask_candidate_source", "") or ""),
+        "text_mask_candidates": debug.get("text_mask_candidate_scores", []),
+        "debug_metrics": debug,
+    }
+    classes = classify_cleanup_failure(data)
+    return classes, primary_cleanup_failure_class(classes)
+
+
 def _write_cleanup_metadata_to_block(
     block: Any,
     plan: CleanupPlan,
@@ -3221,7 +3554,10 @@ def _write_cleanup_metadata_to_block(
     policy._apply_mode_thresholds()
     quality = _refresh_cleanup_quality(plan, img_cv)
     tier, status, reason = classify_cleanup_tier(plan, policy=policy)
+    failure_classes, failure_class = _cleanup_failure_taxonomy_for_plan(plan, quality, status, reason)
     block.cleanup_tier = tier
+    block.cleanup_failure_classes = list(failure_classes)
+    block.cleanup_failure_class = str(failure_class)
     if policy.cleanup_status_enabled:
         block.cleanup_status = status
         block.cleanup_reason = reason
@@ -3232,6 +3568,8 @@ def _write_cleanup_metadata_to_block(
         "tier": int(tier),
         "status": str(status),
         "reason": str(reason),
+        "failure_classes": list(failure_classes),
+        "failure_class": str(failure_class),
         "status_visible": bool(policy.cleanup_status_enabled),
         "review_required": bool(tier == 2 and policy.require_review_for_tier2),
         "diagnostic_only": bool(plan.debug_metrics.get("diagnostic_only", False)),
@@ -4109,9 +4447,23 @@ def build_outline_shadow_mask(
     gray     = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY).astype(np.float32)
     blurred  = cv2.GaussianBlur(gray, (radius * 2 + 1, radius * 2 + 1), 0)
     contrast = np.abs(gray - blurred)
+    lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2Lab).astype(np.float32)
+    lab_blur = cv2.GaussianBlur(lab, (radius * 2 + 1, radius * 2 + 1), 0)
+    chroma_contrast = np.sqrt(np.sum((lab - lab_blur) ** 2, axis=2))
+    hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV).astype(np.float32)
+    sat_blur = cv2.GaussianBlur(hsv[:, :, 1], (radius * 2 + 1, radius * 2 + 1), 0)
+    sat_contrast = np.abs(hsv[:, :, 1] - sat_blur)
 
+    # FIX: lower thresholds to catch soft/anti-aliased and gray outlines
     outline_cand = np.where(
-        (expansion_zone > 0) & (contrast > 18.0), 255, 0
+        (expansion_zone > 0)
+        & (
+            (contrast > 12.0)
+            | (chroma_contrast > 11.0)
+            | ((sat_contrast > 12.0) & (chroma_contrast > 7.0))
+        ),
+        255,
+        0,
     ).astype(np.uint8)
 
     # FIX-6: use normalize_mask_to_image instead of manual canvas build.
@@ -4124,6 +4476,67 @@ def build_outline_shadow_mask(
     if not np.any(outline_cand):
         return None
     return outline_cand
+
+
+def _measure_glow_radius(
+    img_cv: np.ndarray,
+    text_mask: np.ndarray,
+    bg_bgr: np.ndarray,
+    bg_sat: float,
+    max_probe: int = 40,
+) -> int:
+    """
+    Probe expanding rings around text_mask to find how far chromatic glow extends.
+
+    Samples rings at 4, 6, 8 … 40 px from the text strokes and checks what
+    fraction of ring pixels still show a significant chroma/luminance deviation
+    from the background.  Returns the outermost radius at which glow is still
+    present, or 0 if no significant glow is detected.
+
+    FIX-20: Adaptive glow-radius detection for neon / multi-layer glow text.
+    """
+    hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
+    diff_img = np.sqrt(
+        np.sum((img_cv.astype(np.float32) - bg_bgr[None, None, :]) ** 2, axis=2)
+    )
+    text_bin = (text_mask > 0).astype(np.uint8) * 255
+
+    # Thresholds: elevation above background saturation and colour distance.
+    # Cap chroma_thresh at 55 – neon glows can contaminate the bg sample and
+    # inflate bg_sat, causing the probe to miss real glow rings.
+    chroma_thresh = min(max(bg_sat + 18.0, 30.0), 55.0)
+    diff_thresh = 18.0
+    # Fraction of ring pixels that must show glow colour to count as active.
+    # Lowered 0.12→0.08: outer glow rings are diffuse and fraction drops fast.
+    glow_fraction_gate = 0.08
+
+    prev_dilated = text_bin.copy()
+    found_radius = 0
+    consecutive_misses = 0  # allow 1 weak ring before declaring glow over
+
+    for r in range(4, max_probe + 2, 2):  # probe radii: 4, 6, 8 … max_probe px
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r * 2 + 1, r * 2 + 1))
+        dilated = cv2.dilate(text_bin, k, iterations=1)
+        ring_bool = (dilated > 0) & (prev_dilated == 0)
+        ring_px = int(np.count_nonzero(ring_bool))
+        if ring_px == 0:
+            break
+
+        sat_vals  = hsv[:, :, 1][ring_bool].astype(np.float32)
+        diff_vals = diff_img[ring_bool]
+        glow_frac = float(np.mean((sat_vals > chroma_thresh) & (diff_vals > diff_thresh)))
+
+        if glow_frac >= glow_fraction_gate:
+            found_radius = r
+            consecutive_misses = 0
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= 2:
+                break  # two consecutive weak rings – glow has genuinely faded
+
+        prev_dilated = dilated
+
+    return found_radius
 
 
 def build_text_halo_mask(
@@ -4145,7 +4558,52 @@ def build_text_halo_mask(
             debug_metrics["halo_rejected_reason"] = "empty_text_mask"
         return None
 
-    radius = max(1, min(4, int(max_px or 1)))
+    # ── FIX-20: Detect chromatic glow extent before committing to a radius ───
+    #
+    # Background saturation estimate: glow pixels are always high-saturation;
+    # actual background is always low-saturation.  Sample the bottom 30th
+    # percentile of saturation among non-stroke pixels to get clean bg_sat
+    # without needing to know the glow radius first.  This works regardless
+    # of glow extent, font size, or bubble type.
+    _text_bin_pre = (text_mask > 0).astype(np.uint8) * 255
+    _excl_stroke = cv2.dilate(
+        _text_bin_pre,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    ) > 0
+    _pre_hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
+    _non_stroke = ~_excl_stroke
+    _sat_all = _pre_hsv[:, :, 1][_non_stroke].astype(np.float32)
+
+    # Dynamic probe ceiling: glow radius scales with font size (≈ sqrt of
+    # text mask area).  Clamped 24–60 px to stay safe on any input.
+    _text_mask_px = int(np.count_nonzero(_text_bin_pre))
+    _max_probe_r = min(60, max(24, int(np.sqrt(float(_text_mask_px)) * 0.4)))
+
+    if _sat_all.shape[0] >= 16:
+        _sat_cutoff = float(np.percentile(_sat_all, 30))
+        _bg_bool = _non_stroke & (_pre_hsv[:, :, 1] <= _sat_cutoff)
+        _bg_pixels = img_cv[_bg_bool]
+        if _bg_pixels.shape[0] >= 8:
+            _pre_bgr = np.median(_bg_pixels.reshape(-1, 3).astype(np.float32), axis=0)
+            _pre_sat = float(np.median(_pre_hsv[:, :, 1][_bg_bool]))
+        else:
+            _pre_bgr = np.median(img_cv[_non_stroke].reshape(-1, 3).astype(np.float32), axis=0)
+            _pre_sat = float(np.percentile(_sat_all, 30))
+        glow_radius = _measure_glow_radius(
+            img_cv, text_mask, _pre_bgr, _pre_sat, max_probe=_max_probe_r
+        )
+    else:
+        glow_radius = 0
+    glow_detected = glow_radius > 0
+    # Effective radius: honour measured glow extent, still respect max_px as a
+    # floor so normal anti-alias halos are not shrunk.  Ceiling = dynamic probe
+    # limit (scales with font size, 24–60 px).
+    effective_max = max(int(max_px or 1), glow_radius)
+    radius = max(1, min(_max_probe_r, effective_max))
+    if debug_metrics is not None:
+        debug_metrics["glow_radius_measured"] = glow_radius
+        debug_metrics["halo_effective_radius"] = radius
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
     )
@@ -4245,10 +4703,14 @@ def build_text_halo_mask(
         quality = _compute_mask_quality_metrics(halo, global_cm, region_bbox)
         rectangularity = float(quality.get("rectangularity", 0.0) or 0.0)
         mask_region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
+        # FIX-20: Neon/glow text produces large halos by design – relax gates.
+        _ratio_gate       = 8.0  if glow_detected else 1.75
+        _region_gate      = 0.75 if glow_detected else 0.18
+        _rect_ratio_gate  = 2.5  if glow_detected else 0.55
         if (
-            ratio > 1.75
-            or mask_region_ratio > 0.18
-            or (rectangularity > 0.72 and halo_px > text_px * 0.55)
+            ratio > _ratio_gate
+            or mask_region_ratio > _region_gate
+            or (rectangularity > 0.72 and halo_px > text_px * _rect_ratio_gate)
         ):
             if debug_metrics is not None:
                 debug_metrics["halo_added_px"] = 0
@@ -5126,6 +5588,28 @@ def _optimize_flat_fill_cleanup_mask(
         if np.any(confined) and preserves:
             base = confined
     max_growth = max(0, int(policy.cleanup_flat_fill_max_growth_px or 10) + int(extra_growth_px or 0))
+    base_quality = _compute_mask_quality_metrics(
+        base,
+        support if np.any(support) else None,
+        plan.region_bbox,
+        plan.text_bbox,
+        safety_bbox=_select_safety_bbox(plan),
+    )
+    broad_mask = _mask_is_nontrivial_for_model_inpaint(base_quality)
+    fragmented_fallback = (
+        str(plan.debug_metrics.get("selected_text_mask_candidate_source", "") or "") == "fallback_cv_no_bbox"
+        and _mask_is_fragmented_broad_fallback(base_quality)
+    )
+    if fragmented_fallback or broad_mask:
+        if fragmented_fallback or float(base_quality.get("mask_region_ratio", 0.0) or 0.0) >= 0.28:
+            max_growth = 0
+        else:
+            max_growth = min(max_growth, 1)
+        plan.debug_metrics["flat_fill_ladder_growth_limited"] = {
+            "max_growth_px": int(max_growth),
+            "base_quality": base_quality,
+            "reason": "fragmented_fallback" if fragmented_fallback else "broad_or_risky_mask",
+        }
     candidates: List[Tuple[np.ndarray, Dict[str, Any]]] = []
     candidate_metrics: List[Dict[str, Any]] = []
     for growth in range(0, max_growth + 1):
@@ -5323,6 +5807,414 @@ def _build_residual_guided_expansion(
     return expanded, added_px
 
 
+def _add_sam2_residual_specks(
+    img_cv: np.ndarray,
+    plan: CleanupPlan,
+) -> None:
+    if (
+        plan.text_mask is None
+        or not np.any(plan.text_mask)
+        or plan.text_bbox is None
+        or plan.region_class not in ("speech_bubble", "caption_box")
+        or str(plan.debug_metrics.get("selected_text_mask_candidate_source", "") or "") != "sam2"
+    ):
+        return
+
+    if plan.container_mask is not None and plan.container_bbox is not None:
+        scope = normalize_mask_to_image(plan.container_mask, plan.container_bbox, img_cv.shape) > 0
+    else:
+        scope = np.zeros(img_cv.shape[:2], dtype=bool)
+        rx, ry, rw, rh = plan.region_bbox
+        x1, y1 = max(0, rx), max(0, ry)
+        x2, y2 = min(img_cv.shape[1], rx + rw), min(img_cv.shape[0], ry + rh)
+        if x2 > x1 and y2 > y1:
+            scope[y1:y2, x1:x2] = True
+    if not np.any(scope):
+        return
+
+    x, y, w, h = _expand_bbox(plan.text_bbox, 14, img_cv.shape)
+    near_text = np.zeros(img_cv.shape[:2], dtype=bool)
+    near_text[y:y + h, x:x + w] = True
+    candidate_scope = scope & near_text & ~(plan.text_mask > 0)
+    if not np.any(candidate_scope):
+        return
+
+    bg_pixels = img_cv[scope & ~(plan.text_mask > 0)]
+    if bg_pixels.shape[0] < 20:
+        return
+    bg_gray = float(np.median(cv2.cvtColor(bg_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY)))
+    # FIX: old code bailed when bg_gray < 185, skipping all dark/colored bubbles.
+    # Instead, check contrast between text strokes and background. If there's enough
+    # contrast (>28 gray levels) we can recover residuals regardless of bg brightness.
+    gray_full = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    if np.any(plan.text_mask):
+        stroke_gray = float(np.median(gray_full[plan.text_mask > 0]))
+    else:
+        stroke_gray = 128.0
+    stroke_contrast = abs(bg_gray - stroke_gray)
+    if stroke_contrast < 28.0:
+        return  # text and background too similar — residual detection unreliable
+    # For dark backgrounds, glyphs are light; for light backgrounds, glyphs are dark.
+    find_dark_residuals = bg_gray >= 128.0
+
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    # FIX: use polarity based on bg brightness — dark bubble = find light residuals
+    if find_dark_residuals:
+        raw = np.where(candidate_scope & (gray < max(24.0, bg_gray - 45.0)), 255, 0).astype(np.uint8)
+    else:
+        raw = np.where(candidate_scope & (gray > min(231.0, bg_gray + 45.0)), 255, 0).astype(np.uint8)
+    if not np.any(raw):
+        return
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(raw, 8)
+    kept = np.zeros_like(raw)
+    text_px = max(1, int(np.count_nonzero(plan.text_mask)))
+    max_total = max(12, min(600, int(text_px * 0.35)))
+    base_quality = _compute_mask_quality_metrics(
+        plan.text_mask,
+        scope.astype(np.uint8) * 255,
+        plan.region_bbox,
+        plan.text_bbox,
+        safety_bbox=_select_safety_bbox(plan),
+    )
+    if _mask_is_nontrivial_for_model_inpaint(base_quality):
+        max_total = max(8, min(200, int(text_px * 0.18)))
+        plan.debug_metrics["sam2_residual_speck_budget_limited"] = {
+            "max_total_px": int(max_total),
+            "base_quality": base_quality,
+        }
+    for label in range(1, n):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < 2 or area > 80:
+            continue
+        cw = int(stats[label, cv2.CC_STAT_WIDTH])
+        ch = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if cw > max(18, w // 3) or ch > max(18, h // 3):
+            continue
+        comp = labels == label
+        touches = cv2.dilate(
+            comp.astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
+        ) > 0
+        if not np.any(touches & (plan.text_mask > 0)):
+            continue
+        kept[comp] = 255
+
+    added_px = int(np.count_nonzero(kept))
+    if added_px <= 0 or added_px > max_total:
+        return
+    plan.text_mask = cv2.bitwise_or(plan.text_mask, kept)
+    plan.debug_metrics["sam2_residual_speck_pass_px"] = added_px
+    plan.debug_metrics["sam2_residual_speck_pass_enabled"] = True
+
+
+def _recover_glyphs_inside_text_bbox(
+    img_cv: np.ndarray,
+    plan: CleanupPlan,
+) -> None:
+    """Recover missed glyph/outline pixels, constrained to the OCR text bbox."""
+    if (
+        plan.text_mask is None
+        or not np.any(plan.text_mask)
+        or plan.text_bbox is None
+        or plan.region_bbox is None
+        or plan.region_class == "sfx"
+        or plan.region_class not in {"speech_bubble", "caption_box", "text_on_art"}
+    ):
+        return
+
+    target_bbox = plan.text_bbox
+    x, y, w, h = _expand_bbox(target_bbox, 5, img_cv.shape)
+    if w <= 0 or h <= 0:
+        return
+    scope = np.zeros(img_cv.shape[:2], dtype=bool)
+    scope[y:y + h, x:x + w] = True
+    rx, ry, rw, rh = plan.region_bbox
+    region_scope = np.zeros_like(scope)
+    region_scope[max(0, ry):min(img_cv.shape[0], ry + rh), max(0, rx):min(img_cv.shape[1], rx + rw)] = True
+    scope &= region_scope
+    if plan.container_mask is not None and plan.container_bbox is not None and plan.region_class != "text_on_art":
+        global_cm = normalize_mask_to_image(plan.container_mask, plan.container_bbox, img_cv.shape) > 0
+        if np.any(global_cm):
+            scope &= global_cm
+    if int(np.count_nonzero(scope)) < 24:
+        return
+
+    active = plan.text_mask > 0
+    sample_exclude = cv2.dilate(
+        active.astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=1,
+    ) > 0
+    sample = scope & ~sample_exclude
+    if int(np.count_nonzero(sample)) < 24:
+        ring = np.zeros_like(scope)
+        ring[y:y + h, x:x + w] = True
+        ring = cv2.dilate(
+            ring.astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            iterations=1,
+        ) > 0
+        sample = ring & region_scope & ~scope
+    if int(np.count_nonzero(sample)) < 24:
+        return
+
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2Lab).astype(np.float32)
+    hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV).astype(np.float32)
+    bg_gray = float(np.median(gray[sample]))
+    bg_lab = np.median(lab[sample].reshape(-1, 3), axis=0)
+    bg_sat = float(np.median(hsv[:, :, 1][sample]))
+    lab_dist = np.sqrt(np.sum((lab - bg_lab[None, None, :]) ** 2, axis=2))
+    sat_delta = hsv[:, :, 1] - bg_sat
+    edges = cv2.Canny(gray.astype(np.uint8), 34, 110)
+    edge_band = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1) > 0
+    near_active = cv2.dilate(
+        active.astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=1,
+    ) > 0
+    missed = scope & ~active
+    raw = np.where(
+        missed
+        & (
+            (lab_dist > 28.0)
+            | (np.abs(gray - bg_gray) > 24.0)
+            | ((sat_delta > 18.0) & (lab_dist > 18.0))
+        )
+        & (edge_band | near_active | (lab_dist > 42.0)),
+        255,
+        0,
+    ).astype(np.uint8)
+    if not np.any(raw):
+        return
+    raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+    if not np.any(raw):
+        return
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(raw, 8)
+    kept = np.zeros_like(raw)
+    text_px = max(1, int(np.count_nonzero(plan.text_mask)))
+    max_total = max(24, min(2600, int(text_px * 0.75)))
+    for label in range(1, n):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        bw = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if area < 2 or area > max(260, int(text_px * 0.22)):
+            continue
+        if bw > max(72, int(w * 0.70)) and bh > max(16, int(h * 0.26)):
+            continue
+        if bh > max(72, int(h * 0.88)) and bw > max(18, int(w * 0.20)):
+            continue
+        density = area / max(1, bw * bh)
+        if density > 0.92 and area > 24:
+            continue
+        comp = labels == label
+        touches_text = np.any(
+            cv2.dilate(
+                comp.astype(np.uint8) * 255,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                iterations=1,
+            ) > 0
+            & active
+        )
+        if not touches_text and area < 5:
+            continue
+        kept[comp] = 255
+
+    added_px = int(np.count_nonzero(kept))
+    if added_px <= 0 or added_px > max_total:
+        return
+    expanded = cv2.bitwise_or(plan.text_mask, kept)
+    quality = _compute_mask_quality_metrics(
+        expanded,
+        None,
+        plan.region_bbox,
+        plan.text_bbox,
+        safety_bbox=_select_safety_bbox(plan),
+    )
+    if (
+        float(quality.get("mask_region_ratio", 0.0) or 0.0) > 0.38
+        or (
+            float(quality.get("rectangularity", 0.0) or 0.0) > 0.78
+            and float(quality.get("mask_region_ratio", 0.0) or 0.0) > 0.24
+        )
+    ):
+        return
+    plan.text_mask = expanded
+    plan.debug_metrics["text_bbox_glyph_recovery_px"] = added_px
+    plan.debug_metrics["text_bbox_glyph_recovery_scope"] = "text_bbox"
+    plan.debug_metrics["text_bbox_glyph_recovery_quality"] = quality
+
+
+def _solid_bubble_text_box_cleanup_mask(
+    img_cv: np.ndarray,
+    plan: CleanupPlan,
+    base_mask: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Use padded text boxes for genuinely solid bubbles to avoid stroke remnants."""
+    if (
+        plan.region_class not in {"speech_bubble", "caption_box"}
+        or plan.background_model not in {"flat_light", "flat_colored", "dark_bubble"}
+        or plan.text_bbox is None
+        or plan.region_bbox is None
+        or base_mask is None
+        or not np.any(base_mask)
+    ):
+        return None
+    x, y, w, h = _expand_bbox(plan.text_bbox, 5, img_cv.shape)
+    rect = np.zeros(img_cv.shape[:2], dtype=np.uint8)
+    rect[y:y + h, x:x + w] = 255
+    local = cv2.dilate(
+        rect,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+        iterations=1,
+    ) > 0
+    if plan.container_mask is not None and plan.container_bbox is not None and plan.container_confidence >= 0.35:
+        sample_scope = local & (normalize_mask_to_image(plan.container_mask, plan.container_bbox, img_cv.shape) > 0)
+    else:
+        sample_scope = local
+        rx, ry, rw, rh = plan.region_bbox
+        region_scope = np.zeros(img_cv.shape[:2], dtype=bool)
+        region_scope[max(0, ry):min(img_cv.shape[0], ry + rh), max(0, rx):min(img_cv.shape[1], rx + rw)] = True
+        sample_scope &= region_scope
+    sample = sample_scope & ~(rect > 0)
+    if int(np.count_nonzero(sample)) < 80:
+        return None
+    sample_pixels = img_cv[sample].reshape(-1, 3).astype(np.float32)
+    bg_bgr = np.median(sample_pixels, axis=0)
+    dominant = (
+        np.sqrt(np.sum((sample_pixels - bg_bgr[None, :]) ** 2, axis=1)) <= 22.0
+    )
+    gray = cv2.cvtColor(sample_pixels.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_BGR2GRAY).reshape(-1).astype(np.float32)
+    hsv = cv2.cvtColor(sample_pixels.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
+    edges = cv2.Canny(cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY), 40, 120)
+    metrics = {
+        "sample_px": int(sample_pixels.shape[0]),
+        "bg_bgr": [int(v) for v in bg_bgr],
+        "dominant_ratio": round(float(np.count_nonzero(dominant)) / max(1, int(sample_pixels.shape[0])), 4),
+        "gray_std": round(float(np.std(gray)), 3),
+        "channel_std_max": round(float(np.max(np.std(sample_pixels, axis=0))), 3),
+        "sat_std": round(float(np.std(hsv[:, 1])), 3),
+        "edge_density": round(float(np.count_nonzero(edges[sample])) / max(1, int(np.count_nonzero(sample))), 5),
+    }
+    gray_std = float(metrics.get("gray_std", 999.0) or 999.0)
+    channel_std = float(metrics.get("channel_std_max", 999.0) or 999.0)
+    sat_std = float(metrics.get("sat_std", 999.0) or 999.0)
+    edge_density = float(metrics.get("edge_density", 1.0) or 1.0)
+    dominant_ratio = float(metrics.get("dominant_ratio", 0.0) or 0.0)
+    if (
+        dominant_ratio < 0.68
+        and (gray_std > 20.0 or channel_std > 24.0 or sat_std > 28.0)
+    ) or edge_density > 0.070:
+        return None
+    if plan.container_mask is not None and plan.container_bbox is not None and plan.container_confidence >= 0.35:
+        cm = normalize_mask_to_image(plan.container_mask, plan.container_bbox, img_cv.shape)
+        if np.any(cm):
+            rect = cv2.bitwise_and(rect, cm)
+    if not np.any(rect):
+        return None
+
+    combined = cv2.bitwise_or(base_mask, rect)
+    quality = _compute_mask_quality_metrics(
+        combined,
+        normalize_mask_to_image(plan.container_mask, plan.container_bbox, img_cv.shape)
+        if plan.container_mask is not None and plan.container_bbox is not None
+        else None,
+        plan.region_bbox,
+        plan.text_bbox,
+        safety_bbox=_select_safety_bbox(plan),
+    )
+    container_ratio = float(quality.get("mask_container_ratio", 0.0) or 0.0)
+    region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
+    effective_ratio = container_ratio if container_ratio > 0.0 else region_ratio
+    if (
+        region_ratio > 0.50
+        or effective_ratio > 0.78
+        or float(quality.get("border_touch_ratio", 0.0) or 0.0) > 0.65
+    ):
+        return None
+    plan.debug_metrics["solid_bubble_text_box_cleanup"] = {
+        "added_px": int(np.count_nonzero(combined) - np.count_nonzero(base_mask)),
+        "bg_metrics": metrics,
+        "quality": quality,
+    }
+    return combined
+
+
+def _grow_tight_cleanup_mask(
+    img_cv: np.ndarray,
+    plan: CleanupPlan,
+    mask: np.ndarray,
+) -> np.ndarray:
+    """Grow tight glyph masks by a small proportional amount, then re-check safety."""
+    if (
+        mask is None
+        or not np.any(mask)
+        or plan.region_bbox is None
+        or plan.region_class == "sfx"
+        or plan.region_class not in {"speech_bubble", "caption_box", "text_on_art"}
+        or plan.background_model == "dark_bubble"
+    ):
+        return mask
+    quality = _compute_mask_quality_metrics(
+        mask,
+        normalize_mask_to_image(plan.container_mask, plan.container_bbox, img_cv.shape)
+        if plan.container_mask is not None and plan.container_bbox is not None
+        else None,
+        plan.region_bbox,
+        plan.text_bbox,
+        safety_bbox=_select_safety_bbox(plan),
+    )
+    mask_region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
+    rectangularity = float(quality.get("rectangularity", 0.0) or 0.0)
+    border_touch = float(quality.get("border_touch_ratio", 0.0) or 0.0)
+    component_count = int(quality.get("component_count", 0) or 0)
+    if mask_region_ratio > 0.38 or rectangularity > 0.82 or border_touch > 0.30:
+        return mask
+    mb = _mask_bbox(mask)
+    if mb is None:
+        return mask
+    _x, _y, mw, mh = mb
+    radius = max(2, min(8, int(round(min(mw, mh) * 0.08))))  # FIX: was max(1, 0.05) — too small for outlined glyphs
+    if radius <= 0:
+        return mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    grown = cv2.dilate((mask > 0).astype(np.uint8) * 255, kernel, iterations=1)
+    if plan.container_mask is not None and plan.container_bbox is not None and plan.container_confidence >= 0.35:
+        cm = normalize_mask_to_image(plan.container_mask, plan.container_bbox, img_cv.shape)
+        if np.any(cm):
+            grown = cv2.bitwise_and(grown, cm)
+    grown_quality = _compute_mask_quality_metrics(
+        grown,
+        normalize_mask_to_image(plan.container_mask, plan.container_bbox, img_cv.shape)
+        if plan.container_mask is not None and plan.container_bbox is not None
+        else None,
+        plan.region_bbox,
+        plan.text_bbox,
+        safety_bbox=_select_safety_bbox(plan),
+    )
+    added_px = int(np.count_nonzero(grown) - np.count_nonzero(mask))
+    if added_px <= 0:
+        return mask
+    max_region_ratio = 0.52 if plan.background_model in {"flat_light", "flat_colored", "dark_bubble"} else 0.42
+    if (
+        float(grown_quality.get("mask_region_ratio", 0.0) or 0.0) > max_region_ratio
+        or float(grown_quality.get("mask_container_ratio", 0.0) or 0.0) > 0.66
+        or float(grown_quality.get("border_touch_ratio", 0.0) or 0.0) > 0.38
+    ):
+        return mask
+    plan.debug_metrics["tight_mask_growth"] = {
+        "radius_px": int(radius),
+        "added_px": int(added_px),
+        "component_count": int(component_count),
+        "before": quality,
+        "after": grown_quality,
+    }
+    return grown
+
+
 def _mark_residual_review(plan: CleanupPlan) -> None:
     plan.skip_reason = "cleanup_residual_text_remains"
     plan.debug_metrics["review_required_after_cleanup"] = True
@@ -5351,6 +6243,7 @@ def select_strategy(
     container_confidence: float,
     auto_clean_sfx: bool = False,
     policy: Optional[CleanupPolicy] = None,
+    model_config: Optional[Any] = None,  # FIX: added so LaMa pre-check can inspect backend
 ) -> Tuple[str, str]:
     """
     Return (cleanup_strategy, inpaint_method) based on classification.
@@ -5364,6 +6257,15 @@ def select_strategy(
 
     if policy.cleanup_manual_review_only:
         return "review", "skip"
+
+    # FIX (Bug 5): if LaMa is configured as the backend, route ALL non-SFX regions with
+    # sufficient mask confidence to mask_inpaint rather than falling through to skip/review.
+    # This prevents text_on_art, halftone_texture, busy_art, gradient bubbles from being
+    # silently skipped even though LaMa can handle them.
+    if model_config is not None and region_class not in {"sfx"}:
+        _cfg_backend = str(getattr(model_config, "cleanup_backend", "") or "").strip().lower()
+        if _cfg_backend in _MODEL_INPAINT_BACKENDS and text_mask_confidence >= 0.22:
+            return "mask_inpaint", "telea"
 
     if text_mask_confidence < 0.12 and region_class != "caption_box":
         return "skip", "skip"
@@ -5453,6 +6355,50 @@ def select_strategy(
     return "review", "skip"
 
 
+def _route_model_backend_for_nontrivial_solid_mask(plan: CleanupPlan, backend: str) -> bool:
+    if (
+        backend not in _MODEL_INPAINT_BACKENDS
+        or plan.cleanup_strategy != "flat_fill"
+        or plan.region_class not in {"speech_bubble", "caption_box"}
+        or plan.background_model not in {"flat_light", "flat_colored", "dark_bubble"}
+        or plan.text_mask is None
+        or not np.any(plan.text_mask)
+    ):
+        return False
+    quality_container = None
+    if plan.container_mask is not None and plan.container_bbox is not None:
+        quality_container = normalize_mask_to_image(
+            plan.container_mask, plan.container_bbox, plan.text_mask.shape
+        )
+    # FIX: probe cleanup_mask (post-halo/outline expansion) when available.
+    # text_mask is pre-expansion and may have a much smaller ratio, causing this
+    # function to return False even though the actual cleanup mask is overbroad.
+    probe_mask = (
+        plan.cleanup_mask
+        if plan.cleanup_mask is not None and np.any(plan.cleanup_mask)
+        else plan.text_mask
+    )
+    quality = _compute_mask_quality_metrics(
+        probe_mask,
+        quality_container,
+        plan.region_bbox,
+        plan.text_bbox,
+        safety_bbox=_select_safety_bbox(plan),
+    )
+    if not _mask_is_nontrivial_for_model_inpaint(quality):
+        return False
+    plan.cleanup_backend = backend
+    plan.cleanup_strategy = "mask_inpaint"
+    plan.inpaint_method = "telea"
+    plan.skip_reason = ""
+    plan.debug_metrics["cleanup_route"] = "model_inpaint_solid_bubble"
+    plan.debug_metrics["model_inpaint_required"] = True
+    plan.debug_metrics["cleanup_strategy_source"] = "cleanup_backend"
+    plan.debug_metrics["flat_fill_disabled_by_config"] = True
+    plan.debug_metrics["model_inpaint_solid_mask_quality"] = quality
+    return True
+
+
 def _hybrid_cleanup_route(
     plan: CleanupPlan,
     policy: CleanupPolicy,
@@ -5477,6 +6423,32 @@ def _hybrid_cleanup_route(
     if bg in {"flat_light", "flat_colored", "dark_bubble"}:
         region_kind = str(plan.debug_metrics.get("region_kind", "") or "")
         textured_solid = bg == "dark_bubble" and region_kind == "TEXTURED_BUBBLE"
+        if _route_model_backend_for_nontrivial_solid_mask(plan, configured_backend):
+            if model_config is not None:
+                plan.iopaint_url = str(getattr(model_config, "iopaint_url", "") or "")
+                plan.lama_model_path = str(getattr(model_config, "lama_model_path", "") or "")
+                try:
+                    plan.max_tile_size = int(getattr(model_config, "max_tile_size", plan.max_tile_size) or plan.max_tile_size)
+                except (TypeError, ValueError):
+                    pass
+            return
+        if configured_backend in _MODEL_INPAINT_BACKENDS and not policy.cleanup_solid_bubble_fill_enabled:
+            plan.debug_metrics["cleanup_route"] = "model_inpaint_solid_bubble"
+            plan.debug_metrics["model_inpaint_required"] = True
+            plan.debug_metrics["flat_fill_disabled_by_config"] = True
+            plan.debug_metrics["cleanup_strategy_source"] = "cleanup_backend"
+            plan.cleanup_backend = configured_backend
+            plan.cleanup_strategy = "mask_inpaint"
+            plan.inpaint_method = "telea"
+            plan.skip_reason = ""
+            if model_config is not None:
+                plan.iopaint_url = str(getattr(model_config, "iopaint_url", "") or "")
+                plan.lama_model_path = str(getattr(model_config, "lama_model_path", "") or "")
+                try:
+                    plan.max_tile_size = int(getattr(model_config, "max_tile_size", plan.max_tile_size) or plan.max_tile_size)
+                except (TypeError, ValueError):
+                    pass
+            return
         if textured_solid and (prefers_lama or prefers_iopaint):
             plan.debug_metrics["cleanup_route"] = "model_inpaint_solid_bubble"
             plan.debug_metrics["model_inpaint_required"] = True
@@ -5675,6 +6647,7 @@ def build_cleanup_plan(
     """
     from backend.core.regions import RegionKind  # lazy import – avoids circular
 
+    _coerce_config_bool_fields(model_config)
     policy = cleanup_policy or (
         CleanupPolicy.from_config(model_config) if model_config is not None else CleanupPolicy(auto_clean_sfx=auto_clean_sfx)
     )
@@ -5838,6 +6811,63 @@ def build_cleanup_plan(
             },
             *candidate_rows,
         ]
+    filtered_candidates: List[Tuple[np.ndarray, float, str]] = []
+    rejected_fallback_reasons: List[Dict[str, Any]] = []
+    for cand_mask, cand_conf, cand_reason in candidates:
+        source = _candidate_source_from_reason(cand_reason)
+        if source == "fallback_cv_no_bbox":
+            cand_quality = _compute_mask_quality_metrics(
+                cand_mask,
+                None,
+                plan.region_bbox,
+                plan.text_bbox,
+            )
+            if _mask_is_fragmented_broad_fallback(cand_quality):
+                rejected_fallback_reasons.append({
+                    "reason": cand_reason,
+                    "quality": cand_quality,
+                    "rejection_reason": "fragmented_broad_fallback_cv_no_bbox",
+                })
+                for row in candidate_rows:
+                    if isinstance(row, dict) and row.get("reason") == cand_reason:
+                        row["accepted"] = False
+                        row["selected"] = False
+                        row["rejection_reason"] = "fragmented_broad_fallback_cv_no_bbox"
+                continue
+        filtered_candidates.append((cand_mask, cand_conf, cand_reason))
+    if rejected_fallback_reasons:
+        plan.debug_metrics["fallback_cv_no_bbox_rejected"] = rejected_fallback_reasons
+    candidates = filtered_candidates
+    if candidates:
+        first_mask, _first_conf, first_reason = candidates[0]
+        if _candidate_source_from_reason(first_reason) == "sam2" and _sam2_undercovered_text_bbox(plan, first_mask):
+            sam2_px = max(1, int(np.count_nonzero(first_mask)))
+            alternatives: List[Tuple[int, Tuple[np.ndarray, float, str], Dict[str, Any]]] = []
+            for idx, (cand_mask, cand_conf, cand_reason) in enumerate(candidates[1:], start=1):
+                source = _candidate_source_from_reason(cand_reason)
+                if source in {"sam2", "fallback_cv_no_bbox", "dark_caption_path"}:
+                    continue
+                cand_px = int(np.count_nonzero(cand_mask))
+                cand_quality = _compute_mask_quality_metrics(cand_mask, None, plan.region_bbox, plan.text_bbox)
+                if (
+                    cand_conf >= 0.35
+                    and cand_px >= int(sam2_px * 1.8)
+                    and float(cand_quality.get("mask_region_ratio", 0.0) or 0.0) <= 0.38
+                ):
+                    alternatives.append((idx, (cand_mask, cand_conf, cand_reason), cand_quality))
+            if alternatives:
+                alt_idx, alt, alt_quality = alternatives[0]
+                candidates = [alt, *candidates[:alt_idx], *candidates[alt_idx + 1:]]
+                plan.debug_metrics["sam2_undercovered_text_bbox_demoted"] = {
+                    "sam2_reason": first_reason,
+                    "selected_reason": alt[2],
+                    "alternative_quality": alt_quality,
+                }
+                for row in candidate_rows:
+                    if isinstance(row, dict) and row.get("reason") == first_reason:
+                        row["accepted"] = True
+                        row["selected"] = False
+                        row["demoted_reason"] = "sam2_undercovered_text_bbox"
     plan.debug_metrics["text_mask_candidate_scores"] = candidate_rows
     if candidates:
         best_mask, best_conf, best_reason = candidates[0]
@@ -5911,6 +6941,8 @@ def build_cleanup_plan(
             plan.container_confidence = 0.0
             plan.container_reason     = f"error:{exc}"
 
+    _add_sam2_residual_specks(img_cv, plan)
+    _recover_glyphs_inside_text_bbox(img_cv, plan)
     _expand_large_glyph_components(img_cv, plan, policy)
 
     # ── Outline / shadow expansion ────────────────────────────────────────────
@@ -6033,6 +7065,7 @@ def build_cleanup_plan(
         plan.container_confidence,
         auto_clean_sfx=auto_clean_sfx,
         policy=policy,
+        model_config=model_config,  # FIX: pass model_config for LaMa pre-check
     )
     if plan.background_model == "translucent_gradient":
         detail_score = float(plan.debug_metrics.get("translucent_detail_score", 0.0) or 0.0)
@@ -6171,7 +7204,6 @@ def build_cleanup_plan(
             cleanup = cv2.bitwise_or(cleanup, plan.outline_shadow_mask)
         if plan.halo_mask is not None:
             cleanup = cv2.bitwise_or(cleanup, plan.halo_mask)
-
         # Confine to container_mask if available and high-confidence.
         # FIX-6: use normalize_mask_to_image instead of manual canvas build.
         if (
@@ -6193,9 +7225,23 @@ def build_cleanup_plan(
             elif np.any(confined):
                 plan.debug_metrics["container_confine_ignored"] = "partial_container_mask"
 
-        cleanup = _optimize_flat_fill_cleanup_mask(img_cv, plan, cleanup, policy)
+        if (
+            plan.cleanup_backend in _MODEL_INPAINT_BACKENDS
+            and plan.debug_metrics.get("flat_fill_disabled_by_config") is True
+        ):
+            plan.debug_metrics["flat_fill_ladder_enabled"] = False
+            plan.debug_metrics["flat_fill_ladder_rejection_reason"] = "disabled_by_backend_route"
+        else:
+            cleanup = _optimize_flat_fill_cleanup_mask(img_cv, plan, cleanup, policy)
+        cleanup_before_tight_growth = cleanup.copy()
+        cleanup = _grow_tight_cleanup_mask(img_cv, plan, cleanup)
         cleanup = _constrain_flat_fill_boundary_mask(img_cv, plan, cleanup)
         reject_reason = _reject_unsafe_cleanup_mask(plan, cleanup, policy=policy, img_cv=img_cv)
+        if reject_reason and plan.debug_metrics.get("tight_mask_growth"):
+            plan.debug_metrics["tight_mask_growth_reverted"] = str(reject_reason)
+            plan.debug_metrics.pop("tight_mask_growth", None)
+            cleanup = cleanup_before_tight_growth
+            reject_reason = _reject_unsafe_cleanup_mask(plan, cleanup, policy=policy, img_cv=img_cv)
         if reject_reason and policy.cleanup_force_enabled:
             plan.debug_metrics["force_cleanup_bypassed_rejection"] = str(reject_reason)
             reject_reason = ""
@@ -6349,21 +7395,25 @@ def execute_cleanup_plan(
             and plan.container_bbox is not None
         ):
             extra_growth = int(plan.debug_metrics.get("cleanup_flat_fill_retry_extra_growth_px", 2) or 2)
-            ladder_retry = _optimize_flat_fill_cleanup_mask(
-                img_cv,
-                plan,
-                mask,
-                CleanupPolicy(
-                    cleanup_flat_fill_ladder_enabled=True,
-                    cleanup_flat_fill_max_growth_px=int(plan.debug_metrics.get("cleanup_flat_fill_max_growth_px", 10) or 10),
-                    cleanup_flat_fill_retry_extra_growth_px=extra_growth,
-                    cleanup_flat_fill_ring_px=int(plan.debug_metrics.get("cleanup_flat_fill_ring_px", 3) or 3),
-                    cleanup_flat_fill_max_ring_gray_std=float(plan.debug_metrics.get("cleanup_flat_fill_max_ring_gray_std", 14.0) or 14.0),
-                    cleanup_flat_fill_max_ring_chroma_std=float(plan.debug_metrics.get("cleanup_flat_fill_max_ring_chroma_std", 12.0) or 12.0),
-                    cleanup_flat_fill_max_ring_edge_density=float(plan.debug_metrics.get("cleanup_flat_fill_max_ring_edge_density", 0.08) or 0.08),
-                ),
-                extra_growth_px=extra_growth,
-            )
+            ladder_retry = None
+            if bool(plan.debug_metrics.get("flat_fill_ladder_enabled", True)):
+                ladder_retry = _optimize_flat_fill_cleanup_mask(
+                    img_cv,
+                    plan,
+                    mask,
+                    CleanupPolicy(
+                        cleanup_flat_fill_ladder_enabled=True,
+                        cleanup_flat_fill_max_growth_px=int(plan.debug_metrics.get("cleanup_flat_fill_max_growth_px", 10) or 10),
+                        cleanup_flat_fill_retry_extra_growth_px=extra_growth,
+                        cleanup_flat_fill_ring_px=int(plan.debug_metrics.get("cleanup_flat_fill_ring_px", 3) or 3),
+                        cleanup_flat_fill_max_ring_gray_std=float(plan.debug_metrics.get("cleanup_flat_fill_max_ring_gray_std", 14.0) or 14.0),
+                        cleanup_flat_fill_max_ring_chroma_std=float(plan.debug_metrics.get("cleanup_flat_fill_max_ring_chroma_std", 12.0) or 12.0),
+                        cleanup_flat_fill_max_ring_edge_density=float(plan.debug_metrics.get("cleanup_flat_fill_max_ring_edge_density", 0.08) or 0.08),
+                    ),
+                    extra_growth_px=extra_growth,
+                )
+            else:
+                plan.debug_metrics["flat_fill_ladder_retry_skipped"] = "disabled_by_config"
             if ladder_retry is not None and np.any(ladder_retry) and int(np.count_nonzero(ladder_retry)) > int(np.count_nonzero(mask)):
                 retry_used = True
                 plan.cleanup_mask = ladder_retry
@@ -6874,6 +7924,9 @@ def _guard_flat_bubble_smear(
     plan: CleanupPlan,
 ) -> None:
     """Retry flat bubble cleanup with sampled fill if inpaint dirties the bubble."""
+    if str(plan.cleanup_backend or "").strip().lower() in _MODEL_INPAINT_BACKENDS:
+        plan.debug_metrics["flat_bubble_smear_guard"] = "skipped_model_inpaint"
+        return
     if (
         plan.region_class not in ("speech_bubble", "caption_box")
         or plan.background_model not in ("flat_light", "flat_colored")
@@ -7136,6 +8189,7 @@ def _try_external_inpaint_backend(
     if override_mode in {"force_telea", "force_ns"}:
         return False
     backend = (plan.cleanup_backend or "opencv").strip().lower()
+    plan.debug_metrics["cleanup_backend_used"] = backend
     if backend not in {"iopaint", "lama_onnx", "lama_pt"}:
         return False
     if backend == "iopaint" and not (plan.iopaint_url or "").strip():
@@ -7334,6 +8388,7 @@ def erase_text_region_planned(
         )
     """
     result = img_cv.copy()
+    _coerce_config_bool_fields(model_config)
     policy = cleanup_policy or (
         CleanupPolicy.from_config(model_config) if model_config is not None else CleanupPolicy(
             cleanup_mode=cleanup_mode,
@@ -7371,7 +8426,9 @@ def erase_text_region_planned(
             cleanup_policy=policy,
             model_config=model_config,
         )
-        plan.cleanup_backend = cleanup_backend or "opencv"
+        configured_backend = str(getattr(model_config, "cleanup_backend", "") or "").strip().lower() if model_config is not None else ""
+        requested_backend = configured_backend or str(cleanup_backend or "opencv").strip().lower()
+        plan.cleanup_backend = requested_backend
         plan.iopaint_url = iopaint_url or ""
         if model_config is not None:
             plan.lama_model_path = str(getattr(model_config, "lama_model_path", "") or "")
@@ -7384,6 +8441,28 @@ def erase_text_region_planned(
             or plan.debug_metrics.get("cleanup_fallback_backend") == "iopaint"
         ):
             plan.cleanup_backend = "iopaint"
+        plan.debug_metrics["cleanup_backend_requested"] = requested_backend
+        plan.debug_metrics["cleanup_backend_used"] = plan.cleanup_backend
+        plan.debug_metrics.setdefault("cleanup_strategy_source", "selector")
+        plan.debug_metrics.setdefault("flat_fill_disabled_by_config", False)
+        plan.debug_metrics["mask_backend_used"] = (
+            "sam2" if bool(plan.debug_metrics.get("sam2_mask_used", False)) else "cv"
+        )
+        _route_model_backend_for_nontrivial_solid_mask(plan, plan.cleanup_backend)
+        if (
+            plan.cleanup_backend in _MODEL_INPAINT_BACKENDS
+            and not policy.cleanup_solid_bubble_fill_enabled
+            and plan.region_class in ("speech_bubble", "caption_box")
+            and plan.background_model in {"flat_light", "flat_colored", "dark_bubble"}
+            and plan.cleanup_strategy == "flat_fill"
+        ):
+            plan.cleanup_strategy = "mask_inpaint"
+            plan.inpaint_method = "telea"
+            plan.skip_reason = ""
+            plan.debug_metrics["cleanup_route"] = "model_inpaint_solid_bubble"
+            plan.debug_metrics["model_inpaint_required"] = True
+            plan.debug_metrics["cleanup_strategy_source"] = "cleanup_backend"
+            plan.debug_metrics["flat_fill_disabled_by_config"] = True
 
         # Apply explicit override if set, but still route through the plan
         # so all mask-safety invariants are honoured.
@@ -7430,6 +8509,7 @@ def erase_text_region_planned(
                     plan.cleanup_mask            = cleanup
                     plan.cleanup_mask_confidence = plan.text_mask_confidence
 
+        plan.debug_metrics["cleanup_backend_used"] = plan.cleanup_backend
         execute_cleanup_plan(img_cv, result, plan)
         _write_cleanup_metadata_to_block(block, plan, img_cv, policy=policy)
         if (
@@ -7467,6 +8547,7 @@ def summarize_cleanup_plan(plan: "CleanupPlan") -> Dict[str, Any]:
     safe_rect = plan.debug_metrics.get("cleanup_safe_rect")
     safe_conf = float(plan.debug_metrics.get("cleanup_safe_rect_confidence", 0.0) or 0.0)
     safe_reason = str(plan.debug_metrics.get("cleanup_safe_rect_reason", "") or "")
+    failure_classes, failure_class = _cleanup_failure_taxonomy_for_plan(plan, quality)
     return {
         "region_class":          plan.region_class,
         "background_model":      plan.background_model,
@@ -7477,6 +8558,8 @@ def summarize_cleanup_plan(plan: "CleanupPlan") -> Dict[str, Any]:
         "cleanup_tier":          None,
         "cleanup_status":        None,
         "cleanup_reason":        None,
+        "failure_classes":       list(failure_classes),
+        "failure_class":         str(failure_class),
         "skip_reason":           plan.skip_reason,
         "mask_region_ratio":     round(float(quality.get("mask_region_ratio", 0.0) or 0.0), 4),
         "border_touch_ratio":    round(float(quality.get("border_touch_ratio", 0.0) or 0.0), 4),

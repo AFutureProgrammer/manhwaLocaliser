@@ -57,6 +57,38 @@ Each run writes the following files to the output directory:
 - `cleaned_page_preview.png`: full-page cleaned preview.
 - `report.json`: metrics, strategy, confidence, skip reason, artifact paths, and raw planner debug metrics.
 
+Reports also include `failure_classes` and `failure_class`, using the canonical cleanup failure taxonomy:
+`bad_text_mask`, `bad_container_mask`, `unsafe_mask_rejection`, `bad_cleanup_routing`,
+`bad_flat_fill`, `bad_inpaint_backend`, `halo_residual`, `leftover_glyphs`, `art_damage`,
+`overcleanup`, `undercleanup`, and `needs_manual_mask`.
+
+## Batch QA manifest mode
+
+Run a manifest of cleanup cases without starting the app:
+
+```powershell
+python tools/cleanup_lab/cleanup_lab.py ^
+  --manifest tools\cleanup_lab\fixtures\cleanup_qa_manifest.json ^
+  --out tools\cleanup_lab\outputs\cleanup_qa
+```
+
+Each case gets its own output folder with `original_crop.png`, `text_mask.png`, `container_mask.png`,
+`cleanup_mask.png`, `overlay.png`, `cleaned_crop.png`, `cleaned_page_preview.png`, and `report.json`.
+The batch folder also gets `review_manifest.json`, which records expected outcome, actual outcome,
+failure classes, backend used, mask quality, inpaint quality, and final pass/fail.
+
+The runner prints a concise table with case id, strategy, method, failure class, mask ratios, result,
+and output folder. When using this workflow, keep iterating on one failing case at a time: inspect
+the images and `report.json`, classify the failure, patch only the responsible cleanup path, rerun
+the same case, then add or update a focused regression test before moving to the next case. If a
+case cannot be made visually correct, leave an exact blocker in the review manifest notes or issue
+comment with the artifact path and evidence.
+
+The default manifest covers plain bubble, colored bubble, textured bubble, dark caption, and
+text-over-art/SFX protected behavior. Current cleanup regressions are covered by focused tests in
+`backend/core/test_cleanup_pipeline.py`, including colored local fill, dark caption fill, textured
+halftone routing, and SFX protection cases.
+
 ## Fixture format
 
 Use a small JSON file with only the fields needed for the experiment:

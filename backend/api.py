@@ -42,6 +42,13 @@ class PywebviewAPI:
         {"ok": True,  ...result fields...}    on success
         {"ok": False, "error": "...message"}  on failure
     This way the React side never has to catch exceptions from the API.
+
+    NOTE ON pageIdx / editPageIdx PARAMETERS
+    ─────────────────────────────────────────
+    The TypeScript frontend (api.ts) passes pageIdx (and sometimes editPageIdx)
+    as trailing optional args to most region-mutation methods so it can work
+    across pages without navigating.  Methods whose engine counterpart supports
+    page context forward those arguments so edits land on the intended page.
     """
 
     def __init__(self, engine: LocalizerEngine) -> None:
@@ -278,12 +285,6 @@ class PywebviewAPI:
         """
         Return the requested page image mode as a base64 PNG.
         mode ∈ {"best", "raw", "cleaned", "typeset"}.
-        The React canvas sets:  <img src={`data:image/png;base64,${result.b64}`} />
-
-        Pass 2: the response also carries ``render_version`` — a server-authored
-        monotonically-increasing counter bumped whenever the page's cleaned/
-        typeset state changes. The frontend uses it in cache keys so freshly
-        produced images show up immediately without a client-side race.
         """
         try:
             idx_i = int(idx)
@@ -302,30 +303,33 @@ class PywebviewAPI:
             return self._err(exc)
 
     # ── Region editing ────────────────────────────────────────────────────────
+    #
+    # IMPORTANT: The JS frontend (api.ts) sends pageIdx / editPageIdx so region
+    # actions target the owning page even while the visible page is different.
 
-    def update_region(self, region_idx: int, field: str, value: Any) -> dict:
-        """
-        Update a single field on a region.
-        field ∈ {"translation", "text", "font_name", "font_size", "align", "visible", "locked"}
-        """
+    def update_region(self, region_idx: int, field: str, value: Any,
+                      page_idx: Optional[int] = None) -> dict:
         if self._engine.busy:
             return self._err(RuntimeError("Already running — wait for the current step to finish."))
         try:
-            bootstrap = self._engine.update_region_field(int(region_idx), field, value)
+            bootstrap = self._engine.update_region_field(int(region_idx), field, value, page_idx)
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
 
-    def update_region_bbox(self, region_idx: int, x: int, y: int, w: int, h: int, page_idx: Optional[int] = None) -> dict:
+    def update_region_bbox(self, region_idx: int, x: int, y: int, w: int, h: int,
+                           page_idx: Optional[int] = None,
+                           edit_page_idx: Optional[int] = None) -> dict:
         if self._engine.busy:
             return self._err(RuntimeError("Already running — wait for the current step to finish."))
         try:
-            bootstrap = self._engine.update_region_bbox(int(region_idx), x, y, w, h, page_idx)
+            bootstrap = self._engine.update_region_bbox(int(region_idx), x, y, w, h, page_idx, edit_page_idx)
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
 
-    def get_region_preview_sprite(self, region_idx: int, draft: Optional[dict] = None, page_idx: Optional[int] = None) -> dict:
+    def get_region_preview_sprite(self, region_idx: int, draft: Optional[dict] = None,
+                                  page_idx: Optional[int] = None) -> dict:
         try:
             return self._ok(**self._engine.get_region_preview_sprite(int(region_idx), draft or {}, page_idx))
         except Exception as exc:
@@ -337,20 +341,22 @@ class PywebviewAPI:
         except Exception as exc:
             return self._err(exc)
 
-    def add_region(self, x: int, y: int, w: int, h: int, text: str = "") -> dict:
+    def add_region(self, x: int, y: int, w: int, h: int, text: str = "",
+                   page_idx: Optional[int] = None) -> dict:
         if self._engine.busy:
             return self._err(RuntimeError("Already running — wait for the current step to finish."))
         try:
-            bootstrap = self._engine.add_region(x, y, w, h, text)
+            bootstrap = self._engine.add_region(x, y, w, h, text, page_idx)
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
 
-    def delete_region(self, region_idx: int, yolo_reject_reason: str = "") -> dict:
+    def delete_region(self, region_idx: int, yolo_reject_reason: str = "",
+                      page_idx: Optional[int] = None) -> dict:
         if self._engine.busy:
             return self._err(RuntimeError("Already running — wait for the current step to finish."))
         try:
-            bootstrap = self._engine.delete_region(int(region_idx), str(yolo_reject_reason or ""))
+            bootstrap = self._engine.delete_region(int(region_idx), str(yolo_reject_reason or ""), page_idx)
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
@@ -361,9 +367,10 @@ class PywebviewAPI:
         except Exception as exc:
             return self._err(exc)
 
-    def set_yolo_train_class(self, region_idx: int, class_id: int) -> dict:
+    def set_yolo_train_class(self, region_idx: int, class_id: int,
+                             page_idx: Optional[int] = None) -> dict:
         try:
-            bootstrap = self._engine.set_yolo_train_class(int(region_idx), int(class_id))
+            bootstrap = self._engine.set_yolo_train_class(int(region_idx), int(class_id), page_idx)
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
@@ -380,33 +387,35 @@ class PywebviewAPI:
         except Exception as exc:
             return self._err(exc)
 
-    def ocr_region(self, region_idx: int) -> dict:
+    def ocr_region(self, region_idx: int, page_idx: Optional[int] = None) -> dict:
         if self._engine.busy:
             return self._err(RuntimeError("Already running — wait for the current step to finish."))
         try:
-            bootstrap = self._engine.ocr_region(int(region_idx))
+            bootstrap = self._engine.ocr_region(int(region_idx), page_idx)
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
 
-    def translate_region(self, region_idx: int) -> dict:
+    def translate_region(self, region_idx: int, page_idx: Optional[int] = None) -> dict:
         if self._engine.busy:
             return self._err(RuntimeError("Already running — wait for the current step to finish."))
         try:
-            bootstrap = self._engine.translate_region(int(region_idx))
+            bootstrap = self._engine.translate_region(int(region_idx), page_idx)
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
 
-    def preview_region_cleanup(self, region_idx: int, manual_mask: Optional[dict] = None) -> dict:
+    def preview_region_cleanup(self, region_idx: int, manual_mask: Optional[dict] = None,
+                               page_idx: Optional[int] = None) -> dict:
         try:
-            return self._engine.preview_region_cleanup(int(region_idx), manual_mask if isinstance(manual_mask, dict) else None)
+            return self._engine.preview_region_cleanup(int(region_idx), manual_mask if isinstance(manual_mask, dict) else None, page_idx)
         except Exception as exc:
             return self._err(exc)
 
-    def propose_cleanup_mask_sam2(self, region_idx: int, prompt: Optional[dict] = None) -> dict:
+    def propose_cleanup_mask_sam2(self, region_idx: int, prompt: Optional[dict] = None,
+                                  page_idx: Optional[int] = None) -> dict:
         try:
-            return self._engine.propose_cleanup_mask_sam2(int(region_idx), prompt if isinstance(prompt, dict) else None)
+            return self._engine.propose_cleanup_mask_sam2(int(region_idx), prompt if isinstance(prompt, dict) else None, page_idx)
         except Exception as exc:
             return self._err(exc)
 
@@ -416,15 +425,17 @@ class PywebviewAPI:
         except Exception as exc:
             return self._err(exc)
 
-    def get_region_cleanup_debug(self, region_idx: int, manual_mask: Optional[dict] = None) -> dict:
+    def get_region_cleanup_debug(self, region_idx: int, manual_mask: Optional[dict] = None,
+                                 page_idx: Optional[int] = None) -> dict:
         try:
-            return self._engine.get_region_cleanup_debug(int(region_idx), manual_mask if isinstance(manual_mask, dict) else None)
+            return self._engine.get_region_cleanup_debug(int(region_idx), manual_mask if isinstance(manual_mask, dict) else None, page_idx)
         except Exception as exc:
             return self._err(exc)
 
-    def record_mask_qa_label(self, region_idx: int, label: str, notes: str = "") -> dict:
+    def record_mask_qa_label(self, region_idx: int, label: str, notes: str = "",
+                             page_idx: Optional[int] = None) -> dict:
         try:
-            return self._engine.record_mask_qa_label(int(region_idx), str(label or ""), str(notes or ""))
+            return self._engine.record_mask_qa_label(int(region_idx), str(label or ""), str(notes or ""), page_idx)
         except Exception as exc:
             return self._err(exc)
 
@@ -440,44 +451,51 @@ class PywebviewAPI:
         except Exception as exc:
             return self._err(exc)
 
-    def compare_region_cleanup_candidates(self, region_idx: int, manual_mask: Optional[dict] = None) -> dict:
+    def compare_region_cleanup_candidates(self, region_idx: int, manual_mask: Optional[dict] = None,
+                                          page_idx: Optional[int] = None) -> dict:
         try:
-            return self._engine.compare_region_cleanup_candidates(int(region_idx), manual_mask if isinstance(manual_mask, dict) else None)
+            return self._engine.compare_region_cleanup_candidates(int(region_idx), manual_mask if isinstance(manual_mask, dict) else None, page_idx)
         except Exception as exc:
             return self._err(exc)
 
-    def apply_region_cleanup_candidate(self, region_idx: int, candidate_id: str, manual_mask: Optional[dict] = None) -> dict:
+    def apply_region_cleanup_candidate(self, region_idx: int, candidate_id: str,
+                                       manual_mask: Optional[dict] = None,
+                                       page_idx: Optional[int] = None) -> dict:
         try:
             bootstrap = self._engine.apply_region_cleanup_candidate(
                 int(region_idx),
                 str(candidate_id or "default"),
                 manual_mask if isinstance(manual_mask, dict) else None,
+                page_idx,
             )
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
 
-    def apply_region_cleanup(self, region_idx: int, manual_mask: Optional[dict] = None) -> dict:
+    def apply_region_cleanup(self, region_idx: int, manual_mask: Optional[dict] = None,
+                             page_idx: Optional[int] = None) -> dict:
         try:
-            bootstrap = self._engine.apply_region_cleanup(int(region_idx), manual_mask=manual_mask if isinstance(manual_mask, dict) else None)
+            bootstrap = self._engine.apply_region_cleanup(int(region_idx), manual_mask=manual_mask if isinstance(manual_mask, dict) else None, page_idx=page_idx)
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
 
-    def rerun_region_cleanup(self, region_idx: int, manual_mask: Optional[dict] = None) -> dict:
+    def rerun_region_cleanup(self, region_idx: int, manual_mask: Optional[dict] = None,
+                             page_idx: Optional[int] = None) -> dict:
         try:
             bootstrap = self._engine.apply_region_cleanup(
                 int(region_idx),
                 rerun=True,
                 manual_mask=manual_mask if isinstance(manual_mask, dict) else None,
+                page_idx=page_idx,
             )
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
 
-    def delete_region_cleanup(self, region_idx: int) -> dict:
+    def delete_region_cleanup(self, region_idx: int, page_idx: Optional[int] = None) -> dict:
         try:
-            bootstrap = self._engine.delete_region_cleanup(int(region_idx))
+            bootstrap = self._engine.delete_region_cleanup(int(region_idx), page_idx)
             return self._ok(**bootstrap)
         except Exception as exc:
             return self._err(exc)
@@ -564,8 +582,7 @@ class PywebviewAPI:
             return self._err(exc)
 
     def get_thumbnail_b64(self, url: str = "", path: str = "") -> dict:
-        """Fetch a thumbnail (by URL or local path) and return it as a base64 data-URI.
-        Handles Naver hotlink protection by sending the correct Referer header."""
+        """Fetch a thumbnail (by URL or local path) and return it as a base64 data-URI."""
         try:
             return self._engine.get_thumbnail_b64(url or "", path or "")
         except Exception as exc:

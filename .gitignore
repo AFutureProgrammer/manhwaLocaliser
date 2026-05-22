@@ -5,7 +5,7 @@ backend/terminal.txt
 !.env.example
 .venv/
 model_config.local.json
-run_deepseek_local.local.bat
+run_deepseek_local.bat
 series_memory/
 source_naver_comic_*/
 tools/cleanup_lab/outputs/

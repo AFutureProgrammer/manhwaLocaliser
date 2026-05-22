@@ -74,6 +74,8 @@ export interface Region {
   cleanup_tier?:   number;
   cleanup_status?: string;
   cleanup_reason?: string;
+  failure_classes?: string[];
+  failure_class?: string;
   cleanup_patch?: CleanupPatchInfo | null;
   cleanup_override?: CleanupOverride;
   cleanup_container_confidence?: number;
@@ -114,6 +116,8 @@ export interface CleanupPatchInfo {
   review_required?: boolean;
   cleanup_status?: string;
   cleanup_reason?: string;
+  failure_classes?: string[];
+  failure_class?: string;
   rerun?: boolean;
   manual_mask_used?: boolean;
   grouped_inpaint?: boolean;
@@ -153,6 +157,12 @@ export interface CleanupDebugMask {
   available?: boolean;
 }
 
+export interface CleanupDebugPreview {
+  b64?: string | null;
+  bbox?: number[] | null;
+  available?: boolean;
+}
+
 export interface CleanupDebugResponse extends ApiResponse {
   analysis?: CleanupQaAnalysis;
   boxes?: {
@@ -169,6 +179,12 @@ export interface CleanupDebugResponse extends ApiResponse {
     manual_mask?: CleanupDebugMask;
     grouped_mask?: CleanupDebugMask;
   };
+  previews?: {
+    raw_crop?: CleanupDebugPreview;
+    cleaned_crop?: CleanupDebugPreview;
+    typeset_crop?: CleanupDebugPreview;
+    overlay?: CleanupDebugPreview;
+  };
 }
 
 export interface CleanupQaAnalysis {
@@ -181,6 +197,9 @@ export interface CleanupQaAnalysis {
   cleanup_status?: string;
   cleanup_reason?: string;
   skip_reason?: string;
+  failure_classes?: string[];
+  failure_class?: string;
+  cleanup_backend?: string;
   background_model?: string;
   container_confidence?: number;
   text_mask_confidence?: number;

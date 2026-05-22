@@ -16,7 +16,10 @@ if str(ROOT) not in sys.path:
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from tool_image_io import imread_unicode, imwrite_unicode  # noqa: E402
+from backend.core.cleanup_failure_taxonomy import (  # noqa: E402
+    classify_cleanup_failure,
+    primary_cleanup_failure_class,
+)
 from backend.core.cleanup_plan import (  # noqa: E402
     CleanupPolicy,
     build_cleanup_plan,
@@ -30,6 +33,23 @@ from backend.core.regions import OCRBlock, RegionKind, RegionOverride, _block_fr
 LAB_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUTS_DIR = LAB_DIR / "outputs"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+
+
+def imread_unicode(path: str) -> Optional[np.ndarray]:
+    data = np.fromfile(path, dtype=np.uint8)
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
+def imwrite_unicode(path: str, arr: np.ndarray) -> bool:
+    ext = Path(path).suffix or ".png"
+    ok, encoded = cv2.imencode(ext, arr)
+    if not ok:
+        return False
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    encoded.tofile(path)
+    return True
 
 
 def _json_safe(value: Any) -> Any:
@@ -496,11 +516,248 @@ def _write_artifacts(out_dir: Path, image: np.ndarray, cleaned: np.ndarray, plan
         "artifacts": files,
     }
     report.update(report["effectiveness"])
+    failure_classes = classify_cleanup_failure(report)
+    report["failure_classes"] = failure_classes
+    report["failure_class"] = primary_cleanup_failure_class(failure_classes)
     report_path = out_dir / "report.json"
     with report_path.open("w", encoding="utf-8") as f:
         json.dump(_json_safe(report), f, indent=2, ensure_ascii=False)
     files["report.json"] = str(report_path)
     return files
+
+
+def _source_for_inline_fixture(case: Dict[str, Any], manifest_path: Path) -> Tuple[Path, List[Tuple[str, OCRBlock, Dict[str, Any]]], int, Dict[str, Any]]:
+    image_value = case.get("image") or case.get("page_image")
+    if not image_value:
+        raise ValueError("manifest case requires 'image' or 'page_image'")
+    image_path = Path(str(image_value)).expanduser()
+    if not image_path.is_absolute():
+        image_path = (manifest_path.parent / image_path).resolve()
+    region = case.get("region")
+    if not isinstance(region, dict):
+        raise ValueError("manifest case requires inline 'region' object when 'regions' is not provided")
+    region_id = str(case.get("region_id") or region.get("id") or region.get("region_id") or "R-01")
+    raw_region = dict(region)
+    raw_region.setdefault("id", region_id)
+    page_index = int(case.get("page_index", case.get("page_index_zero_based", 0)) or 0)
+    return image_path, [(region_id, _make_fixture_block(raw_region), raw_region)], page_index, {
+        "mode": "manifest_inline",
+        "manifest": str(manifest_path),
+        "case_id": str(case.get("case_id") or region_id),
+    }
+
+
+def _load_manifest_case(case: Dict[str, Any], manifest_path: Path) -> Tuple[Path, List[Tuple[str, OCRBlock, Dict[str, Any]]], int, Dict[str, Any]]:
+    if case.get("chapter"):
+        page = int(case.get("page") or 0)
+        if page <= 0 and not bool(case.get("zero_based_page")):
+            raise ValueError("chapter manifest case requires one-based 'page' unless zero_based_page=true")
+        image_path, regions, page_index = _load_chapter_page(
+            (manifest_path.parent / str(case["chapter"])).resolve()
+            if not Path(str(case["chapter"])).is_absolute()
+            else Path(str(case["chapter"])).resolve(),
+            page,
+            bool(case.get("zero_based_page", False)),
+        )
+        return image_path, regions, page_index, {
+            "mode": "manifest_chapter",
+            "manifest": str(manifest_path),
+            "chapter": str(case["chapter"]),
+            "page_arg": page,
+        }
+
+    if case.get("regions"):
+        regions_path = Path(str(case["regions"])).expanduser()
+        if not regions_path.is_absolute():
+            regions_path = (manifest_path.parent / regions_path).resolve()
+        fixture_image, regions = _load_fixture(regions_path)
+        image_value = case.get("image") or case.get("page_image")
+        image_path = Path(str(image_value)).expanduser() if image_value else fixture_image
+        if image_path is None:
+            raise ValueError("manifest case requires image/page_image or fixture page_image")
+        if not image_path.is_absolute():
+            image_path = (manifest_path.parent / image_path).resolve()
+        page_index = int(case.get("page_index", case.get("page_index_zero_based", 0)) or 0)
+        return image_path, regions, page_index, {
+            "mode": "manifest_fixture",
+            "manifest": str(manifest_path),
+            "regions": str(regions_path),
+        }
+
+    return _source_for_inline_fixture(case, manifest_path)
+
+
+def _cleanup_verdict(report: Dict[str, Any]) -> str:
+    if report.get("cleanup_effective") and not report.get("failure_classes"):
+        return "pass"
+    if report.get("cleanup_effective"):
+        return "review"
+    if report.get("strategy") in {"review", "skip"} or report.get("skip_reason"):
+        return "review"
+    return "fail"
+
+
+def _case_output_dir(batch_out: Path, case_id: str) -> Path:
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in case_id).strip("_")
+    return batch_out / (safe or "case")
+
+
+def _string_list(value: Any) -> List[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item or "").strip()]
+    return [str(value)]
+
+
+def run_manifest(manifest_path: Path, out_dir: Path) -> Dict[str, Any]:
+    with manifest_path.open("r", encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    cases = manifest.get("cases") if isinstance(manifest, dict) else None
+    if not isinstance(cases, list):
+        raise ValueError("cleanup QA manifest must contain a 'cases' list")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    review_cases: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for idx, case_obj in enumerate(cases, start=1):
+        if not isinstance(case_obj, dict):
+            continue
+        case_id = str(case_obj.get("case_id") or f"case_{idx:03d}")
+        try:
+            image_path, regions, page_index, source = _load_manifest_case(case_obj, manifest_path)
+            inline_region = case_obj.get("region")
+            region_id = str(
+                case_obj.get("region_id")
+                or (inline_region.get("id") if isinstance(inline_region, dict) else "")
+                or "R-01"
+            )
+            region_id, block, raw_region = _select_region(regions, region_id)
+            image = imread_unicode(str(image_path))
+            if image is None:
+                raise FileNotFoundError(f"could not read image: {image_path}")
+            cfg = ModelConfig()
+            policy = CleanupPolicy.from_config(cfg)
+            plan = build_cleanup_plan(
+                image,
+                block,
+                page_index=page_index,
+                region_id=region_id,
+                cleanup_debug_artifacts=False,
+                cleanup_policy=policy,
+                model_config=cfg,
+            )
+            plan.cleanup_backend = "opencv"
+            cleaned = image.copy()
+            execute_cleanup_plan(image, cleaned, plan)
+            validate_cleanup_proposal(
+                image,
+                cleaned,
+                plan,
+                destructive_allowed=True,
+                production_patch_accepted=False,
+                validation_source="cleanup_lab_manifest",
+            )
+            source.update({"image": str(image_path), "raw_region": raw_region})
+            case_dir = _case_output_dir(out_dir, case_id)
+            files = _write_artifacts(case_dir, image, cleaned, plan, source)
+            report = _read_report(files["report.json"])
+            expected_outcome = str(case_obj.get("expected_outcome") or "").strip()
+            actual_outcome = _cleanup_verdict(report)
+            expected_classes = _string_list(
+                case_obj.get("expected_failure_classes")
+                if "expected_failure_classes" in case_obj
+                else case_obj.get("expected_failure_class")
+            )
+            failure_classes = list(report.get("failure_classes") or [])
+            expected_met = not expected_outcome or expected_outcome == actual_outcome
+            if expected_classes:
+                expected_met = expected_met and all(item in failure_classes for item in expected_classes)
+            quality = report.get("debug_metrics", {}).get("quality", {}) or {}
+            review_cases.append({
+                "case_id": case_id,
+                "region_id": region_id,
+                "page_index_zero_based": int(page_index),
+                "expected_outcome": expected_outcome,
+                "actual_outcome": actual_outcome,
+                "expected_failure_classes": expected_classes,
+                "actual_failure_class": report.get("failure_class", ""),
+                "failure_classes": failure_classes,
+                "backend_used": report.get("debug_metrics", {}).get("cleanup_backend_used", report.get("cleanup_backend", "opencv")),
+                "strategy": report.get("strategy", ""),
+                "method": report.get("inpaint_method", ""),
+                "mask_quality": {
+                    "mask_region_ratio": quality.get("mask_region_ratio", report.get("mask_region_ratio", 0.0)),
+                    "mask_container_ratio": quality.get("mask_container_ratio", report.get("mask_container_ratio", 0.0)),
+                    "border_touch_ratio": quality.get("border_touch_ratio", report.get("border_touch_ratio", 0.0)),
+                    "rectangularity": quality.get("rectangularity", report.get("rectangularity", 0.0)),
+                },
+                "inpaint_quality": {
+                    "cleanup_effective": bool(report.get("cleanup_effective", False)),
+                    "residual_text_visible": bool(report.get("residual_text_visible", False)),
+                    "visual_quality_ok": bool(report.get("visual_quality_ok", False)),
+                    "cleanup_failure_reason": str(report.get("cleanup_failure_reason", "") or ""),
+                },
+                "final_result": "pass" if expected_met else "fail",
+                "artifacts": files,
+                "output_dir": str(case_dir),
+                "notes": str(case_obj.get("notes") or ""),
+            })
+        except Exception as exc:
+            errors.append({"case_id": case_id, "error": str(exc)})
+            review_cases.append({
+                "case_id": case_id,
+                "actual_outcome": "error",
+                "actual_failure_class": "needs_manual_mask",
+                "failure_classes": ["needs_manual_mask"],
+                "final_result": "fail",
+                "error": str(exc),
+                "output_dir": str(_case_output_dir(out_dir, case_id)),
+            })
+
+    review_manifest = {
+        "schema_version": 1,
+        "source_manifest": str(manifest_path),
+        "summary": {
+            "case_count": len(review_cases),
+            "pass_count": sum(1 for item in review_cases if item.get("final_result") == "pass"),
+            "fail_count": sum(1 for item in review_cases if item.get("final_result") == "fail"),
+            "error_count": len(errors),
+        },
+        "cases": review_cases,
+        "errors": errors,
+    }
+    review_path = out_dir / "review_manifest.json"
+    with review_path.open("w", encoding="utf-8") as fh:
+        json.dump(_json_safe(review_manifest), fh, ensure_ascii=False, indent=2)
+    return {"review_manifest": review_manifest, "review_path": str(review_path), "out_dir": str(out_dir)}
+
+
+def _read_report(path: str) -> Dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    return data if isinstance(data, dict) else {}
+
+
+def _print_manifest_summary(result: Dict[str, Any]) -> None:
+    manifest = result["review_manifest"]
+    print(f"cleanup_lab manifest cases={manifest['summary']['case_count']} out={result['out_dir']}")
+    print("case_id\tstrategy\tmethod\tfailure_class\tmask_region\tmask_container\tresult\toutput")
+    for case in manifest.get("cases", []):
+        quality = case.get("mask_quality") or {}
+        print(
+            "\t".join([
+                str(case.get("case_id", "")),
+                str(case.get("strategy", "")),
+                str(case.get("method", "")),
+                str(case.get("actual_failure_class", "")),
+                f"{float(quality.get('mask_region_ratio', 0.0) or 0.0):.4f}",
+                f"{float(quality.get('mask_container_ratio', 0.0) or 0.0):.4f}",
+                str(case.get("final_result", "")),
+                str(case.get("output_dir", "")),
+            ])
+        )
+    print(f"review_manifest: {result['review_path']}")
 
 
 def _default_out(image_path: Path, region_id: str) -> Path:
@@ -509,8 +766,16 @@ def _default_out(image_path: Path, region_id: str) -> Path:
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.manifest:
+        manifest_path = Path(args.manifest).resolve()
+        out_dir = Path(args.out).resolve() if args.out else (DEFAULT_OUTPUTS_DIR / manifest_path.stem).resolve()
+        result = run_manifest(manifest_path, out_dir)
+        _print_manifest_summary(result)
+        return 0
     if args.export_fixture:
         return export_fixture(args)
+    if not args.region_id:
+        raise ValueError("--region-id is required unless --manifest is used")
     page_index = 0
     source: Dict[str, Any] = {"mode": "fixture"}
     if args.chapter:
@@ -578,8 +843,9 @@ def main() -> int:
     parser.add_argument("--page", type=int, help="page number for --chapter mode; one-based unless --zero-based-page is set")
     parser.add_argument("--zero-based-page", action="store_true", help="treat --page as zero-based")
     parser.add_argument("--page-index", type=int, default=0, help="zero-based page index to store in report for fixture mode")
-    parser.add_argument("--region-id", required=True, help="region id such as R-01")
+    parser.add_argument("--region-id", help="region id such as R-01")
     parser.add_argument("--out", help="output directory; defaults to tools/cleanup_lab/outputs/<image>_<region>")
+    parser.add_argument("--manifest", help="run a cleanup QA manifest containing multiple cases")
     parser.add_argument("--export-fixture", help="write a standalone fixture JSON from --chapter/--page/--region-id and exit")
     try:
         return run(parser.parse_args())

@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "description": "Representative cleanup QA cases for the manifest runner. Cases are synthetic, small, and deterministic so agents can rerun them without opening the app.",
+  "cases": [
+    {
+      "case_id": "plain_bubble",
+      "image": "qa_cases/plain_bubble.png",
+      "region_id": "R-01",
+      "expected_outcome": "pass",
+      "notes": "Plain white dialogue bubble with dark text.",
+      "region": {
+        "id": "R-01",
+        "bbox": [40, 40, 180, 100],
+        "text": "테스트",
+        "role": "dialog",
+        "kind": "PLAIN_BUBBLE",
+        "yolo_kind": "dialogue",
+        "detector": "yolo",
+        "detector_confidence": 0.9,
+        "boxes": [[[82, 76], [178, 76], [178, 104], [82, 104]]],
+        "bubble_bbox": [40, 40, 180, 100],
+        "safe_rect": [48, 48, 164, 84]
+      }
+    },
+    {
+      "case_id": "colored_bubble",
+      "image": "qa_cases/colored_bubble.png",
+      "region_id": "R-01",
+      "expected_outcome": "pass",
+      "notes": "Colored bubble should use sampled local fill, not force white.",
+      "region": {
+        "id": "R-01",
+        "bbox": [40, 40, 180, 100],
+        "text": "테스트",
+        "role": "dialog",
+        "kind": "PLAIN_BUBBLE",
+        "yolo_kind": "dialogue",
+        "detector": "yolo",
+        "detector_confidence": 0.9,
+        "boxes": [[[82, 76], [178, 76], [178, 104], [82, 104]]],
+        "bubble_bbox": [40, 40, 180, 100],
+        "safe_rect": [48, 48, 164, 84]
+      }
+    },
+    {
+      "case_id": "textured_bubble",
+      "image": "qa_cases/textured_bubble.png",
+      "region_id": "R-01",
+      "expected_outcome": "pass",
+      "notes": "Halftone texture should route away from flat fill and remain artifact-free.",
+      "region": {
+        "id": "R-01",
+        "bbox": [40, 40, 180, 100],
+        "text": "테스트",
+        "role": "dialog",
+        "kind": "TEXTURED_BUBBLE",
+        "yolo_kind": "dialogue",
+        "detector": "yolo",
+        "detector_confidence": 0.9,
+        "boxes": [[[82, 76], [178, 76], [178, 104], [82, 104]]],
+        "bubble_bbox": [40, 40, 180, 100],
+        "safe_rect": [48, 48, 164, 84]
+      }
+    },
+    {
+      "case_id": "dark_caption",
+      "image": "qa_cases/dark_caption.png",
+      "region_id": "R-01",
+      "expected_outcome": "pass",
+      "notes": "Dark caption with light text should sample a dark fill.",
+      "region": {
+        "id": "R-01",
+        "bbox": [40, 45, 181, 51],
+        "text": "캡션",
+        "role": "caption",
+        "kind": "CAPTION_BOX",
+        "yolo_kind": "caption",
+        "detector": "yolo",
+        "detector_confidence": 0.9,
+        "boxes": [[[78, 58], [178, 58], [178, 84], [78, 84]]],
+        "bubble_bbox": [40, 45, 181, 51],
+        "safe_rect": [42, 47, 177, 47]
+      }
+    },
+    {
+      "case_id": "sfx_over_art_protected",
+      "image": "qa_cases/sfx_over_art.png",
+      "region_id": "R-01",
+      "expected_outcome": "review",
+      "expected_failure_class": "needs_manual_mask",
+      "notes": "SFX over art should be protected by default instead of destructive flat fill.",
+      "region": {
+        "id": "R-01",
+        "bbox": [35, 35, 185, 85],
+        "text": "쾅",
+        "role": "sfx",
+        "kind": "SFX_OVER_ART",
+        "yolo_kind": "sfx",
+        "yolo_class_id": 2,
+        "detector": "yolo",
+        "detector_confidence": 0.9,
+        "boxes": [[[55, 52], [180, 52], [180, 102], [55, 102]]],
+        "bubble_bbox": [35, 35, 185, 85],
+        "safe_rect": [35, 35, 185, 85]
+      }
+    }
+  ]
+}

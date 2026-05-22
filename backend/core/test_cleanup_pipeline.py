@@ -1787,7 +1787,7 @@ class CleanupPipelineTests(unittest.TestCase):
 
         self.assertEqual(engine._translations, ["current"])
 
-    def test_run_all_processes_each_page_through_all_steps_before_next_page(self):
+    def test_run_all_processes_all_pages_phase_first(self):
         engine = LocalizerEngine.__new__(LocalizerEngine)
         calls = []
         chapter_mgr = SimpleNamespace(
@@ -1826,10 +1826,76 @@ class CleanupPipelineTests(unittest.TestCase):
         self.assertEqual(
             step_calls,
             [
-                ("detect", 0), ("ocr", 0), ("translate", 0), ("cleanup", 0), ("typeset", 0),
-                ("detect", 1), ("ocr", 1), ("translate", 1), ("cleanup", 1), ("typeset", 1),
+                ("detect", 0), ("detect", 1),
+                ("ocr", 0), ("ocr", 1),
+                ("translate", 0), ("translate", 1),
+                ("cleanup", 0), ("cleanup", 1),
+                ("typeset", 0), ("typeset", 1),
             ],
         )
+
+    def test_missing_required_translation_keeps_cross_page_primary(self):
+        engine = LocalizerEngine.__new__(LocalizerEngine)
+        engine.model_config = SimpleNamespace(process_sfx_regions=False)
+        block = _dialogue_block((40, 40, 180, 100), text="테스트")
+        block.cross_page = True
+        engine._regions = [block]
+        engine._translations = [""]
+
+        self.assertEqual(engine._missing_required_translation_indices(), [0])
+
+    def test_missing_required_translation_skips_cross_page_secondary(self):
+        engine = LocalizerEngine.__new__(LocalizerEngine)
+        engine.model_config = SimpleNamespace(process_sfx_regions=False)
+        block = _dialogue_block((40, 40, 180, 100), text="테스트")
+        block.cross_page = True
+        block.cleanup_meta["cross_page_secondary"] = True
+        engine._regions = [block]
+        engine._translations = [""]
+
+        self.assertEqual(engine._missing_required_translation_indices(), [])
+
+    def test_missing_required_translation_skips_sfx_when_disabled(self):
+        engine = LocalizerEngine.__new__(LocalizerEngine)
+        engine.model_config = SimpleNamespace(process_sfx_regions=False)
+        block = _dialogue_block((40, 40, 180, 100), text="쾅", kind=RegionKind.SFX_OVER_ART)
+        block.bubble_role = "sfx"
+        block.yolo_kind = "sfx"
+        engine._regions = [block]
+        engine._translations = [""]
+
+        self.assertEqual(engine._missing_required_translation_indices(), [])
+
+    def test_api_forwards_page_indices_to_engine(self):
+        sys.modules.setdefault("webview", SimpleNamespace(windows=[]))
+        from backend.api import PywebviewAPI
+
+        calls = []
+
+        class FakeEngine:
+            busy = False
+
+            def update_region_field(self, *args):
+                calls.append(("field", args))
+                return {"ok": True}
+
+            def update_region_bbox(self, *args):
+                calls.append(("bbox", args))
+                return {"ok": True}
+
+            def ocr_region(self, *args):
+                calls.append(("ocr", args))
+                return {"ok": True}
+
+        api = PywebviewAPI(FakeEngine())
+
+        self.assertTrue(api.update_region(2, "text", "x", 5)["ok"])
+        self.assertTrue(api.update_region_bbox(2, 1, 2, 3, 4, 5, 6)["ok"])
+        self.assertTrue(api.ocr_region(2, 5)["ok"])
+
+        self.assertEqual(calls[0], ("field", (2, "text", "x", 5)))
+        self.assertEqual(calls[1], ("bbox", (2, 1, 2, 3, 4, 5, 6)))
+        self.assertEqual(calls[2], ("ocr", (2, 5)))
 
     def test_run_all_flags_missing_translation_and_continues(self):
         engine = LocalizerEngine.__new__(LocalizerEngine)

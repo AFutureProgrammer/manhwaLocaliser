@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "description": "Small deterministic cleanup planner fixtures. Each case stores the minimal region metadata needed to run build_cleanup_plan without OCR, LLMs, backend servers, or app startup.",
+  "default_model_config": {
+    "cleanup_backend": "opencv",
+    "sam2_enabled": false,
+    "cleanup_solid_bubble_fill_enabled": true,
+    "cleanup_allow_texture_telea": true,
+    "cleanup_allow_translucent_caption": true,
+    "cleanup_allow_text_over_art": false,
+    "cleanup_allow_sfx_cleanup": false
+  },
+  "cases": [
+    {
+      "id": "plain_white_bubble",
+      "description": "Plain white dialogue bubble with dark text.",
+      "image": "images/plain_white_bubble.png",
+      "region": {
+        "bbox": [40, 40, 180, 100],
+        "text": "테스트",
+        "role": "dialog",
+        "kind": "PLAIN_BUBBLE",
+        "detector": "fixture",
+        "confidence": 0.9,
+        "text_mask_rects": [[82, 76, 96, 28]]
+      },
+      "expected": {
+        "strategies": ["flat_fill"],
+        "methods": ["local_sample"],
+        "mask_region_ratio": [0.12, 0.20],
+        "mask_container_ratio": [0.12, 0.20],
+        "production_allowed": true
+      }
+    },
+    {
+      "id": "off_white_bubble",
+      "description": "Yellowed/off-white scan bubble; cleanup may use deterministic inpaint instead of forcing pure white.",
+      "image": "images/off_white_bubble.png",
+      "region": {
+        "bbox": [40, 40, 180, 100],
+        "text": "테스트",
+        "role": "dialog",
+        "kind": "PLAIN_BUBBLE",
+        "detector": "fixture",
+        "confidence": 0.9,
+        "text_mask_rects": [[82, 76, 96, 28]]
+      },
+      "expected": {
+        "strategies": ["flat_fill", "mask_inpaint"],
+        "methods": ["local_sample", "telea"],
+        "mask_region_ratio": [0.12, 0.20],
+        "mask_container_ratio": [0.12, 0.20],
+        "production_allowed": true
+      }
+    },
+    {
+      "id": "colored_bubble",
+      "description": "Colored dialogue bubble should sample local color instead of painting white.",
+      "image": "images/colored_bubble.png",
+      "region": {
+        "bbox": [40, 40, 180, 100],
+        "text": "테스트",
+        "role": "dialog",
+        "kind": "PLAIN_BUBBLE",
+        "detector": "fixture",
+        "confidence": 0.9,
+        "text_mask_rects": [[82, 76, 96, 28]]
+      },
+      "expected": {
+        "strategies": ["flat_fill"],
+        "methods": ["local_sample"],
+        "mask_region_ratio": [0.12, 0.20],
+        "mask_container_ratio": [0.18, 0.30],
+        "production_allowed": true
+      }
+    },
+    {
+      "id": "textured_bubble",
+      "description": "Textured bubble is protected when texture cleanup is not explicitly enabled.",
+      "image": "images/textured_bubble.png",
+      "region": {
+        "bbox": [40, 40, 180, 100],
+        "text": "테스트",
+        "role": "dialog",
+        "kind": "TEXTURED_BUBBLE",
+        "detector": "fixture",
+        "confidence": 0.9,
+        "text_mask_rects": [[82, 76, 96, 28]]
+      },
+      "expected": {
+        "strategies": ["skip"],
+        "methods": ["skip"],
+        "skip_contains": "texture",
+        "mask_region_ratio": [0.12, 0.20],
+        "mask_container_ratio": [0.12, 0.20],
+        "production_allowed": false
+      }
+    },
+    {
+      "id": "dark_caption",
+      "description": "Dark caption with light text should sample dark local fill.",
+      "image": "images/dark_caption.png",
+      "region": {
+        "bbox": [40, 45, 181, 51],
+        "text": "캡션",
+        "role": "caption",
+        "kind": "CAPTION_BOX",
+        "detector": "fixture",
+        "confidence": 0.9,
+        "text_mask_rects": [[78, 58, 100, 26]]
+      },
+      "expected": {
+        "strategies": ["flat_fill"],
+        "methods": ["local_sample"],
+        "mask_region_ratio": [0.16, 0.24],
+        "mask_container_ratio": [0.16, 0.24],
+        "production_allowed": true
+      }
+    },
+    {
+      "id": "gradient_bubble",
+      "description": "Mild gradient bubble remains eligible for deterministic local cleanup.",
+      "image": "images/gradient_bubble.png",
+      "region": {
+        "bbox": [40, 40, 180, 100],
+        "text": "테스트",
+        "role": "dialog",
+        "kind": "GRADIENT_BUBBLE",
+        "detector": "fixture",
+        "confidence": 0.9,
+        "text_mask_rects": [[82, 76, 96, 28]]
+      },
+      "expected": {
+        "strategies": ["flat_fill", "gradient_fill"],
+        "methods": ["local_sample", "gradient"],
+        "mask_region_ratio": [0.12, 0.20],
+        "mask_container_ratio": [0.12, 0.20],
+        "production_allowed": true
+      }
+    },
+    {
+      "id": "halftone_bubble",
+      "description": "Halftone bubble with broad mask should be rejected/protected instead of overcleaned.",
+      "image": "images/halftone_bubble.png",
+      "region": {
+        "bbox": [40, 40, 180, 100],
+        "text": "테스트",
+        "role": "dialog",
+        "kind": "TEXTURED_BUBBLE",
+        "detector": "fixture",
+        "confidence": 0.9,
+        "text_mask_rects": [[82, 76, 96, 28]]
+      },
+      "expected": {
+        "strategies": ["skip"],
+        "methods": ["skip"],
+        "skip_contains": "cleanup_mask",
+        "mask_region_ratio": [0.12, 0.20],
+        "mask_container_ratio": [0.18, 0.30],
+        "production_allowed": false
+      }
+    },
+    {
+      "id": "translucent_caption",
+      "description": "Translucent caption with light text should keep mask ratios bounded.",
+      "image": "images/translucent_caption.png",
+      "region": {
+        "bbox": [30, 28, 200, 90],
+        "text": "캡션",
+        "role": "caption",
+        "kind": "CAPTION_BOX",
+        "detector": "fixture",
+        "confidence": 0.9,
+        "text_mask_rects": [[75, 58, 100, 30]]
+      },
+      "expected": {
+        "strategies": ["flat_fill", "gradient_fill", "mask_inpaint"],
+        "methods": ["local_sample", "gradient", "telea"],
+        "mask_region_ratio": [0.08, 0.14],
+        "mask_container_ratio": [0.08, 0.14],
+        "production_allowed": true
+      }
+    },
+    {
+      "id": "text_over_art",
+      "description": "Dialogue over art is protected by default.",
+      "image": "images/text_over_art.png",
+      "region": {
+        "bbox": [35, 35, 190, 95],
+        "text": "효과",
+        "role": "dialog",
+        "kind": "DIALOGUE_OVER_ART",
+        "detector": "fixture",
+        "confidence": 0.9,
+        "text_mask_rects": [[54, 62, 150, 45]]
+      },
+      "expected": {
+        "strategies": ["skip"],
+        "methods": ["skip"],
+        "skip_contains": "text_over_art",
+        "mask_region_ratio": [0.30, 0.45],
+        "mask_container_ratio": [0.0, 0.01],
+        "production_allowed": false
+      }
+    },
+    {
+      "id": "sfx_protected",
+      "description": "SFX over art is protected by default.",
+      "image": "images/sfx_protected.png",
+      "region": {
+        "bbox": [35, 35, 185, 95],
+        "text": "쾅",
+        "role": "sfx",
+        "kind": "SFX_OVER_ART",
+        "yolo_kind": "sfx",
+        "yolo_class_id": 2,
+        "detector": "fixture",
+        "confidence": 0.9,
+        "text_mask_rects": [[55, 64, 120, 50]]
+      },
+      "expected": {
+        "strategies": ["skip"],
+        "methods": ["skip"],
+        "skip_contains": "sfx",
+        "mask_region_ratio": [0.28, 0.40],
+        "mask_container_ratio": [0.0, 0.01],
+        "production_allowed": false
+      }
+    }
+  ]
+}

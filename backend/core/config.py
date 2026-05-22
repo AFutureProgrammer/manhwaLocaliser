@@ -51,7 +51,7 @@ class ModelConfig:
     auto_typeset_sfx: bool = False
     auto_clean_text_over_art: bool = False
     auto_clean_busy_background: bool = False
-    require_review_for_tier2: bool = True
+    require_review_for_tier2: bool = False
     allow_gradient_fill: bool = True
     allow_texture_inpaint: bool = True
     sfx_experimental_cleanup_mode: str = "off"

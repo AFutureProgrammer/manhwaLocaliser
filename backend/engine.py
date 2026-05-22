@@ -103,6 +103,7 @@ from backend.core.cleanup_plan import (
     summarize_cleanup_plan,
     validate_cleanup_proposal,
 )
+from backend.core.cleanup_failure_taxonomy import CLEANUP_FAILURE_CLASSES
 from backend.core.config import ModelConfig
 from backend.core import sam2_mask
 from backend.core.constants import (
@@ -2118,6 +2119,25 @@ class LocalizerEngine:
             if k not in {"patch_png_b64", "mask_png_b64"}
         }
 
+    @staticmethod
+    def _cleanup_failure_fields(source: Any) -> Dict[str, Any]:
+        if isinstance(source, dict):
+            meta = source
+            attr_classes: List[Any] = []
+            attr_primary = ""
+        else:
+            meta = getattr(source, "cleanup_meta", {}) or {}
+            attr_classes = list(getattr(source, "cleanup_failure_classes", []) or [])
+            attr_primary = str(getattr(source, "cleanup_failure_class", "") or "")
+        raw_classes = meta.get("failure_classes") or meta.get("cleanup_failure_classes") or attr_classes
+        classes = []
+        for item in raw_classes or []:
+            name = str(item or "").strip()
+            if name and name not in classes:
+                classes.append(name)
+        primary = str(meta.get("failure_class") or meta.get("cleanup_failure_class") or attr_primary or (classes[0] if classes else ""))
+        return {"failure_classes": classes, "failure_class": primary}
+
     def _json_safe(self, value: Any) -> Any:
         try:
             return json.loads(json.dumps(value, default=str, ensure_ascii=False))
@@ -2166,6 +2186,31 @@ class LocalizerEngine:
             "bbox": [int(x), int(y), int(w), int(h)],
             "available": bool(mask is not None and np.any(mask)),
         }
+
+    def _encode_image_crop(self, img_cv: Optional[np.ndarray], bbox: Tuple[int, int, int, int]) -> Dict[str, Any]:
+        if img_cv is None:
+            x, y, w, h = [int(v) for v in bbox]
+            return {"b64": None, "bbox": [x, y, w, h], "available": False}
+        ih, iw = img_cv.shape[:2]
+        x, y, w, h = [int(v) for v in bbox]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(iw, x + w), min(ih, y + h)
+        if x2 <= x1 or y2 <= y1:
+            return {"b64": None, "bbox": [x, y, w, h], "available": False}
+        crop = img_cv[y1:y2, x1:x2].copy()
+        return {
+            "b64": self._encode_cv_png_b64(crop),
+            "bbox": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+            "available": True,
+        }
+
+    @staticmethod
+    def _padded_bbox(bbox: Tuple[int, int, int, int], image_shape: Tuple[int, ...], pad: int = 8) -> Tuple[int, int, int, int]:
+        ih, iw = image_shape[:2]
+        x, y, w, h = [int(v) for v in bbox]
+        x1, y1 = max(0, x - pad), max(0, y - pad)
+        x2, y2 = min(iw, x + w + pad), min(ih, y + h + pad)
+        return (x1, y1, max(1, x2 - x1), max(1, y2 - y1))
 
     def _mask_crop_for_bbox(
         self,
@@ -2615,21 +2660,30 @@ class LocalizerEngine:
         page.cleanup_patches = patches
         page.cleanup_patches.append(patch)
 
-    def _remove_cleanup_patches_for_region(self, page_indices: List[int], region_idx: int) -> None:
+    def _remove_cleanup_patches_for_region(
+        self,
+        page_indices: List[int],
+        region_idx: int,
+        cross_page_group_id: str = "",
+    ) -> None:
         region_id = self._region_id_for_cleanup_patch(region_idx)
         pages = getattr(self.chapter_mgr, "pages", []) or []
         for page_idx in sorted(set(int(v) for v in page_indices)):
             if not (0 <= page_idx < len(pages)):
                 continue
             page = pages[page_idx]
-            page.cleanup_patches = [
-                p for p in (getattr(page, "cleanup_patches", []) or [])
-                if not (
-                    p.get("region_id") == region_id
-                    or int(p.get("region_idx", -1) or -1) == int(region_idx)
-                    or p.get("cross_page_group_id") == region_id
-                )
-            ]
+            kept = []
+            for patch in getattr(page, "cleanup_patches", []) or []:
+                is_cross = bool(patch.get("cross_page", False))
+                if cross_page_group_id and str(patch.get("cross_page_group_id", "") or "") == str(cross_page_group_id):
+                    continue
+                if not is_cross and (
+                    patch.get("region_id") == region_id
+                    or int(patch.get("region_idx", -1) or -1) == int(region_idx)
+                ):
+                    continue
+                kept.append(patch)
+            page.cleanup_patches = kept
 
     def _changed_bbox(self, before: np.ndarray, after: np.ndarray, fallback: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
         changed = np.any(before != after, axis=2) if before.ndim == 3 and after.ndim == 3 else before != after
@@ -2733,6 +2787,7 @@ class LocalizerEngine:
                     summary["cleanup_tier"] = int(tier or 0)
                     summary["cleanup_status"] = str(getattr(block, "cleanup_status", "") or "")
                     summary["cleanup_reason"] = str(getattr(block, "cleanup_reason", "") or "")
+                    summary.update(self._cleanup_failure_fields(block))
                 changed_bbox = self._changed_bbox(base, result, comp_bbox)
                 page_results: List[Dict[str, Any]] = []
                 for pidx in pages:
@@ -2835,6 +2890,7 @@ class LocalizerEngine:
             summary["cleanup_tier"] = int(tier or 0)
             summary["cleanup_status"] = str(getattr(block, "cleanup_status", "") or "")
             summary["cleanup_reason"] = str(getattr(block, "cleanup_reason", "") or "")
+            summary.update(self._cleanup_failure_fields(block))
 
         bbox = self._changed_bbox(base, result, block.bbox())
         x, y, w, h = bbox
@@ -2923,7 +2979,14 @@ class LocalizerEngine:
             return np.array([255.0, 255.0, 255.0], dtype=np.float32)
         return img_cv[sample].reshape(-1, 3).mean(axis=0).astype(np.float32)
 
-    def _score_cleanup_candidate(self, before: np.ndarray, after: np.ndarray, plan: Any, bbox: Tuple[int, int, int, int]) -> Dict[str, Any]:
+    def _score_cleanup_candidate(
+        self,
+        before: np.ndarray,
+        after: np.ndarray,
+        plan: Any,
+        bbox: Tuple[int, int, int, int],
+        candidate_id: str = "",
+    ) -> Dict[str, Any]:
         mask = getattr(plan, "cleanup_mask", None)
         x, y, w, h = [int(v) for v in bbox]
         roi_before = before[y:y + h, x:x + w]
@@ -2974,6 +3037,43 @@ class LocalizerEngine:
             except Exception:
                 container_area = 0
         mask_container_ratio = float(mask_area) / float(max(1, container_area)) if container_area > 0 else 0.0
+        quality = (getattr(plan, "debug_metrics", {}) or {}).get("quality", {}) or {}
+        mask_region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
+        border_touch_ratio = float(quality.get("border_touch_ratio", 0.0) or 0.0)
+        risk_penalty = 0.0
+        risk_reasons: List[str] = []
+
+        def add_risk(points: float, reason: str) -> None:
+            nonlocal risk_penalty
+            risk_penalty += float(points)
+            risk_reasons.append(reason)
+
+        if bool((getattr(plan, "debug_metrics", {}) or {}).get("cleanup_mask_rejected", False)):
+            add_risk(220.0, "unsafe mask rejected")
+        if not cleanup_production_patch_allowed(plan):
+            add_risk(120.0, "production patch not allowed")
+        if mask_region_ratio >= 0.35 or mask_container_ratio >= 0.55:
+            add_risk(95.0, "large mask spill risk")
+        elif mask_region_ratio >= 0.25 or mask_container_ratio >= 0.35:
+            add_risk(42.0, "wide cleanup mask")
+        if border_touch_ratio >= 0.35:
+            add_risk(90.0, "border spill risk")
+        elif border_touch_ratio >= 0.18:
+            add_risk(35.0, "mask touches boundary")
+        if residual_text > 12:
+            add_risk(min(180.0, residual_text * 0.8), "residual glyph risk")
+        if seam_score > 42.0:
+            add_risk(55.0, "visible seam risk")
+        bg_model = str(getattr(plan, "background_model", "") or "")
+        if candidate_id in {"telea", "opencv_ns", "grouped", "iopaint"} and (
+            blur_loss > 120.0 or texture_var_loss > 1200.0
+        ):
+            add_risk(85.0, "texture blur risk")
+        if bg_model == "halftone_texture" and candidate_id in {"telea", "opencv_ns", "grouped"}:
+            add_risk(75.0, "textured background inpaint risk")
+        if candidate_id == "solid_fill" and color_dist > 28.0:
+            add_risk(70.0, "flat fill color mismatch")
+
         total = (
             residual_text * 1.35
             + residual_edge * 0.9
@@ -2982,6 +3082,7 @@ class LocalizerEngine:
             + blur_loss * 0.035
             + texture_var_loss * 0.002
             + mask_container_ratio * 55.0
+            + risk_penalty
         )
         return {
             "score": round(float(total), 3),
@@ -2995,7 +3096,48 @@ class LocalizerEngine:
             "texture_variance_loss": round(float(texture_var_loss), 3),
             "mask_area": mask_area,
             "mask_container_ratio": round(float(mask_container_ratio), 4),
+            "mask_region_ratio": round(float(mask_region_ratio), 4),
+            "border_touch_ratio": round(float(border_touch_ratio), 4),
+            "risk_penalty": round(float(risk_penalty), 3),
+            "risk_reasons": list(dict.fromkeys(risk_reasons)),
         }
+
+    @staticmethod
+    def _candidate_score_explanation(candidate_id: str, scores: Dict[str, Any], warnings: List[str], unavailable_reason: str = "") -> str:
+        if unavailable_reason:
+            return unavailable_reason
+        risk_reasons = [str(v) for v in (scores.get("risk_reasons") or []) if str(v)]
+        if risk_reasons:
+            return "; ".join(risk_reasons[:2])
+        if warnings:
+            return "; ".join(warnings[:2])
+        if candidate_id == "default":
+            return "Current plan has the lowest calibrated risk"
+        if candidate_id == "solid_fill":
+            return "Solid fill best matches the local background"
+        if candidate_id in {"telea", "opencv_ns", "iopaint", "grouped", "manual_mask"}:
+            return "Inpaint has the lowest residual and seam risk"
+        return "Lowest calibrated score"
+
+    @staticmethod
+    def _recommended_cleanup_candidate(entries: List[Dict[str, Any]]) -> Tuple[str, str]:
+        available = [c for c in entries if c.get("is_available")]
+        scored = sorted(
+            available,
+            key=lambda c: float((c.get("scores") or {}).get("score", 999999.0) or 999999.0),
+        )
+        if not scored:
+            return "", ""
+        best = scored[0]
+        best_score = float((best.get("scores") or {}).get("score", 999999.0) or 999999.0)
+        next_score = (
+            float((scored[1].get("scores") or {}).get("score", 999999.0) or 999999.0)
+            if len(scored) > 1
+            else best_score + 25.0
+        )
+        if best.get("warnings") or best.get("review_required") or next_score - best_score < 8.0:
+            return "", ""
+        return str(best.get("candidate_id") or ""), str(best.get("score_explanation") or "")
 
     def _candidate_warnings(self, candidate_id: str, plan: Any, scores: Dict[str, Any], unavailable_reason: str = "") -> List[str]:
         warnings: List[str] = []
@@ -3263,6 +3405,7 @@ class LocalizerEngine:
                 },
                 "warnings": [f"{label} failed"],
                 "reasons": [str(exc)],
+                "score_explanation": f"{label} failed",
                 "review_required": True,
                 "is_available": False,
                 "unavailable_reason": f"{label} failed",
@@ -3273,7 +3416,7 @@ class LocalizerEngine:
         bbox = tuple(int(v) for v in (run.get("bbox") or block.bbox()))
         x, y, w, h = bbox
         crop = run["result"][y:y + h, x:x + w].copy() if available else np.zeros((max(1, h), max(1, w), 3), dtype=np.uint8)
-        scores = self._score_cleanup_candidate(run["base"], run["result"], plan, bbox) if available else {
+        scores = self._score_cleanup_candidate(run["base"], run["result"], plan, bbox, candidate_id) if available else {
             "score": 999999.0,
             "residual_dark_pixels": 0,
             "residual_edge_energy": 0.0,
@@ -3282,9 +3425,12 @@ class LocalizerEngine:
             "blur_local_variance_loss": 0.0,
             "mask_area": 0,
             "mask_container_ratio": 0.0,
+            "risk_penalty": 999999.0,
+            "risk_reasons": [],
         }
         unavailable_reason = str(run.get("unavailable_reason", "") or "")
         warnings = self._candidate_warnings(candidate_id, plan, scores, unavailable_reason)
+        score_explanation = self._candidate_score_explanation(candidate_id, scores, warnings, unavailable_reason)
         return {
             "candidate_id": candidate_id,
             "label": label,
@@ -3300,6 +3446,7 @@ class LocalizerEngine:
                 str((getattr(plan, "debug_metrics", {}) or {}).get("selected_candidate", "") or ""),
                 str((run.get("group") or {}).get("reason", "") or ""),
             ],
+            "score_explanation": score_explanation,
             "review_required": self._candidate_review_required(plan) or bool(warnings),
             "is_available": available,
             "unavailable_reason": unavailable_reason,
@@ -3359,6 +3506,7 @@ class LocalizerEngine:
                     },
                     "warnings": ["Candidate comparison timed out"],
                     "reasons": ["Candidate comparison timed out"],
+                    "score_explanation": "Candidate comparison timed out",
                     "review_required": True,
                     "is_available": False,
                     "unavailable_reason": "Candidate comparison timed out",
@@ -3367,23 +3515,8 @@ class LocalizerEngine:
                 })
                 continue
             entries.append(self._cleanup_candidate_entry(region_idx, cid, label, manual_mask))
-        available = [c for c in entries if c.get("is_available")]
-        scored = sorted(
-            available,
-            key=lambda c: float((c.get("scores") or {}).get("score", 999999.0) or 999999.0),
-        )
-        best_id = ""
-        if scored:
-            best = scored[0]
-            best_score = float((best.get("scores") or {}).get("score", 999999.0) or 999999.0)
-            next_score = (
-                float((scored[1].get("scores") or {}).get("score", 999999.0) or 999999.0)
-                if len(scored) > 1
-                else best_score + 25.0
-            )
-            if not best.get("warnings") and not best.get("review_required") and next_score - best_score >= 8.0:
-                best_id = str(best.get("candidate_id") or "")
-        return {"ok": True, "candidates": entries, "recommended_candidate_id": best_id}
+        best_id, best_reason = self._recommended_cleanup_candidate(entries)
+        return {"ok": True, "candidates": entries, "recommended_candidate_id": best_id, "recommended_reason": best_reason}
 
     def apply_region_cleanup_candidate(
         self,
@@ -3419,7 +3552,11 @@ class LocalizerEngine:
                 self._flush_working_state_to_page()
                 self.chapter_mgr.save_state()
                 return self.get_bootstrap()
-            self._remove_cleanup_patches_for_region(pages_touched, int(region_idx))
+            self._remove_cleanup_patches_for_region(
+                pages_touched,
+                int(region_idx),
+                str(getattr(block, "cross_page_group_id", "") or ""),
+            )
             _write_cleanup_metadata_to_block(
                 block,
                 run["plan"],
@@ -3464,6 +3601,7 @@ class LocalizerEngine:
                     "review_required": bool((getattr(block, "cleanup_meta", {}) or {}).get("review_required", False)),
                     "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                     "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
+                    **self._cleanup_failure_fields(block),
                     "diagnostic_only": bool((getattr(block, "cleanup_meta", {}) or {}).get("diagnostic_only", False)),
                     "destructive_cleanup_executed": bool((getattr(block, "cleanup_meta", {}) or {}).get("destructive_cleanup_executed", False)),
                     "production_patch_accepted": bool((getattr(block, "cleanup_meta", {}) or {}).get("production_patch_accepted", False)),
@@ -3534,6 +3672,7 @@ class LocalizerEngine:
                 "review_required": bool((getattr(block, "cleanup_meta", {}) or {}).get("review_required", False)),
                 "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                 "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
+                **self._cleanup_failure_fields(block),
                 "diagnostic_only": bool((getattr(block, "cleanup_meta", {}) or {}).get("diagnostic_only", False)),
                 "destructive_cleanup_executed": bool((getattr(block, "cleanup_meta", {}) or {}).get("destructive_cleanup_executed", False)),
                 "production_patch_accepted": bool((getattr(block, "cleanup_meta", {}) or {}).get("production_patch_accepted", False)),
@@ -3753,6 +3892,65 @@ class LocalizerEngine:
         grouped_used = bool((patch or {}).get("grouped_inpaint", False))
         override = getattr(block, "override", None)
         override_summary = override.to_dict() if override is not None and hasattr(override, "to_dict") else {}
+        failure_fields = self._cleanup_failure_fields(block)
+        if not failure_fields.get("failure_classes") and patch:
+            failure_fields = self._cleanup_failure_fields(patch)
+        preview_bbox = self._padded_bbox(fallback, self._raw_cv.shape, 8)
+        cleaned_cv = getattr(page, "cleaned_cv", None) if page is not None else None
+        if cleaned_cv is None and page is not None and getattr(page, "cleanup_patches", None):
+            try:
+                cleaned_cv = self._rebuild_cleaned_from_cleanup_patches(page, self._raw_cv)
+            except Exception:
+                cleaned_cv = None
+        typeset_cv = None
+        if page is not None and getattr(page, "typeset_pil", None) is not None:
+            try:
+                typeset_cv = cv2.cvtColor(np.array(page.typeset_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+            except Exception:
+                typeset_cv = None
+
+        def _full_container_mask() -> Optional[np.ndarray]:
+            if getattr(plan, "container_mask", None) is None or getattr(plan, "container_bbox", None) is None:
+                return None
+            bx, by, bw, bh = [int(v) for v in plan.container_bbox]
+            full = np.zeros(self._raw_cv.shape[:2], dtype=np.uint8)
+            local = plan.container_mask
+            if len(local.shape) == 3:
+                local = cv2.cvtColor(local, cv2.COLOR_BGR2GRAY)
+            if local.shape[:2] != (bh, bw):
+                local = cv2.resize(local, (max(1, bw), max(1, bh)), interpolation=cv2.INTER_NEAREST)
+            x1, y1 = max(0, bx), max(0, by)
+            x2, y2 = min(self._raw_cv.shape[1], bx + bw), min(self._raw_cv.shape[0], by + bh)
+            if x2 > x1 and y2 > y1:
+                lx1, ly1 = max(0, -bx), max(0, -by)
+                full[y1:y2, x1:x2] = local[ly1:ly1 + (y2 - y1), lx1:lx1 + (x2 - x1)]
+            return full
+
+        overlay = None
+        overlay_has_debug = False
+        try:
+            x, y, w, h = preview_bbox
+            overlay = self._raw_cv[y:y + h, x:x + w].copy()
+            for mask, color, alpha in (
+                (_full_container_mask(), (255, 80, 80), 0.24),
+                (getattr(plan, "text_mask", None), (0, 220, 0), 0.45),
+                (getattr(plan, "cleanup_mask", None), (0, 0, 255), 0.34),
+            ):
+                if mask is None or not np.any(mask):
+                    continue
+                local = mask[y:y + h, x:x + w]
+                if local.shape[:2] != overlay.shape[:2]:
+                    continue
+                active = local > 0
+                if not np.any(active):
+                    continue
+                overlay_has_debug = True
+                overlay[active] = (
+                    overlay[active].astype(np.float32) * (1.0 - alpha)
+                    + np.array(color, dtype=np.float32) * alpha
+                ).clip(0, 255).astype(np.uint8)
+        except Exception:
+            overlay = None
         return {
             "ok": True,
             "analysis": {
@@ -3765,6 +3963,9 @@ class LocalizerEngine:
                 "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                 "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
                 "skip_reason": str(getattr(plan, "skip_reason", "") or ""),
+                "failure_classes": list(failure_fields.get("failure_classes") or []),
+                "failure_class": str(failure_fields.get("failure_class") or ""),
+                "cleanup_backend": str((patch or {}).get("backend") or getattr(plan, "cleanup_backend", "") or getattr(self.model_config, "cleanup_backend", "opencv") or ""),
                 "background_model": str(getattr(plan, "background_model", "") or ""),
                 "container_confidence": round(float(getattr(plan, "container_confidence", 0.0) or 0.0), 4),
                 "text_mask_confidence": round(float(getattr(plan, "text_mask_confidence", 0.0) or 0.0), 4),
@@ -3818,6 +4019,16 @@ class LocalizerEngine:
                 "manual_mask": self._encode_mask_crop(manual_full, fallback),
                 "grouped_mask": self._encode_mask_crop(group_mask, fallback),
             },
+            "previews": {
+                "raw_crop": self._encode_image_crop(self._raw_cv, preview_bbox),
+                "cleaned_crop": self._encode_image_crop(cleaned_cv, preview_bbox),
+                "typeset_crop": self._encode_image_crop(typeset_cv, preview_bbox),
+                "overlay": {
+                    "b64": self._encode_cv_png_b64(overlay) if overlay is not None else None,
+                    "bbox": [int(v) for v in preview_bbox],
+                    "available": bool(overlay is not None and overlay_has_debug),
+                },
+            },
         }
 
     def _mask_qa_dir(self) -> str:
@@ -3829,14 +4040,19 @@ class LocalizerEngine:
     @staticmethod
     def _normalize_mask_qa_label(label: str) -> str:
         key = str(label or "").strip().lower().replace("-", "_").replace(" ", "_")
+        legacy = {
+            "bad_glyph_mask": "bad_text_mask",
+            "unsafe_cleanup_validation": "unsafe_mask_rejection",
+            "bad_fill_inpaint": "bad_flat_fill",
+            "bad_routing_strategy": "bad_cleanup_routing",
+            "legacy_candidate_wrong": "bad_text_mask",
+        }
+        if key in legacy:
+            return legacy[key]
+        if key in CLEANUP_FAILURE_CLASSES:
+            return key
         allowed = {
             "good",
-            "bad_glyph_mask",
-            "bad_container_mask",
-            "unsafe_cleanup_validation",
-            "bad_fill_inpaint",
-            "bad_routing_strategy",
-            "legacy_candidate_wrong",
         }
         return key if key in allowed else ""
 
@@ -3961,7 +4177,11 @@ class LocalizerEngine:
                 self._flush_working_state_to_page()
                 self.chapter_mgr.save_state()
                 return self.get_bootstrap()
-            self._remove_cleanup_patches_for_region(pages_touched, int(region_idx))
+            self._remove_cleanup_patches_for_region(
+                pages_touched,
+                int(region_idx),
+                str(getattr(block, "cross_page_group_id", "") or ""),
+            )
             created_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
             for page_result in run.get("page_results", []) or []:
                 if not cleanup_production_patch_allowed(run["plan"]):
@@ -3999,6 +4219,7 @@ class LocalizerEngine:
                     "review_required": bool((getattr(block, "cleanup_meta", {}) or {}).get("review_required", False)),
                     "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                     "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
+                    **self._cleanup_failure_fields(block),
                     "diagnostic_only": bool((getattr(block, "cleanup_meta", {}) or {}).get("diagnostic_only", False)),
                     "destructive_cleanup_executed": bool((getattr(block, "cleanup_meta", {}) or {}).get("destructive_cleanup_executed", False)),
                     "production_patch_accepted": bool((getattr(block, "cleanup_meta", {}) or {}).get("production_patch_accepted", False)),
@@ -4068,6 +4289,7 @@ class LocalizerEngine:
                 "review_required": bool((getattr(block, "cleanup_meta", {}) or {}).get("review_required", False)),
                 "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                 "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
+                **self._cleanup_failure_fields(block),
                 "diagnostic_only": bool((getattr(block, "cleanup_meta", {}) or {}).get("diagnostic_only", False)),
                 "destructive_cleanup_executed": bool((getattr(block, "cleanup_meta", {}) or {}).get("destructive_cleanup_executed", False)),
                 "production_patch_accepted": bool((getattr(block, "cleanup_meta", {}) or {}).get("production_patch_accepted", False)),
@@ -4120,7 +4342,11 @@ class LocalizerEngine:
                 for pidx in pages_touched
                 if 0 <= pidx < len(self.chapter_mgr.pages)
             }
-            self._remove_cleanup_patches_for_region(pages_touched, region_idx)
+            self._remove_cleanup_patches_for_region(
+                pages_touched,
+                region_idx,
+                str(getattr(block, "cross_page_group_id", "") or ""),
+            )
             changed = [
                 pidx for pidx, before in before_counts.items()
                 if len(getattr(self.chapter_mgr.pages[pidx], "cleanup_patches", []) or []) != before
@@ -5955,9 +6181,9 @@ class LocalizerEngine:
                 self._notify("Cleanup skipped - no eligible regions.", 1, 1, updated_pages=[page_idx])
                 return self.get_bootstrap()
             has_cross_page = any(bool(getattr(self._regions[idx], "cross_page", False)) for idx in cleanup_indices)
-            if has_cross_page:
+            use_patch_output = has_cross_page or bool(getattr(page, "cleanup_patches", None))
+            if use_patch_output:
                 debug_print(f'cleanup_route="split_patches" page={page_idx} action="cleanup_current_page"')
-                page.cleanup_patches = []
                 updated_pages = {page_idx}
                 created_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
                 for idx in cleanup_indices:
@@ -5965,7 +6191,11 @@ class LocalizerEngine:
                     block = self._regions[idx]
                     if bool(run.get("cross_page", False)):
                         pages_touched = [int(v) for v in (run.get("cross_page_pages") or [page_idx])]
-                        self._remove_cleanup_patches_for_region(pages_touched, idx)
+                        self._remove_cleanup_patches_for_region(
+                            pages_touched,
+                            idx,
+                            str(getattr(block, "cross_page_group_id", "") or ""),
+                        )
                         for page_result in run.get("page_results", []) or []:
                             pidx = int(page_result["page_idx"])
                             x, y, w, h = [int(v) for v in page_result["bbox"]]
@@ -5992,6 +6222,7 @@ class LocalizerEngine:
                                 "review_required": bool((getattr(block, "cleanup_meta", {}) or {}).get("review_required", False)),
                                 "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                                 "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
+                                **self._cleanup_failure_fields(block),
                                 "rerun": False,
                                 "patch_png_b64": self._encode_cv_png_b64(page_result["crop"]),
                             }
@@ -6000,6 +6231,7 @@ class LocalizerEngine:
                             self._append_cleanup_patch_to_page(pidx, patch)
                             updated_pages.add(pidx)
                     else:
+                        self._remove_cleanup_patches_for_region([page_idx], idx)
                         x, y, w, h = self._mask_bbox(getattr(run["plan"], "cleanup_mask", None), block.bbox())
                         crop = run["result"][y:y + h, x:x + w].copy()
                         patch = {
@@ -6017,6 +6249,7 @@ class LocalizerEngine:
                             "review_required": bool((getattr(block, "cleanup_meta", {}) or {}).get("review_required", False)),
                             "cleanup_status": str(getattr(block, "cleanup_status", "") or ""),
                             "cleanup_reason": str(getattr(block, "cleanup_reason", "") or ""),
+                            **self._cleanup_failure_fields(block),
                             "rerun": False,
                             "patch_png_b64": self._encode_cv_png_b64(crop),
                         }
@@ -6147,8 +6380,6 @@ class LocalizerEngine:
         process_sfx = _config_bool(getattr(model_config, "process_sfx_regions", False))
         missing: List[int] = []
         for idx, block in enumerate(getattr(self, "_regions", []) or []):
-            if bool(getattr(block, "cross_page", False)):
-                continue
             if self._is_cross_page_secondary(block):
                 continue
             if not getattr(block, "visible", True):
@@ -6231,7 +6462,15 @@ class LocalizerEngine:
             )
             page.cleanup_patches = []
 
-        base_cv = page.cleaned_cv if page.cleaned_cv is not None else self._raw_cv
+        has_inbound_cross_typeset = (
+            page.typeset_pil is not None
+            and not bool(getattr(page, "render_dirty", False))
+            and any(self._is_cross_page_secondary(block) for block in self._regions)
+        )
+        if has_inbound_cross_typeset:
+            base_cv = cv2.cvtColor(np.array(page.typeset_pil), cv2.COLOR_RGB2BGR)
+        else:
+            base_cv = page.cleaned_cv if page.cleaned_cv is not None else self._raw_cv
         if base_cv is None:
             raise RuntimeError("No image loaded.")
         if not any(t and t.strip() for t in self._translations):
@@ -7741,13 +7980,13 @@ class LocalizerEngine:
         try:
             def mark_checkpoint(phase: str, idx: int) -> None:
                 phase_pos = phases.index(phase)
-                if phase_pos + 1 < len(phases):
-                    next_phase = phases[phase_pos + 1]
-                    next_idx = idx
-                else:
-                    next_phase = "detect"
+                if idx + 1 < total:
+                    next_phase = phase
                     next_idx = idx + 1
-                if next_idx >= total:
+                elif phase_pos + 1 < len(phases):
+                    next_phase = phases[phase_pos + 1]
+                    next_idx = 0
+                else:
                     return
                 if hasattr(self.chapter_mgr, "save_run_all_checkpoint"):
                     self.chapter_mgr.save_run_all_checkpoint({
@@ -7758,99 +7997,99 @@ class LocalizerEngine:
                         "message": f"Continue Run All from {next_phase} page {next_idx + 1}/{total}",
                     })
 
-            for idx in range(start_page_idx, total):
-                first_phase = phases.index(start_phase) if idx == start_page_idx else 0
-                if first_phase <= phases.index("detect"):
-                    self._set_progress(running=True, job="run_all", stage="detect", page_idx=idx, page_total=total, updated_pages=[])
-                    self._notify(f"Run All Detect: Page {idx + 1}/{total}...", idx, total)
+            start_phase_idx = phases.index(start_phase)
+            for phase_pos in range(start_phase_idx, len(phases)):
+                phase = phases[phase_pos]
+                page_start = start_page_idx if phase_pos == start_phase_idx else 0
+                for idx in range(page_start, total):
                     self.go_to_page(idx)
-                    self.detect_current_page()
-                    self._notify(f"Run All Detect: checkpointing page {idx + 1}/{total}...", idx + 1, total)
-                    self.chapter_mgr.save_state()
-                    mark_checkpoint("detect", idx)
-                if first_phase <= phases.index("ocr"):
-                    self._set_progress(running=True, job="run_all", stage="ocr", page_idx=idx, page_total=total, updated_pages=[])
-                    self._notify(f"Run All OCR: Page {idx + 1}/{total}...", idx, total)
-                    self.go_to_page(idx)
-                    self.ocr_current_page()
-                    self._notify(f"Run All OCR: checkpointing page {idx + 1}/{total}...", idx + 1, total)
-                    self.chapter_mgr.save_state()
-                    mark_checkpoint("ocr", idx)
-                if first_phase <= phases.index("translate"):
-                    self._set_progress(running=True, job="run_all", stage="translate", page_idx=idx, page_total=total, updated_pages=[])
-                    self._notify(f"Run All Translate: Page {idx + 1}/{total}...", idx, total)
-                    self.go_to_page(idx)
-                    try:
-                        self.translate_current_page()
-                    except RuntimeError as exc:
-                        if not str(exc).startswith("Translation failed:"):
-                            raise
-                        missing_translations = self._missing_required_translation_indices()
-                        if not missing_translations:
-                            raise
-                        self._mark_missing_required_translations(idx, missing_translations)
-                        self._flush_working_state_to_page()
-                        self._notify(
-                            f"Run All Translate: Page {idx + 1}/{total} has missing translation(s); flagged for review.",
-                            idx + 1,
-                            total,
-                            updated_pages=[idx],
-                        )
-                    missing_translations = self._missing_required_translation_indices()
-                    if missing_translations:
-                        self._mark_missing_required_translations(idx, missing_translations)
-                        self._flush_working_state_to_page()
-                        self._notify(
-                            f"Run All Translate: Page {idx + 1}/{total} has missing translation(s); continuing.",
-                            idx + 1,
-                            total,
-                            updated_pages=[idx],
-                        )
-                    self._notify(f"Run All Translate: checkpointing page {idx + 1}/{total}...", idx + 1, total)
-                    self.chapter_mgr.save_state()
-                    mark_checkpoint("translate", idx)
-                if first_phase <= phases.index("cleanup"):
-                    self._set_progress(running=True, job="run_all", stage="cleanup", page_idx=idx, page_total=total, updated_pages=[])
-                    self._notify(f"Run All Cleanup: Page {idx + 1}/{total}...", idx, total)
-                    self.go_to_page(idx)
-                    self.cleanup_current_page()
-                    mark_checkpoint("cleanup", idx)
-                if first_phase <= phases.index("typeset"):
-                    self._set_progress(running=True, job="run_all", stage="typeset", page_idx=idx, page_total=total, updated_pages=[])
-                    self._notify(f"Run All Typeset: Page {idx + 1}/{total}...", idx, total)
-                    self.go_to_page(idx)
-                    page = getattr(self.chapter_mgr, "current_page", None)
-                    if page is None and hasattr(self.chapter_mgr, "pages"):
+                    if phase == "detect":
+                        self._set_progress(running=True, job="run_all", stage="detect", page_idx=idx, page_total=total, updated_pages=[])
+                        self._notify(f"Run All Detect: Page {idx + 1}/{total}...", idx, total)
+                        self.detect_current_page()
+                        self._notify(f"Run All Detect: checkpointing page {idx + 1}/{total}...", idx + 1, total)
+                        self.chapter_mgr.save_state()
+                        mark_checkpoint("detect", idx)
+                    elif phase == "ocr":
+                        self._set_progress(running=True, job="run_all", stage="ocr", page_idx=idx, page_total=total, updated_pages=[])
+                        self._notify(f"Run All OCR: Page {idx + 1}/{total}...", idx, total)
+                        self.ocr_current_page()
+                        self._notify(f"Run All OCR: checkpointing page {idx + 1}/{total}...", idx + 1, total)
+                        self.chapter_mgr.save_state()
+                        mark_checkpoint("ocr", idx)
+                    elif phase == "translate":
+                        self._set_progress(running=True, job="run_all", stage="translate", page_idx=idx, page_total=total, updated_pages=[])
+                        self._notify(f"Run All Translate: Page {idx + 1}/{total}...", idx, total)
                         try:
-                            page = self.chapter_mgr.pages[idx]
-                        except Exception:
-                            page = None
-                    translations = getattr(self, "_translations", None)
-                    if page is not None and translations is not None and not any(t and t.strip() for t in translations):
-                        missing_translations = self._missing_required_translation_indices()
-                        if missing_translations:
+                            self.translate_current_page()
+                        except RuntimeError as exc:
+                            if not str(exc).startswith("Translation failed:"):
+                                raise
+                            missing_translations = self._missing_required_translation_indices()
+                            if not missing_translations:
+                                raise
                             self._mark_missing_required_translations(idx, missing_translations)
                             self._flush_working_state_to_page()
-                        base_cv = page.cleaned_cv if page.cleaned_cv is not None else self._raw_cv
-                        if base_cv is not None:
-                            page.typeset_pil = Image.fromarray(cv2.cvtColor(base_cv, cv2.COLOR_BGR2RGB))
-                            page.render_dirty = False
-                            page.bump_render_version()
-                            self._flush_working_state_to_page()
-                            self.chapter_mgr.save_state()
-                            updated_pages.append(idx)
-                            mark_checkpoint("typeset", idx)
                             self._notify(
-                                f"Run All Typeset skipped: Page {idx + 1}/{total} has no translated text.",
+                                f"Run All Translate: Page {idx + 1}/{total} has missing translation(s); flagged for review.",
                                 idx + 1,
                                 total,
                                 updated_pages=[idx],
                             )
-                            continue
-                    self.typeset_current_page()
-                    updated_pages.append(idx)
-                    mark_checkpoint("typeset", idx)
-                    self._notify(f"Run All: Page {idx + 1}/{total} complete", idx + 1, total, updated_pages=[idx])
+                        missing_translations = self._missing_required_translation_indices()
+                        if missing_translations:
+                            self._mark_missing_required_translations(idx, missing_translations)
+                            self._flush_working_state_to_page()
+                            self._notify(
+                                f"Run All Translate: Page {idx + 1}/{total} has missing translation(s); continuing.",
+                                idx + 1,
+                                total,
+                                updated_pages=[idx],
+                            )
+                        self._notify(f"Run All Translate: checkpointing page {idx + 1}/{total}...", idx + 1, total)
+                        self.chapter_mgr.save_state()
+                        mark_checkpoint("translate", idx)
+                    elif phase == "cleanup":
+                        self._set_progress(running=True, job="run_all", stage="cleanup", page_idx=idx, page_total=total, updated_pages=[])
+                        self._notify(f"Run All Cleanup: Page {idx + 1}/{total}...", idx, total)
+                        self.cleanup_current_page()
+                        mark_checkpoint("cleanup", idx)
+                    elif phase == "typeset":
+                        self._set_progress(running=True, job="run_all", stage="typeset", page_idx=idx, page_total=total, updated_pages=[])
+                        self._notify(f"Run All Typeset: Page {idx + 1}/{total}...", idx, total)
+                        page = getattr(self.chapter_mgr, "current_page", None)
+                        if page is None and hasattr(self.chapter_mgr, "pages"):
+                            try:
+                                page = self.chapter_mgr.pages[idx]
+                            except Exception:
+                                page = None
+                        translations = getattr(self, "_translations", None)
+                        if page is not None and translations is not None and not any(t and t.strip() for t in translations):
+                            missing_translations = self._missing_required_translation_indices()
+                            if missing_translations:
+                                self._mark_missing_required_translations(idx, missing_translations)
+                                self._flush_working_state_to_page()
+                            base_cv = page.cleaned_cv if page.cleaned_cv is not None else self._raw_cv
+                            if base_cv is not None:
+                                if page.typeset_pil is None:
+                                    page.typeset_pil = Image.fromarray(cv2.cvtColor(base_cv, cv2.COLOR_BGR2RGB))
+                                    page.render_dirty = False
+                                    page.bump_render_version()
+                                self._flush_working_state_to_page()
+                                self.chapter_mgr.save_state()
+                                updated_pages.append(idx)
+                                mark_checkpoint("typeset", idx)
+                                self._notify(
+                                    f"Run All Typeset skipped: Page {idx + 1}/{total} has no translated text.",
+                                    idx + 1,
+                                    total,
+                                    updated_pages=[idx],
+                                )
+                                continue
+                        self.typeset_current_page()
+                        updated_pages.append(idx)
+                        mark_checkpoint("typeset", idx)
+                        self._notify(f"Run All: Page {idx + 1}/{total} complete", idx + 1, total, updated_pages=[idx])
             if hasattr(self.chapter_mgr, "clear_run_all_checkpoint"):
                 self.chapter_mgr.clear_run_all_checkpoint()
             self.go_to_page(min(start_idx, max(0, total - 1)))
@@ -9710,6 +9949,7 @@ class LocalizerEngine:
             "cleanup_tier":        int(getattr(block, "cleanup_tier", 0) or 0),
             "cleanup_status":      str(getattr(block, "cleanup_status", "") or ""),
             "cleanup_reason":      str(getattr(block, "cleanup_reason", "") or ""),
+            **self._cleanup_failure_fields(block),
             "cleanup_patch":       (cleanup_patch_by_region or {}).get(rid),
             "cleanup_container_confidence": float(getattr(block, "cleanup_container_confidence", 0.0) or 0.0),
             "cleanup_safe_rect_confidence": float(getattr(block, "cleanup_safe_rect_confidence", 0.0) or 0.0),
@@ -9992,6 +10232,7 @@ class LocalizerEngine:
                 "cleanup_tier":        int(getattr(block, "cleanup_tier", 0) or 0),
                 "cleanup_status":      str(getattr(block, "cleanup_status", "") or ""),
                 "cleanup_reason":      str(getattr(block, "cleanup_reason", "") or ""),
+                **self._cleanup_failure_fields(block),
                 "cleanup_patch":       cleanup_patch_by_region.get(rid),
                 "cleanup_container_confidence": float(getattr(block, "cleanup_container_confidence", 0.0) or 0.0),
                 "cleanup_safe_rect_confidence": float(getattr(block, "cleanup_safe_rect_confidence", 0.0) or 0.0),
