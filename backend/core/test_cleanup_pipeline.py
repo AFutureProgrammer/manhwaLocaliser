@@ -2012,6 +2012,31 @@ class CleanupPipelineTests(unittest.TestCase):
         self.assertIs(font, default_font)
         self.assertEqual(calls, [("sfx", 18), ("bold", 18)])
 
+    def test_iopaint_client_posts_json_base64(self):
+        from backend.core.iopaint_client import call_iopaint_inpaint
+
+        img = np.zeros((20, 30, 3), dtype=np.uint8)
+        mask = np.zeros((20, 30), dtype=np.uint8)
+        mask[5:10, 5:10] = 255
+        out_bgr = np.full_like(img, 200)
+
+        def _fake_post(url, json=None, timeout=None):
+            self.assertEqual(url, "http://127.0.0.1:8080/api/v1/inpaint")
+            self.assertIn("image", json)
+            self.assertIn("mask", json)
+            self.assertNotIn("files", json or {})
+            ok, buf = cv2.imencode(".png", out_bgr)
+            resp = types.SimpleNamespace()
+            resp.content = buf.tobytes()
+            resp.raise_for_status = lambda: None
+            return resp
+
+        with patch("backend.core.iopaint_client.requests.post", side_effect=_fake_post):
+            decoded = call_iopaint_inpaint(
+                "http://127.0.0.1:8080/api/v1/inpaint", img, mask, timeout=3
+            )
+        self.assertTrue(np.array_equal(decoded, out_bgr))
+
     def test_iopaint_failure_falls_back_to_opencv(self):
         img = _white_bubble_page()
         mask = np.zeros(img.shape[:2], dtype=np.uint8)
@@ -2029,7 +2054,7 @@ class CleanupPipelineTests(unittest.TestCase):
         )
         result = img.copy()
 
-        with patch("backend.core.cleanup_plan.requests.post", side_effect=RuntimeError("unreachable")):
+        with patch("backend.core.iopaint_client.requests.post", side_effect=RuntimeError("unreachable")):
             execute_cleanup_plan(img, result, plan)
 
         self.assertIn("iopaint_fallback", plan.debug_metrics["cleanup_backend_fallback"])

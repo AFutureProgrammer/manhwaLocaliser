@@ -2469,23 +2469,11 @@ class LocalizerEngine:
                     return True, "iopaint_unavailable_fallback_telea"
                 return False, "iopaint_unavailable:no_url"
             try:
-                ok_img, img_buf = cv2.imencode(".png", img_cv)
-                ok_mask, mask_buf = cv2.imencode(".png", mask)
-                if not ok_img or not ok_mask:
-                    raise RuntimeError("encode_failed")
-                resp = requests.post(
-                    url,
-                    files={
-                        "image": ("image.png", img_buf.tobytes(), "image/png"),
-                        "mask": ("mask.png", mask_buf.tobytes(), "image/png"),
-                    },
-                    timeout=self._iopaint_candidate_timeout(),
+                from backend.core.iopaint_client import call_iopaint_inpaint
+
+                decoded = call_iopaint_inpaint(
+                    url, img_cv, mask, timeout=self._iopaint_candidate_timeout()
                 )
-                resp.raise_for_status()
-                arr = np.frombuffer(resp.content, dtype=np.uint8)
-                decoded = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if decoded is None or decoded.shape[:2] != result.shape[:2]:
-                    raise RuntimeError("invalid_output")
                 result[mask > 0] = decoded[mask > 0]
                 return True, ""
             except Exception as exc:
@@ -3252,23 +3240,9 @@ class LocalizerEngine:
             return False, "IOPaint not configured"
         timeout = self._iopaint_candidate_timeout()
         try:
-            ok_img, img_buf = cv2.imencode(".png", img_cv)
-            ok_mask, mask_buf = cv2.imencode(".png", mask)
-            if not ok_img or not ok_mask:
-                return False, "IOPaint unavailable"
-            resp = requests.post(
-                url,
-                files={
-                    "image": ("image.png", img_buf.tobytes(), "image/png"),
-                    "mask": ("mask.png", mask_buf.tobytes(), "image/png"),
-                },
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            arr = np.frombuffer(resp.content, dtype=np.uint8)
-            decoded = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if decoded is None or decoded.shape[:2] != result.shape[:2]:
-                return False, "IOPaint unavailable"
+            from backend.core.iopaint_client import call_iopaint_inpaint
+
+            decoded = call_iopaint_inpaint(url, img_cv, mask, timeout=timeout)
             result[mask > 0] = decoded[mask > 0]
             return True, ""
         except requests.exceptions.Timeout:
@@ -6692,6 +6666,25 @@ class LocalizerEngine:
         safe_rect = getattr(block, 'safe_rect', None)
         if safe_rect is not None:
             sx, sy, sw, sh = safe_rect
+
+            # TYPESET-CLAMP FIX: safe_rect is computed from the bubble/container
+            # mask by compute_placement, which uses bubble geometry for cleanup.
+            # The bubble is always >= the region bbox, so safe_rect can be much
+            # larger than the text region the user sees.  Clamp it to the region
+            # bbox before any area/ratio checks — the text must fit inside the
+            # region, not the bubble.
+            if rx is not None and ry is not None and rw and rh:
+                # Intersect safe_rect with the region bbox.
+                clamped_x = max(sx, rx)
+                clamped_y = max(sy, ry)
+                clamped_x2 = min(sx + sw, rx + rw)
+                clamped_y2 = min(sy + sh, ry + rh)
+                clamped_w = max(0, clamped_x2 - clamped_x)
+                clamped_h = max(0, clamped_y2 - clamped_y)
+                if clamped_w >= 24 and clamped_h >= 16:
+                    safe_rect = (clamped_x, clamped_y, clamped_w, clamped_h)
+                    sx, sy, sw, sh = safe_rect
+
             weak_yolo_container = False
             try:
                 bm = getattr(block, "bubble_mask", None)
@@ -6704,10 +6697,18 @@ class LocalizerEngine:
                 weak_yolo_container = getattr(block, "detector_source", "") == "yolo"
             safe_area = int(sw) * int(sh)
             region_area = max(1, int(rw) * int(rh))
+            # FIX: a safe_rect larger than the region is a signal of bad geometry
+            # (bubble bbox bled through), not a reason to accept it.  The old logic
+            # used clearly_larger_than_region to *permit* an oversized safe_rect for
+            # weak YOLO containers; that's exactly the case that causes text to be
+            # sized to bubble dimensions and overflow the visible region.
             clearly_larger_than_region = safe_area >= int(region_area * 1.35)
             safe_region_ratio = safe_area / float(region_area)
             plausible_yolo_safe = _plausible_yolo_typeset_rect(safe_rect, "safe_rect")
-            if sw >= 24 and sh >= 16 and plausible_yolo_safe and (not weak_yolo_container or clearly_larger_than_region):
+            # Accept safe_rect only when it's NOT clearly larger than the region.
+            # weak_yolo_container + oversized = the old overflow bug; skip it so
+            # the fallback chain picks up a tighter box from detector_text_bbox.
+            if sw >= 24 and sh >= 16 and plausible_yolo_safe and not (weak_yolo_container and clearly_larger_than_region):
                 debug_print(
                     f"[TYPESET_BOX] source=LIR safe_rect={safe_rect} "
                     f"region={(rx, ry, rw, rh)}"

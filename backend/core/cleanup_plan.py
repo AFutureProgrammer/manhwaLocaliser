@@ -92,6 +92,7 @@ import tempfile
 import cv2
 import numpy as np
 import requests
+import scipy.ndimage as _ndimage
 
 # ── Optional AI/hardware dependencies (graceful fallback when absent) ──────────
 ort = None
@@ -285,7 +286,7 @@ class CleanupPolicy:
             busy_background_cleanup_mode=str(
                 getattr(cfg, "busy_background_cleanup_mode", "off") or "off"
             ).strip().lower(),
-            cleanup_solid_bubble_fill_enabled=_bool("cleanup_solid_bubble_fill_enabled", True),
+            cleanup_solid_bubble_fill_enabled=_bool("cleanup_solid_bubble_fill_enabled", False),
             cleanup_flat_fill_ladder_enabled=_bool("cleanup_flat_fill_ladder_enabled", True),
             cleanup_halo_mask_enabled=_bool("cleanup_halo_mask_enabled", True),
             cleanup_residual_retry_enabled=_bool("cleanup_residual_retry_enabled", True),
@@ -314,10 +315,10 @@ class CleanupPolicy:
             policy.cleanup_solid_bubble_max_mask_container_ratio = 0.15
         try:
             policy.cleanup_halo_max_px = int(
-                getattr(cfg, "cleanup_halo_max_px", 2) or 2
+                getattr(cfg, "cleanup_halo_max_px", 3) or 3
             )
         except Exception:
-            policy.cleanup_halo_max_px = 2
+            policy.cleanup_halo_max_px = 3
         for name, default in (
             ("cleanup_flat_fill_max_growth_px", 10),
             ("cleanup_flat_fill_retry_extra_growth_px", 2),
@@ -1200,7 +1201,7 @@ def classify_background_model(
         and local_var < 34.0
     ):
         model = "halftone_texture" if _halftone_guard else "flat_light"
-    elif mean_brightness > 205.0 and local_var < 18.0 and edge_density < 0.04:
+    elif mean_brightness > 205.0 and local_var < 22.0 and edge_density < 0.045:
         if _halftone_guard:
             model = "halftone_texture"
         elif spread < 18.0:
@@ -1216,9 +1217,9 @@ def classify_background_model(
             model = "translucent_gradient"
         else:
             model = "smooth_gradient"
-    elif mean_brightness < 70.0 and local_var < 18.0:
+    elif mean_brightness < 85.0 and local_var < 24.0:
         model = "dark_bubble"
-    elif local_var < 14.0 and edge_density < 0.025:
+    elif local_var < 22.0 and edge_density < 0.045:
         model = "flat_light" if is_neutral else "flat_colored"
     else:
         model = "unknown"
@@ -2674,11 +2675,22 @@ def _sam2_cleanup_candidate(
             and not _cfg_bool_attr(model_config, "cleanup_force_enabled", False)
             and (region_ratio > 0.45 or container_ratio > 0.65)
         ):
-            plan.debug_metrics["sam2_mask_skipped_reason"] = "oversized_auto_mask"
-            plan.debug_metrics["sam2_mask_rejected_ratio"] = round(float(region_ratio), 4)
-            if container_ratio:
-                plan.debug_metrics["sam2_mask_rejected_container_ratio"] = round(float(container_ratio), 4)
-            return None
+            # Before rejecting, check if the mask has structured text-line shape
+            # (long_bar_score > 1.8, low border touch).  Dense multi-line CJK
+            # text in a tight region legitimately fills >45% of the region bbox.
+            # Skipping it leaves no mask at all for normal readable bubbles.
+            _sam2_q = _compute_mask_quality_metrics(full, None, plan.region_bbox, plan.text_bbox)
+            _is_text_shaped = (
+                float(_sam2_q.get("long_bar_score", 0.0) or 0.0) > 1.8
+                and float(_sam2_q.get("border_touch_ratio", 0.0) or 0.0) < 0.5
+            )
+            if not _is_text_shaped:
+                plan.debug_metrics["sam2_mask_skipped_reason"] = "oversized_auto_mask"
+                plan.debug_metrics["sam2_mask_rejected_ratio"] = round(float(region_ratio), 4)
+                if container_ratio:
+                    plan.debug_metrics["sam2_mask_rejected_container_ratio"] = round(float(container_ratio), 4)
+                return None
+            # Structured text mask — allow through despite large region ratio.
         if mask_px / prompt_area > 0.95 and not _cfg_bool_attr(model_config, "cleanup_force_enabled", False):
             plan.debug_metrics["sam2_mask_skipped_reason"] = "near_full_prompt_mask"
             return None
@@ -2821,11 +2833,47 @@ def _compute_mask_quality_metrics(
     return metrics
 
 
-def _mask_is_fragmented_broad_fallback(quality: Dict[str, Any]) -> bool:
+def _mask_is_fragmented_broad_fallback(
+    quality: Dict[str, Any],
+    plan: Optional["CleanupPlan"] = None,
+) -> bool:
+    # GAP-A FIX: YOLO-confirmed dialogue speech bubbles are structurally
+    # guaranteed to contain text.  Their CV masks are fragmented by halftone /
+    # gradient backgrounds, not by background noise bleed.  Never reject them
+    # here — the YOLO detector confidence is the noise-discriminator that CV
+    # statistics cannot provide on textured backgrounds.
+    if (
+        plan is not None
+        and str(getattr(plan, "detector_source", "") or "") == "yolo"
+        and str(getattr(plan, "yolo_class", "") or "") == "dialogue"
+        and str(getattr(plan, "region_class", "") or "") == "speech_bubble"
+    ):
+        return False
+
     mask_region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
     component_count = int(quality.get("component_count", 0) or 0)
     largest_component_ratio = float(quality.get("largest_component_ratio", 0.0) or 0.0)
     rectangularity = float(quality.get("rectangularity", 0.0) or 0.0)
+    long_bar_score = float(quality.get("long_bar_score", 0.0) or 0.0)
+    border_touch_ratio = float(quality.get("border_touch_ratio", 0.0) or 0.0)
+    # A CV mask is "fragmented broad" (i.e. background noise, not text) when it
+    # covers a large fraction of the region AND is broken into many small pieces.
+    # However, multi-line Korean / CJK text naturally looks exactly like that:
+    # it covers 20-40% of a tight region and has 10-30 components because each
+    # character stroke is a separate blob.
+    #
+    # The key discriminator is `long_bar_score` (aspect ratio of the mask bbox):
+    # - Real text lines produce horizontally elongated masks → score > 1.8
+    # - Background segmentation noise spreads in all directions → score ≤ 1.5
+    #
+    # Additionally, if the mask doesn't touch the region border, it can't be
+    # runaway background bleed — accept it regardless.
+    if long_bar_score > 1.8:
+        # Looks like structured text rows — not background fragmentation.
+        return False
+    if border_touch_ratio == 0.0:
+        # Mask is fully interior — can't be runaway background bleed.
+        return False
     # FIX: widen thresholds — old 0.22/5/0.55 missed near-misses (e.g. 5 components, LCR=0.54)
     return bool(
         mask_region_ratio >= 0.20
@@ -2914,7 +2962,7 @@ def _hard_texture_cleanup_guard_reason(
         return "textured_cleanup_low_evidence_mask"
     if (
         source == "fallback_cv_no_bbox"
-        and _mask_is_fragmented_broad_fallback(quality)
+        and _mask_is_fragmented_broad_fallback(quality, plan=plan)
         and border_touch_ratio >= 0.25
     ):
         return "textured_cleanup_fragmented_border_fallback"
@@ -4318,7 +4366,17 @@ def build_text_mask_candidates(
                 mask_cf, conf_cf, reason_cf = _candidate_container_first_glyph_mask(
                     img_cv, block, region_bbox
                 )
-                if mask_cf is not None and conf_cf > 0.05:
+                # GAP-C FIX: container_first_glyph confidence degrades on
+                # halftone/gradient backgrounds because background texture bleeds
+                # into stroke measurement.  For YOLO-confirmed dialogue bubbles
+                # the detector already guarantees text is present, so accept the
+                # candidate at a lower floor (0.025 vs the normal 0.05).
+                yolo_dialogue = (
+                    getattr(block, "detector_source", "") == "yolo"
+                    and getattr(block, "kind", "") == "dialogue"
+                )
+                accept_threshold = 0.025 if yolo_dialogue else 0.05
+                if mask_cf is not None and conf_cf > accept_threshold:
                     mask_cf = _clip_mask_to_bbox(mask_cf, clip_bbox, img_cv.shape)
                     if np.any(mask_cf):
                         results.append((mask_cf, conf_cf, reason_cf))
@@ -4579,6 +4637,7 @@ def build_text_halo_mask(
     # text mask area).  Clamped 24–60 px to stay safe on any input.
     _text_mask_px = int(np.count_nonzero(_text_bin_pre))
     _max_probe_r = min(60, max(24, int(np.sqrt(float(_text_mask_px)) * 0.4)))
+    _bg_contaminated = False  # set True below if background chroma contaminates probe
 
     if _sat_all.shape[0] >= 16:
         _sat_cutoff = float(np.percentile(_sat_all, 30))
@@ -4593,6 +4652,28 @@ def build_text_halo_mask(
         glow_radius = _measure_glow_radius(
             img_cv, text_mask, _pre_bgr, _pre_sat, max_probe=_max_probe_r
         )
+        # FIX-CHROMATIC-BG: Validate that the glow radius is trustworthy.
+        #
+        # On colored/textured backgrounds (e.g. orange/dark bubbles, gradient
+        # fills), the background pixels themselves naturally exceed the chroma
+        # threshold used inside _measure_glow_radius.  This causes the probe to
+        # fire at every radius up to max_probe and return a spuriously large
+        # glow_radius even when no real glow exists.
+        #
+        # Defence: measure what fraction of the already-sampled background
+        # pixel saturation values already pass the chroma threshold.  If >30%
+        # of background pixels read as "glow colour" the measurement is
+        # contaminated and we fall back to the conservative max_px value.
+        if glow_radius > 0 and _sat_all.shape[0] >= 32:
+            _chroma_thresh_used = min(max(float(_pre_sat) + 18.0, 30.0), 55.0)
+            _bg_contamination_ratio = float(np.mean(_sat_all > _chroma_thresh_used))
+            if _bg_contamination_ratio > 0.30:
+                glow_radius = 0
+                _bg_contaminated = True
+                if debug_metrics is not None:
+                    debug_metrics["glow_radius_bg_contaminated"] = round(
+                        _bg_contamination_ratio, 3
+                    )
     else:
         glow_radius = 0
     glow_detected = glow_radius > 0
@@ -4689,6 +4770,58 @@ def build_text_halo_mask(
         255,
         0,
     ).astype(np.uint8)
+
+    # FIX-CONTAMINATED-BG-HALO: On chromatic/textured backgrounds the per-pixel
+    # contrast classifiers above (diff_thresh, gray_edge, color_glow) cannot
+    # reliably distinguish real glow from background texture variation.
+    # Attempting to do so produces a noisy, texture-following mask shape that
+    # misleads LaMa.
+    #
+    # When background contamination was detected earlier, replace the classifier
+    # output with a CLEAN morphological dilation zone at a safe fixed radius
+    # (8px or max_px+2, whichever is larger).  This gives LaMa a smooth,
+    # convex boundary to blend against while still covering the neon glow edge.
+    if _bg_contaminated:
+        _safe_r = max(8, int(max_px or 1) + 2)
+        _safe_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (_safe_r * 2 + 1, _safe_r * 2 + 1)
+        )
+        _safe_zone = cv2.bitwise_and(
+            cv2.dilate((text_mask > 0).astype(np.uint8) * 255, _safe_kernel, iterations=1),
+            cv2.bitwise_not((text_mask > 0).astype(np.uint8) * 255),
+        )
+        if global_cm is not None:
+            _safe_zone = cv2.bitwise_and(_safe_zone, global_cm)
+        halo = _safe_zone
+        if debug_metrics is not None:
+            debug_metrics["halo_contaminated_bg_safe_radius"] = _safe_r
+    # FIX-HALO-DENOISE: Remove background-texture noise from the halo.
+    #
+    # On highly textured backgrounds (vertical grain, halftone dots, orange/dark
+    # bubbles) the per-pixel contrast classifiers above fire on natural texture
+    # variation, producing hundreds of isolated speckle components spread across
+    # the background zone.  LaMa reads those jagged, texture-following mask edges
+    # as intentional background structure and tries to replicate them.
+    #
+    # FIX-HALO-DENOISE: Remove background-texture noise from the halo.
+    # Skip when _bg_contaminated: that path already produced a clean solid ring.
+    if np.any(halo) and not _bg_contaminated:
+        _text_boundary_zone = cv2.dilate(
+            (text_mask > 0).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1,
+        ) > 0
+        _n_h, _lbl_h, _st_h, _ = cv2.connectedComponentsWithStats(halo, 8)
+        _clean_halo = np.zeros_like(halo)
+        for _ci_h in range(1, _n_h):
+            _comp_mask = (_lbl_h == _ci_h)
+            # Accept only if: big enough AND touching the text stroke boundary.
+            if (
+                int(_st_h[_ci_h, cv2.CC_STAT_AREA]) >= 8
+                and np.any(_comp_mask & _text_boundary_zone)
+            ):
+                _clean_halo[_comp_mask] = 255
+        halo = _clean_halo
     if not np.any(halo):
         if debug_metrics is not None:
             debug_metrics["halo_rejected_reason"] = "no_contrast_edge_pixels"
@@ -4700,25 +4833,40 @@ def build_text_halo_mask(
         debug_metrics["halo_added_px"] = halo_px
         debug_metrics["halo_ratio_to_text_mask"] = round(ratio, 4)
     if region_bbox is not None:
-        quality = _compute_mask_quality_metrics(halo, global_cm, region_bbox)
-        rectangularity = float(quality.get("rectangularity", 0.0) or 0.0)
-        mask_region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
-        # FIX-20: Neon/glow text produces large halos by design – relax gates.
-        _ratio_gate       = 8.0  if glow_detected else 1.75
-        _region_gate      = 0.75 if glow_detected else 0.18
-        _rect_ratio_gate  = 2.5  if glow_detected else 0.55
-        if (
-            ratio > _ratio_gate
-            or mask_region_ratio > _region_gate
-            or (rectangularity > 0.72 and halo_px > text_px * _rect_ratio_gate)
-        ):
-            if debug_metrics is not None:
-                debug_metrics["halo_added_px"] = 0
-                debug_metrics["halo_ratio_to_text_mask"] = 0.0
-                debug_metrics["halo_rejected_reason"] = (
-                    f"unsafe_halo_shape(ratio={ratio:.2f},rect={rectangularity:.2f})"
-                )
-            return None
+        # Shape quality gate: detects runaway halos caused by per-pixel
+        # classifier noise (diff_thresh / gray_edge / color_glow firing on
+        # background texture instead of real glow pixels).
+        #
+        # IMPORTANT: this gate must NOT apply when the halo was deliberately
+        # constructed as a geometric morphological ring (i.e. when
+        # _bg_contaminated=True and we bypassed the classifiers entirely).
+        # A clean dilation ring cannot produce a "bad shape" by construction;
+        # applying the gate here only discards valid expansion that LaMa needs
+        # to avoid using neon-glow pixels as background context.
+        #
+        # General rule: skip this gate whenever the halo bypassed the
+        # per-pixel classifiers.  Future callers can signal this via the
+        # _bg_contaminated flag or any equivalent bypass path.
+        if not _bg_contaminated:
+            quality = _compute_mask_quality_metrics(halo, global_cm, region_bbox)
+            rectangularity = float(quality.get("rectangularity", 0.0) or 0.0)
+            mask_region_ratio = float(quality.get("mask_region_ratio", 0.0) or 0.0)
+            # FIX-20: Neon/glow text produces large halos by design – relax gates.
+            _ratio_gate       = 8.0  if glow_detected else 1.75
+            _region_gate      = 0.75 if glow_detected else 0.18
+            _rect_ratio_gate  = 2.5  if glow_detected else 0.55
+            if (
+                ratio > _ratio_gate
+                or mask_region_ratio > _region_gate
+                or (rectangularity > 0.72 and halo_px > text_px * _rect_ratio_gate)
+            ):
+                if debug_metrics is not None:
+                    debug_metrics["halo_added_px"] = 0
+                    debug_metrics["halo_ratio_to_text_mask"] = 0.0
+                    debug_metrics["halo_rejected_reason"] = (
+                        f"unsafe_halo_shape(ratio={ratio:.2f},rect={rectangularity:.2f})"
+                    )
+                return None
     return halo
 
 
@@ -5598,7 +5746,7 @@ def _optimize_flat_fill_cleanup_mask(
     broad_mask = _mask_is_nontrivial_for_model_inpaint(base_quality)
     fragmented_fallback = (
         str(plan.debug_metrics.get("selected_text_mask_candidate_source", "") or "") == "fallback_cv_no_bbox"
-        and _mask_is_fragmented_broad_fallback(base_quality)
+        and _mask_is_fragmented_broad_fallback(base_quality, plan=plan)
     )
     if fragmented_fallback or broad_mask:
         if fragmented_fallback or float(base_quality.get("mask_region_ratio", 0.0) or 0.0) >= 0.28:
@@ -6258,15 +6406,6 @@ def select_strategy(
     if policy.cleanup_manual_review_only:
         return "review", "skip"
 
-    # FIX (Bug 5): if LaMa is configured as the backend, route ALL non-SFX regions with
-    # sufficient mask confidence to mask_inpaint rather than falling through to skip/review.
-    # This prevents text_on_art, halftone_texture, busy_art, gradient bubbles from being
-    # silently skipped even though LaMa can handle them.
-    if model_config is not None and region_class not in {"sfx"}:
-        _cfg_backend = str(getattr(model_config, "cleanup_backend", "") or "").strip().lower()
-        if _cfg_backend in _MODEL_INPAINT_BACKENDS and text_mask_confidence >= 0.22:
-            return "mask_inpaint", "telea"
-
     if text_mask_confidence < 0.12 and region_class != "caption_box":
         return "skip", "skip"
 
@@ -6319,12 +6458,17 @@ def select_strategy(
         return "skip", "skip"
 
     if background_model == "translucent_gradient":
-        if not policy.allow_gradient_fill or not policy.cleanup_allow_translucent_caption:
+        if not policy.allow_gradient_fill:
             return "skip", "skip"
+        # cleanup_allow_translucent_caption only gates caption_box (handled above).
+        # Speech and thought bubbles with translucent gradients route to
+        # gradient_fill or mask_inpaint/telea directly.
         if text_mask_confidence >= 0.20 and container_confidence >= 0.35:
             return "gradient_fill", "idw_lab"
-        if text_mask_confidence >= 0.30 and policy.allow_texture_inpaint:
-            return "mask_inpaint", "telea"
+        if text_mask_confidence >= 0.20:
+            return "gradient_fill", "telea"    # no container, still attempt
+        if text_mask_confidence >= 0.15 and policy.allow_texture_inpaint:
+            return "mask_inpaint", "telea"     # low confidence, tight mask fallback
         return "skip", "skip"
 
     if background_model == "halftone_texture":
@@ -6333,17 +6477,24 @@ def select_strategy(
         if text_mask_confidence >= 0.25:
             if policy.cleanup_fallback_backend == "iopaint" or policy.cleanup_prefer_iopaint_for_texture:
                 return "texture_clone", "telea"
-            return "review", "skip"
+            # Telea on a tight mask is visually acceptable for most halftone
+            # backgrounds and infinitely better than a permanent skip.
+            return "mask_inpaint", "telea"
         return "skip", "skip"
 
     if background_model == "busy_art":
         if not policy.allow_texture_inpaint:
             return "skip", "skip"
+        # Explicit config opts in for full mode.
         if (
             policy.auto_clean_busy_background
             and text_mask_confidence >= policy.t2_text_conf
             and policy.busy_background_cleanup_mode in ("tight_mask", "telea")
         ):
+            return "mask_inpaint", "telea"
+        # Tight-mask Telea always available as a fallback when confidence is high.
+        # Does not reconstruct the background — only patches glyph holes.
+        if text_mask_confidence >= 0.40 and policy.allow_texture_inpaint:
             return "mask_inpaint", "telea"
         return "skip", "skip"
 
@@ -6352,6 +6503,11 @@ def select_strategy(
         return "review", "skip"
     if text_mask_confidence >= 0.35:
         return "mask_inpaint", "telea"
+    # For YOLO-sourced regions with a usable mask, attempt Telea rather than
+    # leaving text permanently visible. The mask safety gates in build_cleanup_plan
+    # still apply and will convert to skip if geometry is unsafe.
+    if text_mask_confidence >= 0.20:
+        return "mask_inpaint", "telea"
     return "review", "skip"
 
 
@@ -6359,7 +6515,7 @@ def _route_model_backend_for_nontrivial_solid_mask(plan: CleanupPlan, backend: s
     if (
         backend not in _MODEL_INPAINT_BACKENDS
         or plan.cleanup_strategy != "flat_fill"
-        or plan.region_class not in {"speech_bubble", "caption_box"}
+        or plan.region_class != "speech_bubble"
         or plan.background_model not in {"flat_light", "flat_colored", "dark_bubble"}
         or plan.text_mask is None
         or not np.any(plan.text_mask)
@@ -6432,23 +6588,6 @@ def _hybrid_cleanup_route(
                 except (TypeError, ValueError):
                     pass
             return
-        if configured_backend in _MODEL_INPAINT_BACKENDS and not policy.cleanup_solid_bubble_fill_enabled:
-            plan.debug_metrics["cleanup_route"] = "model_inpaint_solid_bubble"
-            plan.debug_metrics["model_inpaint_required"] = True
-            plan.debug_metrics["flat_fill_disabled_by_config"] = True
-            plan.debug_metrics["cleanup_strategy_source"] = "cleanup_backend"
-            plan.cleanup_backend = configured_backend
-            plan.cleanup_strategy = "mask_inpaint"
-            plan.inpaint_method = "telea"
-            plan.skip_reason = ""
-            if model_config is not None:
-                plan.iopaint_url = str(getattr(model_config, "iopaint_url", "") or "")
-                plan.lama_model_path = str(getattr(model_config, "lama_model_path", "") or "")
-                try:
-                    plan.max_tile_size = int(getattr(model_config, "max_tile_size", plan.max_tile_size) or plan.max_tile_size)
-                except (TypeError, ValueError):
-                    pass
-            return
         if textured_solid and (prefers_lama or prefers_iopaint):
             plan.debug_metrics["cleanup_route"] = "model_inpaint_solid_bubble"
             plan.debug_metrics["model_inpaint_required"] = True
@@ -6486,11 +6625,6 @@ def _hybrid_cleanup_route(
                 plan.max_tile_size = int(getattr(model_config, "max_tile_size", plan.max_tile_size) or plan.max_tile_size)
             except (TypeError, ValueError):
                 pass
-        if plan.text_mask_confidence < 0.18:
-            plan.cleanup_strategy = "review"
-            plan.inpaint_method = "skip"
-            plan.skip_reason = "model_inpaint_text_mask_confidence_low"
-            return
         if plan.cleanup_strategy in {"skip", "review"}:
             plan.cleanup_strategy = "texture_clone" if bg in {"halftone_texture", "translucent_gradient"} else "mask_inpaint"
             plan.inpaint_method = "telea"
@@ -6498,6 +6632,13 @@ def _hybrid_cleanup_route(
         return
     if not prefers_iopaint:
         plan.debug_metrics["cleanup_route"] = "hard_background_review_or_opencv"
+        if (
+            bg == "halftone_texture"
+            and policy.cleanup_allow_texture_inpaint
+            and plan.cleanup_strategy == "skip"
+        ):
+            plan.cleanup_strategy = "review"
+            plan.inpaint_method = "skip"
         return
 
     url = str(getattr(model_config, "iopaint_url", "") or "").strip() if model_config is not None else ""
@@ -6505,11 +6646,6 @@ def _hybrid_cleanup_route(
     plan.debug_metrics["model_inpaint_required"] = True
     plan.cleanup_backend = "iopaint"
     plan.iopaint_url = url
-    if plan.text_mask_confidence < 0.18:
-        plan.cleanup_strategy = "review"
-        plan.inpaint_method = "skip"
-        plan.skip_reason = "model_inpaint_text_mask_confidence_low"
-        return
     if not url:
         plan.cleanup_strategy = "review"
         plan.inpaint_method = "skip"
@@ -6822,7 +6958,7 @@ def build_cleanup_plan(
                 plan.region_bbox,
                 plan.text_bbox,
             )
-            if _mask_is_fragmented_broad_fallback(cand_quality):
+            if _mask_is_fragmented_broad_fallback(cand_quality, plan=plan):
                 rejected_fallback_reasons.append({
                     "reason": cand_reason,
                     "quality": cand_quality,
@@ -7010,7 +7146,7 @@ def build_cleanup_plan(
         plan.debug_metrics["bg"]   = bg_metrics
         if (
             plan.region_class in ("speech_bubble", "caption_box")
-            and plan.background_model in {"halftone_texture", "busy_art", "unknown"}
+            and plan.background_model in {"halftone_texture", "busy_art", "unknown", "smooth_gradient", "translucent_gradient"}
             and plan.text_mask is not None
             and plan.container_mask is not None
             and plan.container_bbox is not None
@@ -7026,7 +7162,7 @@ def build_cleanup_plan(
                 channel_std = float(solid_bg_metrics.get("channel_std_max", 999.0))
                 sat_std = float(solid_bg_metrics.get("sat_std", 999.0))
                 edge_density = float(solid_bg_metrics.get("edge_density", 1.0))
-                if gray_std <= 16.0 and channel_std <= 20.0 and sat_std <= 24.0 and edge_density <= 0.035:
+                if gray_std <= 20.0 and channel_std <= 24.0 and sat_std <= 28.0 and edge_density <= 0.045:
                     channel_range = int(np.max(solid_bg_bgr)) - int(np.min(solid_bg_bgr))
                     if mean_brightness < 85.0:
                         plan.background_model = "dark_bubble"
@@ -7178,6 +7314,47 @@ def build_cleanup_plan(
         elif plan.background_model in ("smooth_gradient", "translucent_gradient") and not policy.allow_gradient_fill:
             plan.skip_reason = "skipped_gradient_fill_disabled"
 
+    # Emergency bbox fallback — fires when all CV/SAM2 mask candidates failed.
+    # Change 3 (flat backgrounds) + Gap B (textured/unknown YOLO-confirmed regions).
+    # After injecting the mask we re-run select_strategy so it gets a real
+    # strategy instead of retaining the 'skip' assigned before the mask existed.
+    _emergency_fired = False
+    if (
+        plan.text_mask is None
+        and plan.text_mask_reason == "no_candidates"
+        and plan.text_bbox is not None
+        and plan.region_class in ("speech_bubble", "caption_box")
+    ):
+        _flat_bg = plan.background_model in {"flat_light", "flat_colored", "dark_bubble"}
+        _textured_yolo = (
+            plan.background_model in {"halftone_texture", "unknown", "translucent_gradient"}
+            and plan.detector_source == "yolo"
+        )
+        if _flat_bg or _textured_yolo:
+            mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
+            x, y, w, h = _expand_bbox(plan.text_bbox, 4, img_cv.shape)
+            mask[y:y + h, x:x + w] = 255
+            plan.text_mask = mask
+            plan.text_mask_confidence = 0.20
+            plan.text_mask_reason = "emergency_flat_fill_bbox_fallback"
+            plan.debug_metrics["emergency_flat_fill_fallback"] = True
+            plan.debug_metrics["emergency_flat_fill_fallback_bg"] = plan.background_model
+            _emergency_fired = True
+    # Re-run strategy if the emergency mask changed things — the earlier
+    # select_strategy call saw text_mask_confidence=0.0 and returned skip.
+    if _emergency_fired and plan.cleanup_strategy in ("skip", "review"):
+        plan.cleanup_strategy, plan.inpaint_method = select_strategy(
+            plan.region_class,
+            plan.background_model,
+            plan.text_mask_confidence,
+            plan.container_confidence,
+            auto_clean_sfx=auto_clean_sfx,
+            policy=policy,
+            model_config=model_config,
+        )
+        plan.skip_reason = "" if plan.cleanup_strategy not in ("skip", "review") else plan.skip_reason
+        plan.debug_metrics["emergency_strategy_reselected"] = plan.cleanup_strategy
+
     # ── Assemble cleanup_mask ─────────────────────────────────────────────────
     original_strategy = plan.cleanup_strategy
     original_method = plan.inpaint_method
@@ -7214,16 +7391,76 @@ def build_cleanup_plan(
             global_cm = normalize_mask_to_image(
                 plan.container_mask, plan.container_bbox, img_cv.shape
             )
-            confined = cv2.bitwise_and(cleanup, global_cm)
-            preserves, retained_ratio = _mask_preserves_cleanup(cleanup, global_cm)
+            # FIX-SANITIZE (container holes): Text segmentation thresholding
+            # leaves black islands inside the speech bubble interior.  AND-ing
+            # the cleanup mask against a holey container_mask punches those
+            # holes straight through the final cleanup_mask, causing LaMa to
+            # treat glyph-center pixels as valid background and leave floating
+            # text fragments.  Reconstruct via external contours to get a
+            # solid, hole-free container silhouette before any confinement.
+            _cm_uint8 = (global_cm > 0).astype(np.uint8)
+            _cm_contours, _ = cv2.findContours(
+                _cm_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            _solid_cm = np.zeros_like(_cm_uint8)
+            cv2.drawContours(_solid_cm, _cm_contours, -1, 1, thickness=cv2.FILLED)
+            global_cm_solid = (_solid_cm * 255).astype(np.uint8)
+
+            confined = cv2.bitwise_and(cleanup, global_cm_solid)
+            preserves, retained_ratio = _mask_preserves_cleanup(cleanup, global_cm_solid)
             plan.debug_metrics["container_confine_retained_ratio"] = round(retained_ratio, 4)
             # Only use confinement if the detected container preserves the
             # glyph mask. On dark narration art the container detector can lock
             # onto only half a word, which used to erase only that half.
+            # FIX-SANITIZE (text_mask priority): Always re-OR the solid core
+            # text_mask back in after confinement so that no glyph pixel can
+            # ever be silently carved away by an imperfect container boundary.
             if np.any(confined) and preserves:
-                cleanup = confined
+                cleanup = cv2.bitwise_or(confined, plan.text_mask)
             elif np.any(confined):
+                cleanup = cv2.bitwise_or(confined, plan.text_mask)
                 plan.debug_metrics["container_confine_ignored"] = "partial_container_mask"
+
+        # FIX-SANITIZE (final pass): Three-step sanitization applied to the
+        # assembled cleanup_mask right before it is handed to inpainting.
+        #
+        # Step 1 – Horizontal line-merging: close small gaps between adjacent
+        # letters on the same text line so individual glyphs form solid blocks
+        # instead of hundreds of isolated pixel islands.
+        _h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+        cleanup = cv2.morphologyEx(cleanup, cv2.MORPH_CLOSE, _h_kernel)
+        #
+        # Step 2 – Hole filling: eliminate any "donut hole" black islands
+        # punched through letter interiors.  LaMa reads unmasked pixels as
+        # pristine background texture; holes make it copy glyph fragments into
+        # the inpainted result.
+        cleanup = (
+            _ndimage.binary_fill_holes(cleanup > 0).astype(np.uint8) * 255
+        )
+        #
+        # Step 3 – Speckle filter: drop micro-components below 15 px that are
+        # pure noise and would corrupt the background texture sample.
+        # EXCEPTION: any component whose centroid falls inside the text bounding
+        # box is always kept, regardless of size.  A period, comma, ellipsis
+        # dot, or other small punctuation mark is a legitimate glyph pixel —
+        # dropping it leaves visible text remnants after inpainting.
+        _n_comp, _comp_labels, _comp_stats, _ = cv2.connectedComponentsWithStats(
+            cleanup, 8
+        )
+        _speckle_clean = np.zeros_like(cleanup)
+        _tx, _ty, _tw, _th = (plan.text_bbox or (0, 0, img_cv.shape[1], img_cv.shape[0]))
+        _text_box_mask = np.zeros(cleanup.shape, dtype=bool)
+        _text_box_mask[_ty:_ty + _th, _tx:_tx + _tw] = True
+        for _ci in range(1, _n_comp):
+            _area = int(_comp_stats[_ci, cv2.CC_STAT_AREA])
+            if _area >= 15:
+                _speckle_clean[_comp_labels == _ci] = 255
+            else:
+                # Keep small component if it overlaps the text bounding box —
+                # it's likely punctuation, not background noise.
+                if np.any(_text_box_mask & (_comp_labels == _ci)):
+                    _speckle_clean[_comp_labels == _ci] = 255
+        cleanup = _speckle_clean
 
         if (
             plan.cleanup_backend in _MODEL_INPAINT_BACKENDS
@@ -7242,6 +7479,28 @@ def build_cleanup_plan(
             plan.debug_metrics.pop("tight_mask_growth", None)
             cleanup = cleanup_before_tight_growth
             reject_reason = _reject_unsafe_cleanup_mask(plan, cleanup, policy=policy, img_cv=img_cv)
+        if (
+            reject_reason
+            and str(reject_reason).startswith("cleanup_mask_too_large_text_ratio")
+            and bool(plan.debug_metrics.get("model_inpaint_required", False))
+            and plan.background_model in {"halftone_texture", "translucent_gradient"}
+        ):
+            plan.debug_metrics["model_inpaint_bypassed_text_ratio_rejection"] = str(reject_reason)
+            reject_reason = ""
+        if (
+            reject_reason == "caption_cleanup_mask_bbox_matches_region_bbox"
+            and plan.region_class == "caption_box"
+            and plan.background_model == "dark_bubble"
+            and _compute_mask_quality_metrics(
+                cleanup,
+                None,
+                plan.region_bbox,
+                plan.text_bbox,
+                safety_bbox=_select_safety_bbox(plan),
+            ).get("mask_region_ratio", 1.0) < 0.30
+        ):
+            plan.debug_metrics["caption_bypassed_bbox_match_rejection"] = str(reject_reason)
+            reject_reason = ""
         if reject_reason and policy.cleanup_force_enabled:
             plan.debug_metrics["force_cleanup_bypassed_rejection"] = str(reject_reason)
             reject_reason = ""
@@ -8249,7 +8508,10 @@ def _try_external_inpaint_backend(
             return False
     if backend == "lama_pt":
         try:
-            from simple_lama_inpainting import SimpleLama  # type: ignore[import]
+            try:
+                from simple_lama_inpainting import SimpleLama  # type: ignore[import]
+            except ImportError:
+                from simple_lama_inpainting.models.model import SimpleLama # type: ignore[import]
             from PIL import Image as _PILImage             # type: ignore[import]
             import torch                                  # type: ignore[import]
         except ImportError:
@@ -8313,23 +8575,9 @@ def _try_external_inpaint_backend(
             )
             return False
     try:
-        ok_img, img_buf = cv2.imencode(".png", img_cv)
-        ok_mask, mask_buf = cv2.imencode(".png", mask)
-        if not ok_img or not ok_mask:
-            raise RuntimeError("encode_failed")
-        resp = requests.post(
-            plan.iopaint_url,
-            files={
-                "image": ("image.png", img_buf.tobytes(), "image/png"),
-                "mask": ("mask.png", mask_buf.tobytes(), "image/png"),
-            },
-            timeout=8,
-        )
-        resp.raise_for_status()
-        arr = np.frombuffer(resp.content, dtype=np.uint8)
-        decoded = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if decoded is None or decoded.shape[:2] != result.shape[:2]:
-            raise RuntimeError("invalid_output")
+        from backend.core.iopaint_client import call_iopaint_inpaint
+
+        decoded = call_iopaint_inpaint(plan.iopaint_url, img_cv, mask, timeout=8)
         result[mask > 0] = decoded[mask > 0]
         debug_print(
             f"external_inpaint_backend: backend={backend} region={plan.region_id} "
@@ -8449,21 +8697,6 @@ def erase_text_region_planned(
             "sam2" if bool(plan.debug_metrics.get("sam2_mask_used", False)) else "cv"
         )
         _route_model_backend_for_nontrivial_solid_mask(plan, plan.cleanup_backend)
-        if (
-            plan.cleanup_backend in _MODEL_INPAINT_BACKENDS
-            and not policy.cleanup_solid_bubble_fill_enabled
-            and plan.region_class in ("speech_bubble", "caption_box")
-            and plan.background_model in {"flat_light", "flat_colored", "dark_bubble"}
-            and plan.cleanup_strategy == "flat_fill"
-        ):
-            plan.cleanup_strategy = "mask_inpaint"
-            plan.inpaint_method = "telea"
-            plan.skip_reason = ""
-            plan.debug_metrics["cleanup_route"] = "model_inpaint_solid_bubble"
-            plan.debug_metrics["model_inpaint_required"] = True
-            plan.debug_metrics["cleanup_strategy_source"] = "cleanup_backend"
-            plan.debug_metrics["flat_fill_disabled_by_config"] = True
-
         # Apply explicit override if set, but still route through the plan
         # so all mask-safety invariants are honoured.
         if override_strategy is not None and override_strategy not in (
@@ -8497,6 +8730,23 @@ def erase_text_region_planned(
                     cleanup = cv2.bitwise_or(cleanup, plan.outline_shadow_mask)
                 if plan.halo_mask is not None:
                     cleanup = cv2.bitwise_or(cleanup, plan.halo_mask)
+                # FIX-SANITIZE: apply same hole-fill + speckle pass so that
+                # manually-overridden retries are also clean.
+                _h_kernel_r = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+                cleanup = cv2.morphologyEx(cleanup, cv2.MORPH_CLOSE, _h_kernel_r)
+                cleanup = (
+                    _ndimage.binary_fill_holes(cleanup > 0).astype(np.uint8) * 255
+                )
+                _n_r, _lbl_r, _st_r, _ = cv2.connectedComponentsWithStats(cleanup, 8)
+                _clean_r = np.zeros_like(cleanup)
+                _tx_r, _ty_r, _tw_r, _th_r = (plan.text_bbox or (0, 0, img_cv.shape[1], img_cv.shape[0]))
+                _text_box_mask_r = np.zeros(cleanup.shape, dtype=bool)
+                _text_box_mask_r[_ty_r:_ty_r + _th_r, _tx_r:_tx_r + _tw_r] = True
+                for _ci_r in range(1, _n_r):
+                    _area_r = int(_st_r[_ci_r, cv2.CC_STAT_AREA])
+                    if _area_r >= 15 or np.any(_text_box_mask_r & (_lbl_r == _ci_r)):
+                        _clean_r[_lbl_r == _ci_r] = 255
+                cleanup = _clean_r
                 cleanup = _constrain_flat_fill_boundary_mask(img_cv, plan, cleanup)
                 reject_reason = _reject_unsafe_cleanup_mask(plan, cleanup, policy=policy, img_cv=img_cv)
                 if reject_reason:
