@@ -49,15 +49,15 @@ class ModelConfig:
     cleanup_debug_dir: str = ""
     auto_clean_sfx: bool = False
     auto_typeset_sfx: bool = False
-    auto_clean_text_over_art: bool = False
-    auto_clean_busy_background: bool = False
-    require_review_for_tier2: bool = False
+    auto_clean_text_over_art: bool = True
+    auto_clean_busy_background: bool = True
+    require_review_for_tier2: bool = True
     allow_gradient_fill: bool = True
     allow_texture_inpaint: bool = True
     sfx_experimental_cleanup_mode: str = "off"
     busy_background_cleanup_mode: str = "off"
     cleanup_mode: str = "balanced"
-    cleanup_solid_bubble_fill_enabled: bool = True
+    cleanup_solid_bubble_fill_enabled: bool = False
     cleanup_solid_bubble_min_container_confidence: float = 0.60
     cleanup_solid_bubble_max_mask_container_ratio: float = 0.15
     cleanup_solid_bubble_max_rectangularity: float = 0.45
@@ -69,7 +69,7 @@ class ModelConfig:
     cleanup_flat_fill_max_ring_chroma_std: float = 12.0
     cleanup_flat_fill_max_ring_edge_density: float = 0.08
     cleanup_halo_mask_enabled: bool = True
-    cleanup_halo_max_px: int = 2
+    cleanup_halo_max_px: int = 3
     cleanup_residual_retry_enabled: bool = True
     cleanup_residual_retry_dilate_px: int = 1
     cleanup_allow_grouped_inpaint: bool = False
@@ -80,7 +80,7 @@ class ModelConfig:
     cleanup_max_border_touch_ratio: float = 0.35
     cleanup_max_rectangularity: float = 0.88
     cleanup_allow_translucent_caption: bool = False
-    cleanup_allow_texture_inpaint: bool = False
+    cleanup_allow_texture_inpaint: bool = True
     cleanup_easy_fallback_enabled: bool = False
     cleanup_easy_fallback_backend: str = "telea"
     cleanup_easy_fallback_scope: str = "bubbles"

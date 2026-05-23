@@ -963,7 +963,7 @@ const SettingsModal = ({
               <option value="sam2">SAM2</option>
             </select>
             <label>Solid bubble fill</label>
-            <input type="checkbox" checked={checked("cleanup_solid_bubble_fill_enabled", true)} onChange={e => update("cleanup_solid_bubble_fill_enabled", String(e.target.checked))} title="Best for white/solid bubbles" />
+            <input type="checkbox" checked={checked("cleanup_solid_bubble_fill_enabled", false)} onChange={e => update("cleanup_solid_bubble_fill_enabled", String(e.target.checked))} title="Best for white/solid bubbles" />
             <label>Solid min container conf</label>
             <input className="settings-input" type="number" step="0.05" min="0" max="1" value={valueOf("cleanup_solid_bubble_min_container_confidence", "0.6")} onChange={e => update("cleanup_solid_bubble_min_container_confidence", e.target.value)} />
             <label>Solid max mask/container</label>
@@ -973,7 +973,7 @@ const SettingsModal = ({
             <label>Edge cleanup</label>
             <input type="checkbox" checked={checked("cleanup_halo_mask_enabled", true)} onChange={e => update("cleanup_halo_mask_enabled", String(e.target.checked))} title="Expands the cleanup mask over faint text edges" />
             <label>Edge cleanup px</label>
-            <input className="settings-input" type="number" min="0" max="8" value={valueOf("cleanup_halo_max_px", "2")} onChange={e => update("cleanup_halo_max_px", e.target.value)} />
+            <input className="settings-input" type="number" min="0" max="8" value={valueOf("cleanup_halo_max_px", "3")} onChange={e => update("cleanup_halo_max_px", e.target.value)} />
             <label>Complete outlines</label>
             <input type="checkbox" checked={checked("cleanup_contrast_mask_completion_enabled", true)} onChange={e => update("cleanup_contrast_mask_completion_enabled", String(e.target.checked))} title="Expands flat-bubble masks over missed high-contrast outlines and shadows" />
             <label>Outline radius</label>
