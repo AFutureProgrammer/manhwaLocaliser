@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto as _auto
 from typing import Any, Dict, List, Optional, Tuple
 
+import copy
 import cv2
 import numpy as np
 
@@ -62,7 +63,7 @@ class CharacterMemory:
         return json.dumps(self.history, ensure_ascii=False, indent=2)
 
     def is_empty(self) -> bool:
-        return len(self.history) == 0
+        return not self.history
 
 @dataclass
 class TextStyle:
@@ -153,10 +154,20 @@ class TextStyle:
     def from_dict(cls, d: dict) -> "TextStyle":
         def _t3(key: str, default: list) -> Tuple[int, int, int]:
             v = d.get(key, default)
-            return (int(v[0]), int(v[1]), int(v[2])) if len(v) >= 3 else tuple(default)
+            if isinstance(v, (list, tuple)) and len(v) >= 3:
+                try:
+                    return (int(v[0]), int(v[1]), int(v[2]))
+                except (TypeError, ValueError):
+                    pass
+            return (int(default[0]), int(default[1]), int(default[2]))
         def _t2(key: str, default: list) -> Tuple[int, int]:
             v = d.get(key, default)
-            return (int(v[0]), int(v[1])) if len(v) >= 2 else tuple(default)
+            if isinstance(v, (list, tuple)) and len(v) >= 2:
+                try:
+                    return (int(v[0]), int(v[1]))
+                except (TypeError, ValueError):
+                    pass
+            return (int(default[0]), int(default[1]))
         return cls(
             fg_color       = _t3("fg_color",       [0,   0,   0  ]),
             outline_color  = _t3("outline_color",  [255, 255, 255]),
@@ -317,6 +328,18 @@ class RegionOverride:
     cleanup_allow_low_confidence: Optional[bool] = None
     cleanup_allow_texture_inpaint: Optional[bool] = None
     cleanup_allow_translucent_caption: Optional[bool] = None
+    # ── SAM2 prompting overrides ──────────────────────────────────────────────
+    # cleanup_sam2_text_bbox: tighter text area for SAM2 click-grid placement.
+    # When set, positive clicks are generated inside this rect rather than the
+    # full region bbox, reducing SAM2's tendency to over-segment whitespace.
+    cleanup_sam2_text_bbox: Optional[Tuple[int, int, int, int]] = None
+    # cleanup_sam2_bg_color: explicit (B,G,R) bubble background colour for the
+    # glyph-stroke refinement step in propose_mask.  When None, cleanup_plan
+    # auto-derives it from the bg classifier; set this to override.
+    cleanup_sam2_bg_color: Optional[Tuple[int, int, int]] = None
+    # cleanup_sam2_skip_refinement: set True to disable glyph-stroke stripping
+    # (useful on dark-background bubbles where the refinement may over-strip).
+    cleanup_sam2_skip_refinement: Optional[bool] = None
 
     def is_empty(self) -> bool:
         """True when no field carries an actual override value."""
@@ -341,6 +364,9 @@ class RegionOverride:
             and self.cleanup_allow_low_confidence is None
             and self.cleanup_allow_texture_inpaint is None
             and self.cleanup_allow_translucent_caption is None
+            and self.cleanup_sam2_text_bbox is None
+            and self.cleanup_sam2_bg_color is None
+            and self.cleanup_sam2_skip_refinement is None
         )
 
     def to_dict(self) -> dict:
@@ -366,10 +392,14 @@ class RegionOverride:
             "cleanup_allow_low_confidence",
             "cleanup_allow_texture_inpaint",
             "cleanup_allow_translucent_caption",
+            "cleanup_sam2_bg_color",
+            "cleanup_sam2_skip_refinement",
         ):
             value = getattr(self, key)
             if value is not None:
                 d[key] = value
+        if self.cleanup_sam2_text_bbox is not None:
+            d["cleanup_sam2_text_bbox"] = list(self.cleanup_sam2_text_bbox)
         return d
 
     @classmethod
@@ -401,6 +431,17 @@ class RegionOverride:
             cleanup_allow_low_confidence = d.get("cleanup_allow_low_confidence"),
             cleanup_allow_texture_inpaint = d.get("cleanup_allow_texture_inpaint"),
             cleanup_allow_translucent_caption = d.get("cleanup_allow_translucent_caption"),
+            cleanup_sam2_bg_color = (
+                tuple(int(v) for v in d["cleanup_sam2_bg_color"][:3])
+                if isinstance(d.get("cleanup_sam2_bg_color"), (list, tuple)) and len(d["cleanup_sam2_bg_color"]) >= 3
+                else None
+            ),
+            cleanup_sam2_text_bbox = (
+                tuple(int(v) for v in d["cleanup_sam2_text_bbox"][:4])
+                if isinstance(d.get("cleanup_sam2_text_bbox"), (list, tuple)) and len(d["cleanup_sam2_text_bbox"]) >= 4
+                else None
+            ),
+            cleanup_sam2_skip_refinement = d.get("cleanup_sam2_skip_refinement"),
         )
 
 @dataclass
@@ -571,10 +612,19 @@ class OCRBlock:
         self.override = None
 
     def has_override(self, field_name: str) -> bool:
-        """True when a specific field carries an explicit override value."""
+        """True when a specific field carries an explicit override value.
+
+        For Optional fields (default None) this means the value is not None.
+        For bool fields that default to False (currently only skip_typeset),
+        this means the value is True — False is the same as "no override".
+        """
         if self.override is None:
             return False
         val = getattr(self.override, field_name, None)
+        # skip_typeset is a plain bool (default False), not Optional[bool].
+        # treat False as "not overridden" so callers get a consistent signal.
+        if field_name == "skip_typeset":
+            return bool(val)
         return val is not None
 
     # ── Phase 3: effective value accessors ───────────────────────────────────
@@ -622,7 +672,7 @@ class OCRBlock:
         return TextStyle(
             fg_color      = self.fg_color or (0, 0, 0),
             outline_color = oc,
-            outline_width = max(1, ow) if ow > 0 else 1,
+            outline_width = ow,   # 0 means no outline; don't force a minimum of 1
             source        = "auto",
         )
 
@@ -642,7 +692,6 @@ class OCRBlock:
         preset = STYLE_PRESETS.get(preset_name)
         if preset is None:
             return False
-        import copy
         self.style = copy.copy(preset)
         return True
 
@@ -752,7 +801,9 @@ def _block_to_dict(block: "OCRBlock") -> dict:
             val = existing_meta.get(key)
             if isinstance(val, (str, int, float, bool)) or val is None:
                 meta[key] = val
-                persisted_meta_flags = persisted_meta_flags or bool(val)
+                # Check presence (val is not None), not truthiness. Falsy values
+                # like False, 0, "" are legitimate signals that must be persisted.
+                persisted_meta_flags = persisted_meta_flags or (val is not None)
     if cleanup_tier != 0 or cleanup_status or persisted_meta_flags:
         d["cleanup_meta"] = meta
     typeset_status = str(getattr(block, "typeset_status", "") or "")
@@ -973,49 +1024,52 @@ def _apply_block_dict(block: "OCRBlock", d: dict) -> None:
     if isinstance(meta, dict) and meta:
         try:
             block.cleanup_tier = int(meta.get("tier", 0) or 0)
-            block.cleanup_status = str(meta.get("status", "") or "")
-            block.cleanup_reason = str(meta.get("reason", "") or "")
-            block.cleanup_meta = {
-                "tier": block.cleanup_tier,
-                "status": block.cleanup_status,
-                "reason": block.cleanup_reason,
-            }
-            for key in (
-                "review_required",
-                "typeset_box_source",
-                "cross_page_cleanup_limited",
-                "cross_page_cleanup_split",
-                "cross_page_secondary",
-                "diagnostic_only",
-                "diagnostic_cleanup_ran",
-                "destructive_cleanup_executed",
-                "production_patch_accepted",
-                "proposal_valid",
-                "proposal_failure_reason",
-                "cleanup_failure_reason",
-                "gate_violation",
-                "residual_text_visible",
-                "visual_quality_ok",
-                "fill_patch_visible",
-                "cleanup_effective",
-                "selected_mask_source",
-                "selected_mask_reason",
-                "selected_mask_score",
-                "selected_backend",
-                "backend_called",
-                "cleanup_backend_succeeded",
-                "outside_changed_px",
-                "residual_score_bad",
-                "damage_score",
-            ):
-                val = meta.get(key)
-                if isinstance(val, (str, int, float, bool)) or val is None:
-                    block.cleanup_meta[key] = val
         except Exception:
             block.cleanup_tier = 0
+        try:
+            block.cleanup_status = str(meta.get("status", "") or "")
+        except Exception:
             block.cleanup_status = ""
+        try:
+            block.cleanup_reason = str(meta.get("reason", "") or "")
+        except Exception:
             block.cleanup_reason = ""
-            block.cleanup_meta = {}
+        block.cleanup_meta = {
+            "tier": block.cleanup_tier,
+            "status": block.cleanup_status,
+            "reason": block.cleanup_reason,
+        }
+        for key in (
+            "review_required",
+            "typeset_box_source",
+            "cross_page_cleanup_limited",
+            "cross_page_cleanup_split",
+            "cross_page_secondary",
+            "diagnostic_only",
+            "diagnostic_cleanup_ran",
+            "destructive_cleanup_executed",
+            "production_patch_accepted",
+            "proposal_valid",
+            "proposal_failure_reason",
+            "cleanup_failure_reason",
+            "gate_violation",
+            "residual_text_visible",
+            "visual_quality_ok",
+            "fill_patch_visible",
+            "cleanup_effective",
+            "selected_mask_source",
+            "selected_mask_reason",
+            "selected_mask_score",
+            "selected_backend",
+            "backend_called",
+            "cleanup_backend_succeeded",
+            "outside_changed_px",
+            "residual_score_bad",
+            "damage_score",
+        ):
+            val = meta.get(key)
+            if isinstance(val, (str, int, float, bool)) or val is None:
+                block.cleanup_meta[key] = val
 
     if "region_kind" in d:
         try:
@@ -1050,4 +1104,3 @@ def _apply_block_dict(block: "OCRBlock", d: dict) -> None:
             block.style = TextStyle.from_dict(d["style"])
         except Exception as exc:
             debug_print(f"_apply_block_dict: style restore failed: {exc}")
-

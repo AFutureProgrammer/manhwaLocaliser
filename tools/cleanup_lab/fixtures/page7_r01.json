@@ -1,0 +1,47 @@
+{
+  "page_image": "C:\\Users\\zaina\\Downloads\\ManhwaTranslator\\manhwaLocaliser\\source_naver_comic_832677\\chapters\\0001-1\\0007.jpg",
+  "source": {
+    "chapter": "C:\\Users\\zaina\\Downloads\\ManhwaTranslator\\manhwaLocaliser\\source_naver_comic_832677\\chapters\\0001-1",
+    "page_arg": 7,
+    "page_index_zero_based": 6,
+    "region_id": "R-01",
+    "read_only_export": true
+  },
+  "regions": [
+    {
+      "id": "R-01",
+      "bbox": [
+        331,
+        89,
+        277,
+        142
+      ],
+      "text": "진이봉 진화상련 대총수",
+      "role": "thought",
+      "kind": "TEXTURED_BUBBLE",
+      "yolo_kind": "",
+      "detector": "yolo",
+      "detector_confidence": 0.7440173625946045,
+      "boxes": [],
+      "bubble_bbox": [
+        239,
+        18,
+        451,
+        284
+      ],
+      "cleanup_safe_rect": [
+        325,
+        30,
+        346,
+        213
+      ],
+      "detector_text_bbox": [
+        331,
+        89,
+        277,
+        142
+      ],
+      "cleanup_safe_rect_confidence": 0.8279917595624113
+    }
+  ]
+}

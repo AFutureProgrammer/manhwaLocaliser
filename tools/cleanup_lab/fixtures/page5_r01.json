@@ -1,0 +1,40 @@
+{
+  "page_image": "C:\\Users\\zaina\\Downloads\\ManhwaTranslator\\manhwaLocaliser\\source_naver_comic_832677\\chapters\\0001-1\\0005.jpg",
+  "source": {
+    "chapter": "C:\\Users\\zaina\\Downloads\\ManhwaTranslator\\manhwaLocaliser\\source_naver_comic_832677\\chapters\\0001-1",
+    "page_arg": 5,
+    "page_index_zero_based": 4,
+    "region_id": "R-01",
+    "read_only_export": true
+  },
+  "regions": [
+    {
+      "id": "R-01",
+      "bbox": [
+        344,
+        1001,
+        244,
+        168
+      ],
+      "text": "내 전 재산을 빼앗아간 것도 모자라",
+      "role": "dialog",
+      "kind": "TEXTURED_BUBBLE",
+      "yolo_kind": "",
+      "detector": "yolo",
+      "detector_confidence": 0.8549574017524719,
+      "boxes": [],
+      "bubble_bbox": [
+        344,
+        1001,
+        244,
+        168
+      ],
+      "detector_text_bbox": [
+        338,
+        1004,
+        244,
+        168
+      ]
+    }
+  ]
+}

@@ -647,7 +647,7 @@ def run_manifest(manifest_path: Path, out_dir: Path) -> Dict[str, Any]:
                 cleanup_policy=policy,
                 model_config=cfg,
             )
-            plan.cleanup_backend = "opencv"
+            plan.cleanup_backend = str(getattr(cfg, "cleanup_backend", "lama_pt") or "lama_pt")
             cleaned = image.copy()
             execute_cleanup_plan(image, cleaned, plan)
             validate_cleanup_proposal(
@@ -798,7 +798,8 @@ def run(args: argparse.Namespace) -> int:
     image = imread_unicode(str(image_path))
     if image is None:
         raise FileNotFoundError(f"could not read image: {image_path}")
-    policy = CleanupPolicy.from_config(ModelConfig())
+    model_config = ModelConfig.load()
+    policy = CleanupPolicy.from_config(model_config)
     plan = build_cleanup_plan(
         image,
         block,
@@ -806,9 +807,9 @@ def run(args: argparse.Namespace) -> int:
         region_id=region_id,
         cleanup_debug_artifacts=False,
         cleanup_policy=policy,
-        model_config=ModelConfig(),
+        model_config=model_config,
     )
-    plan.cleanup_backend = "opencv"
+    plan.cleanup_backend = str(getattr(model_config, "cleanup_backend", "lama_pt") or "lama_pt")
     cleaned = image.copy()
     execute_cleanup_plan(image, cleaned, plan)
     validate_cleanup_proposal(

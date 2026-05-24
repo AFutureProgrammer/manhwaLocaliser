@@ -1342,6 +1342,7 @@ const ContinuousPage = ({
   regionDrafts,
   showEnglishOverlay,
   showOverlayBoxes,
+  isTypesetDone,
   zoom,
   showMarker,
   totalPages,
@@ -1360,6 +1361,7 @@ const ContinuousPage = ({
   regionDrafts: Record<string, RegionDraft>;
   showEnglishOverlay: boolean;
   showOverlayBoxes: boolean;
+  isTypesetDone: boolean;
   zoom: number;
   showMarker: boolean;
   totalPages: number;
@@ -1443,7 +1445,6 @@ const ContinuousPage = ({
       if (!region.visible || !region.tl) return;
       const ownerPage = regionOwnerPage(region, idx);
       if (ownerPage !== idx) return;
-      if (selectedRegion?.id !== region.id && !regionDrafts[region.id]) return;
       const draft = {
         ...(regionDrafts[region.id] ?? {}),
       };
@@ -1611,8 +1612,7 @@ const ContinuousPage = ({
             if (r.pipeline_disabled && selectedRegion?.id !== r.id) return null;
             const isSelected = selectedRegion?.id === r.id;
             const sprite = previewSprites[`${idx}:${region.id}`];
-            const isLiveEdit = isSelected || Boolean(regionDrafts[region.id]) || dragBox?.id === region.id;
-            const showLiveText = showOverlayBoxes && showEnglishOverlay && isLiveEdit && r.visible && Boolean(r.tl);
+            const showLiveText = showOverlayBoxes && showEnglishOverlay && r.visible && Boolean(r.tl) && (imageMode === "raw" || imageMode === "cleaned" || !isTypesetDone);
             const rawNeedsReview = Boolean(r.raw_match_qa?.needs_review);
             const cleanupNeedsReview = needsCleanupReview(r);
             return (
@@ -1789,6 +1789,7 @@ const ContinuousReader = ({
           regionDrafts={regionDrafts}
           showEnglishOverlay={showEnglishOverlay}
           showOverlayBoxes={showOverlayBoxes}
+          isTypesetDone={pg.status[4] === "done"}
           zoom={zoom}
           showMarker={showMarkers}
           totalPages={data.pages.length}
@@ -2210,8 +2211,7 @@ const CanvasArea = ({
     ...(dragPreview?.id === r.id ? dragPreview.bbox : {}),
   }));
   const requestPreviewSprite = (region: Region | (Region & RegionDraft), draft: RegionDraft, reason: string, debounceMs = 0) => {
-    const activeForPreview = selectedRegion?.id === region.id || Boolean(regionDrafts[region.id]) || dragRef.current?.region.id === region.id;
-    if (!data.meta.chapterDir || !showOverlayBoxes || !showEnglishOverlay || !activeForPreview || !region.visible || !region.tl || dragRef.current?.region.id === region.id) return;
+    if (!data.meta.chapterDir || !showOverlayBoxes || !showEnglishOverlay || !region.visible || !region.tl || dragRef.current?.region.id === region.id) return;
     const slot = spriteSlot(region.id);
     if (previewTimers.current[slot]) window.clearTimeout(previewTimers.current[slot]);
     previewTimers.current[slot] = window.setTimeout(() => {
@@ -2678,12 +2678,12 @@ const CanvasArea = ({
                 ? dragRef.current?.visual
                 : hasLocalPreview && snapshot?.styleKey === regionVisualStyleKey(r) ? snapshot : null;
               const backendSprite = backendPreviewSprites[spriteSlot(r.id)];
-              const isLiveEdit = isSelected || isDragging || hasLocalPreview;
-              const wantsPreviewText = displayImageMode !== "typeset" && isLiveEdit;
-              const liveBackendSprite = wantsPreviewText && previewSpriteMatches(backendSprite, r)
+              const wantsPreviewText = displayImageMode === "raw" || displayImageMode === "cleaned" || !isTypesetDone;
+              const wantsPreviewSprite = wantsPreviewText;
+              const liveBackendSprite = wantsPreviewSprite && previewSpriteMatches(backendSprite, r)
                 ? backendSprite
                 : null;
-              const expectsBackendSprite = r.visible && Boolean(r.tl) && wantsPreviewText;
+              const expectsBackendSprite = r.visible && Boolean(r.tl) && wantsPreviewSprite;
               const allowCssFallback = !expectsBackendSprite || Boolean(cssPreviewFallbacks[spriteSlot(r.id)]);
               const showChrome = showOverlayBoxes;
               const liveBox = dragPreview?.id === r.id ? dragPreview.bbox : r;

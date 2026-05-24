@@ -69,7 +69,68 @@ Fix log (applied in this file)
                                        min(4,max_px) cap, and relaxes rejection gates
                                        (ratio 1.75→8.0, region_ratio 0.18→0.55) when
                                        glow is confirmed.  Fixes neon/multi-layer glow
-                                       text leaving coloured halo residue after LaMa.
+                                        text leaving coloured halo residue after LaMa.
+  FIX-21 Residual retry after model inpaint: _score_cleanup_residual and
+           _residual_retry are now called on the iopaint/lama success path in
+           every strategy branch, not only on the TELEA/NS path.  Fixes
+           boundary-row residuals on multi-line regions.
+  FIX-22 Per-component hole fill:  _fill_holes_per_component() replaces the
+           global binary_fill_holes call in mask assembly and override retry,
+           preventing inter-row gap-filling on multi-line text masks.
+  FIX-23 backend_label iopaint:    cleanup_execution now correctly reports
+           "iopaint" and "lama_pt" instead of "CV-only".
+  FIX-24 destructive_cleanup_executed tracking:  flag set True immediately
+           after any successful pixel write in execute_cleanup_plan, not only
+           inside eval-only validate_cleanup_proposal.
+  FIX-25 halo_effective_radius metric:  updated to reflect the safe_radius
+           actually used when background contamination is detected.
+  FIX-28 Residual scoring + lama retry:  (a) _sample_container_bg_metrics
+           now bails immediately when container_confidence < 0.45, preventing
+           it from sampling surrounding manga art as the bubble background and
+           producing false-positive residual flags on clean white bubbles.
+           (b) _score_cleanup_residual sanity-checks the container sample
+           against the bubble's classified bg brightness; if they diverge by
+           >80 luma units it overrides with region-interior sampling.
+           (c) _model_inpaint_succeeded_path now runs _build_residual_guided_
+           expansion + flat_fill for real leftover smudges (far_ratio ≤ 0.60)
+           when residual_retry_enabled is True, instead of immediately flagging
+           for review.  (d) final_cleanup_decision.inpaint_method now reflects
+           the actual executed backend (lama_pt / lama_onnx) rather than the
+           routing placeholder ("telea" / "local_sample").
+  FIX-27 iopaint-down fallback safety:  (a) inpaint_method placeholder in
+           _route_model_backend_for_nontrivial_solid_mask changed "telea"→
+           "local_sample" so CV fallback is never TELEA on a large mask.
+           (b) cleanup_backend_used now written only on the success path in
+           _try_external_inpaint_backend, not before availability checks, so
+           the meta field reflects what actually ran.  (c) CV fallback paths
+           (TELEA/NS) in execute_cleanup_plan now label cleanup_backend_used
+           "cv_telea"/"cv_ns" explicitly.  (d) _handle_model_inpaint_required_
+           failure restores flat_fill/local_sample when bg is flat-white
+           (brightness ≥ 220 or background_model flat_light/flat_colored) and
+           mask_region_ratio ≥ 0.30, preventing TELEA from destroying bubble
+           edges on the most common failure case.
+  FIX-29 Container-sweep residual pass:  _container_sweep_residuals() is now
+           called from _model_inpaint_succeeded_path when:
+           (a) residual_score.bad is True after LaMa, AND
+           (b) the ring-based _build_residual_guided_expansion finds no
+               adjacent missed pixels (retry_mask is None/empty).
+           The sweep scans the entire bubble interior for pixels that deviate
+           from the sampled background colour (diff>22, luma_diff>16) and
+           inpaints them with TELEA(r=5).  Handles the common case where the
+           text mask missed a large fraction of glyphs (SAM2 skipped,
+           low-confidence CV fallback) leaving residuals spread throughout the
+           container that the 7-px ring approach cannot reach.
+           Safety cap: sweep aborted if it would touch >60% of container area.
+  FIX-30 SAM2 oversized mask glyph rescue:  When the SAM2 auto-mask is
+           rejected as "oversized_auto_mask" (region_ratio>0.45 or
+           container_ratio>0.65) and the bubble background is flat-light
+           (mean_brightness>200), instead of immediately returning None the
+           code now ANDs the SAM2 mask with a raw-image threshold (dark
+           pixels < 180) to extract only the actual glyph strokes.  The
+           rescued mask is accepted when 50+ px survive and the rescued
+           region_ratio is < 0.40.  This recovers a high-quality text mask
+           for large Korean bubbles where SAM2 segments the whole bubble
+           interior (the only object it can find) instead of just the text.
 ──────────────────────────────────────────────────────────────────────────────
 Audit note (engine.py / cleanup.py):
   All destructive pixel writes must go through erase_text_region_planned().
@@ -302,21 +363,18 @@ class CleanupPolicy:
             cleanup_status_enabled=_bool("cleanup_status_enabled", True),
         )
         try:
-            policy.cleanup_solid_bubble_min_container_confidence = float(
-                getattr(cfg, "cleanup_solid_bubble_min_container_confidence", 0.60) or 0.60
-            )
+            _v = getattr(cfg, "cleanup_solid_bubble_min_container_confidence", None)
+            policy.cleanup_solid_bubble_min_container_confidence = float(_v if _v is not None else 0.60)
         except Exception:
             policy.cleanup_solid_bubble_min_container_confidence = 0.60
         try:
-            policy.cleanup_solid_bubble_max_mask_container_ratio = float(
-                getattr(cfg, "cleanup_solid_bubble_max_mask_container_ratio", 0.15) or 0.15
-            )
+            _v = getattr(cfg, "cleanup_solid_bubble_max_mask_container_ratio", None)
+            policy.cleanup_solid_bubble_max_mask_container_ratio = float(_v if _v is not None else 0.15)
         except Exception:
             policy.cleanup_solid_bubble_max_mask_container_ratio = 0.15
         try:
-            policy.cleanup_halo_max_px = int(
-                getattr(cfg, "cleanup_halo_max_px", 3) or 3
-            )
+            _v = getattr(cfg, "cleanup_halo_max_px", None)
+            policy.cleanup_halo_max_px = int(_v if _v is not None else 3)
         except Exception:
             policy.cleanup_halo_max_px = 3
         for name, default in (
@@ -325,13 +383,13 @@ class CleanupPolicy:
             ("cleanup_flat_fill_ring_px", 3),
         ):
             try:
-                setattr(policy, name, max(0, int(getattr(cfg, name, default) or default)))
+                _v = getattr(cfg, name, None)
+                setattr(policy, name, max(0, int(_v if _v is not None else default)))
             except Exception:
                 setattr(policy, name, int(default))
         try:
-            policy.cleanup_residual_retry_dilate_px = int(
-                getattr(cfg, "cleanup_residual_retry_dilate_px", 1) or 1
-            )
+            _v = getattr(cfg, "cleanup_residual_retry_dilate_px", None)
+            policy.cleanup_residual_retry_dilate_px = int(_v if _v is not None else 1)
         except Exception:
             policy.cleanup_residual_retry_dilate_px = 1
         for name, default in (
@@ -346,7 +404,8 @@ class CleanupPolicy:
             ("cleanup_flat_fill_max_ring_edge_density", 0.08),
         ):
             try:
-                setattr(policy, name, float(getattr(cfg, name, default) or default))
+                _v = getattr(cfg, name, None)
+                setattr(policy, name, float(_v if _v is not None else default))
             except Exception:
                 setattr(policy, name, float(default))
         policy.cleanup_risky_action = str(
@@ -1243,8 +1302,8 @@ def _text_bbox_from_boxes(
             arr = np.array(box, dtype=np.float32)
             if arr.ndim == 2:
                 pts.append(arr)
-        except Exception:
-            pass
+        except Exception as _e:
+            debug_print(f"text_bbox_from_boxes: skipping corrupt OCR box {box!r}: {_e}")
     if not pts:
         return None
     all_pts = np.concatenate(pts, axis=0)
@@ -1426,6 +1485,41 @@ def _cleanup_changed_mask(
     total_px = int(max(1, changed.size))
     near_identical_px = int(max(2, min(12, int(total_px * 0.00001))))
     return changed, changed_px, total_px, near_identical_px
+
+
+def _erode_container_to_pure_interior(
+    global_cm: np.ndarray,
+    erode_px: int = 9,
+) -> np.ndarray:
+    """
+    FIX-STROKE-SAFE: Erode the container mask inward so the cleanup mask
+    can never sit on top of (or over) the bubble's black outline stroke.
+
+    Context: SAM2 / YOLO container masks are drawn to the outer boundary
+    of the bubble's ink outline, not the inner edge.  AND-ing cleanup_mask
+    against the raw container therefore allows LaMa to sample ink pixels
+    as background context, producing the characteristic muddy-gray smudge.
+
+    A 9-px inward ellipse erosion peels the safety boundary well inside the
+    white fill area on standard webtoon / manhwa crops (2–5 px stroke width).
+    Even a 5-px stroke with 2 px anti-aliasing fringe leaves a ≥ 2 px gap
+    before the nearest cleanup pixel after this erosion.
+
+    Returns the eroded mask; falls back to the input when erosion empties it.
+    """
+    if erode_px <= 0 or not np.any(global_cm):
+        return global_cm
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1)
+    )
+    eroded = cv2.erode(
+        (global_cm > 0).astype(np.uint8) * 255, kernel, iterations=1
+    )
+    # Safety: only replace if the eroded mask still covers a meaningful area.
+    if int(np.count_nonzero(eroded)) >= max(64, int(np.count_nonzero(global_cm) * 0.25)):
+        return eroded
+    # Erosion made the mask too small → use original (rare; very tiny bubble)
+    return global_cm
 
 
 def _cleanup_safe_interior_mask(plan: CleanupPlan, shape: Tuple[int, ...], erode_px: int = 3) -> Optional[np.ndarray]:
@@ -2685,11 +2779,48 @@ def _sam2_cleanup_candidate(
                 and float(_sam2_q.get("border_touch_ratio", 0.0) or 0.0) < 0.5
             )
             if not _is_text_shaped:
-                plan.debug_metrics["sam2_mask_skipped_reason"] = "oversized_auto_mask"
-                plan.debug_metrics["sam2_mask_rejected_ratio"] = round(float(region_ratio), 4)
-                if container_ratio:
-                    plan.debug_metrics["sam2_mask_rejected_container_ratio"] = round(float(container_ratio), 4)
-                return None
+                # FIX-30: Before hard-rejecting an oversized SAM2 mask on a flat-light
+                # bubble, attempt a glyph-intersection rescue: AND the SAM2 mask with
+                # a threshold on the raw image to keep only the actual dark glyph strokes.
+                # This recovers a high-quality text mask even when SAM2 segments the whole
+                # bubble interior instead of just the text.
+                _bg_is_light = float(
+                    (plan.debug_metrics.get("bg") or {}).get("mean_brightness") or -1
+                ) > 200
+                _rescued = None
+                if _bg_is_light and plan.container_mask is not None:
+                    try:
+                        _gray_raw = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+                        # Threshold: dark pixels in the raw are glyph strokes (bg is light)
+                        _, _dark = cv2.threshold(_gray_raw, 180, 255, cv2.THRESH_BINARY_INV)
+                        # Intersect with the (full-image) SAM2 mask
+                        _dark_in_sam2 = cv2.bitwise_and(_dark, full)
+                        _rescued_px = int(np.count_nonzero(_dark_in_sam2))
+                        _raw_dark_px = int(np.count_nonzero(_dark))
+                        # Accept the rescue if it salvaged a meaningful text-only subset
+                        _rescued_region_ratio = _rescued_px / max(1, region_area)
+                        if (
+                            _rescued_px >= 50
+                            and _rescued_region_ratio < 0.40
+                            and _rescued_px < max(1, _raw_dark_px) * 0.90
+                        ):
+                            _rescued = _dark_in_sam2
+                            plan.debug_metrics["sam2_mask_skipped_reason"] = ""
+                            plan.debug_metrics["sam2_oversized_rescued_px"] = _rescued_px
+                            plan.debug_metrics["sam2_oversized_rescued_ratio"] = round(
+                                float(_rescued_region_ratio), 4
+                            )
+                    except Exception:
+                        _rescued = None
+                if _rescued is None:
+                    plan.debug_metrics["sam2_mask_skipped_reason"] = "oversized_auto_mask"
+                    plan.debug_metrics["sam2_mask_rejected_ratio"] = round(float(region_ratio), 4)
+                    if container_ratio:
+                        plan.debug_metrics["sam2_mask_rejected_container_ratio"] = round(float(container_ratio), 4)
+                    return None
+                # Use the rescued glyph mask in place of the raw SAM2 output
+                full = _rescued
+                mask_px = int(np.count_nonzero(full))
             # Structured text mask — allow through despite large region ratio.
         if mask_px / prompt_area > 0.95 and not _cfg_bool_attr(model_config, "cleanup_force_enabled", False):
             plan.debug_metrics["sam2_mask_skipped_reason"] = "near_full_prompt_mask"
@@ -3030,6 +3161,8 @@ def _try_adopt_existing_safe_rect_container(
         return False
     safe_bbox = (x1, y1, x2 - x1, y2 - y1)
     safe_area = max(1, safe_bbox[2] * safe_bbox[3])
+    if plan.region_bbox is None:
+        return False
     region_area = max(1, int(plan.region_bbox[2] * plan.region_bbox[3]))
     if safe_area < region_area or safe_area > max(region_area * 8, 120000):
         return False
@@ -3274,7 +3407,7 @@ def _reject_unsafe_cleanup_mask(
             and not easy_flat_rect_band
         ):
             return _reject(f"cleanup_mask_rectangular_fill({rectangularity:.2f})")
-        if long_bar_score > 20.0 and mask_area > max(32, int(plan.region_bbox[2] * plan.region_bbox[3] * 0.02)):
+        if long_bar_score > 20.0 and mask_area > max(32, int((plan.region_bbox[2] * plan.region_bbox[3] * 0.02) if plan.region_bbox is not None else 0)):
             return _reject(f"cleanup_mask_long_bar({long_bar_score:.1f})")
         if mask_text_ratio > (3.20 if easy_large_mask else 1.85):
             return _reject(f"cleanup_mask_too_large_text_ratio({mask_text_ratio:.2f})")
@@ -3807,8 +3940,8 @@ def _candidate_multichannel_threshold(
                 pts[:, 0]   = np.clip(pts[:, 0] - x1, 0, roi_w - 1)
                 pts[:, 1]   = np.clip(pts[:, 1] - y1, 0, roi_h - 1)
                 cv2.fillPoly(ocr_local, [pts], 255)
-            except Exception:
-                pass
+            except Exception as _e:
+                debug_print(f"fillPoly: skipping corrupt OCR polygon box {box!r}: {_e}")
     if not np.any(ocr_local):
         return None, 0.0, "no_ocr_boxes"
 
@@ -3834,7 +3967,7 @@ def _candidate_multichannel_threshold(
         (chroma,"Chroma", [(True, False), (False, True)]),
     ]:
         ch_u8 = np.clip(ch, 0, 255).astype(np.uint8)
-        for inv in [p[0] for p in invert_pairs] + [p[1] for p in invert_pairs]:
+        for inv in dict.fromkeys([p[0] for p in invert_pairs] + [p[1] for p in invert_pairs]):
             src      = 255 - ch_u8 if inv else ch_u8
             _, thr   = cv2.threshold(src, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             thr      = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kern)
@@ -3901,8 +4034,8 @@ def _candidate_edge_components(
                 pts[:, 0]   = np.clip(pts[:, 0] - x1, 0, roi_w - 1)
                 pts[:, 1]   = np.clip(pts[:, 1] - y1, 0, roi_h - 1)
                 cv2.fillPoly(ocr_local, [pts], 255)
-            except Exception:
-                pass
+            except Exception as _e:
+                debug_print(f"fillPoly: skipping corrupt OCR polygon box {box!r}: {_e}")
     if not np.any(ocr_local):
         return None, 0.0, "no_ocr_boxes"
 
@@ -4597,6 +4730,31 @@ def _measure_glow_radius(
     return found_radius
 
 
+def _fill_holes_per_component(mask: np.ndarray) -> np.ndarray:
+    """
+    Fill internal holes within each connected component WITHOUT bridging the
+    inter-component whitespace.
+
+    ``scipy.ndimage.binary_fill_holes`` operates on the *entire* binary image.
+    When a cleanup mask covers multiple text rows separated by vertical
+    whitespace, the function treats the gap between rows as a "hole" and fills
+    it -- merging rows into a solid rectangle.  This inflates
+    ``mask_region_ratio``, pushes the mask over safety thresholds, and gives
+    the inpaint model a misleadingly large, rectangular input.
+
+    Per-component filling avoids this: each connected blob (~ one text row, or
+    a cluster of glyphs) has its own interior holes filled while the whitespace
+    separating blobs is preserved.
+    """
+    n, labels, _, _ = cv2.connectedComponentsWithStats(mask, 8)
+    out = np.zeros_like(mask)
+    for ci in range(1, n):
+        comp = ((labels == ci).astype(np.uint8) * 255)
+        filled = (_ndimage.binary_fill_holes(comp > 0).astype(np.uint8) * 255)
+        out = cv2.bitwise_or(out, filled)
+    return out
+
+
 def build_text_halo_mask(
     img_cv: np.ndarray,
     text_mask: np.ndarray,
@@ -4795,6 +4953,7 @@ def build_text_halo_mask(
         halo = _safe_zone
         if debug_metrics is not None:
             debug_metrics["halo_contaminated_bg_safe_radius"] = _safe_r
+            debug_metrics["halo_effective_radius"] = _safe_r  # FIX-25: reflect actual radius
     # FIX-HALO-DENOISE: Remove background-texture noise from the halo.
     #
     # On highly textured backgrounds (vertical grain, halftone dots, orange/dark
@@ -5242,9 +5401,19 @@ def _sample_container_bg_metrics(
     plan: CleanupPlan,
     cleanup_mask: np.ndarray,
 ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
-    """Sample solid-bubble background from eroded container interior."""
+    """Sample solid-bubble background from eroded container interior.
+
+    FIX-28a: When container_confidence < 0.45 the container mask is an
+    unreliable detector box that may span the entire manga panel rather than
+    just the bubble interior.  Sampling from it produces a bg colour drawn
+    from surrounding art pixels, which makes the residual scorer flag a
+    perfectly clean white bubble as 'bad'.  Return None so the caller falls
+    back to _estimate_plain_bg_color, which samples from the region interior.
+    """
     if plan.container_mask is None or plan.container_bbox is None:
         return None, {"reason": "no_container"}
+    if float(plan.container_confidence or 0.0) < 0.45:
+        return None, {"reason": "low_container_confidence", "container_confidence": float(plan.container_confidence or 0.0)}
     global_cm = normalize_mask_to_image(plan.container_mask, plan.container_bbox, img_cv.shape)
     if not np.any(global_cm):
         return None, {"reason": "empty_container"}
@@ -5309,6 +5478,7 @@ def _expand_large_glyph_components(
         or plan.container_mask is None
         or plan.container_bbox is None
         or float(plan.container_confidence or 0.0) < 0.45
+        or plan.region_bbox is None
     ):
         return
     selected_reason = str(plan.debug_metrics.get("selected_text_mask_candidate", "") or "")
@@ -5801,6 +5971,33 @@ def _score_cleanup_residual(
             plan.region_bbox,
             allow_dark=(plan.background_model == "dark_bubble"),
         )
+    # FIX-28b: Sanity-check the container sample against the bubble's own
+    # classified bg brightness.  When the container bleeds into surrounding
+    # manga art (dark panels, screentones) the sampled bg colour is far darker
+    # than the actual bubble fill.  If the two diverge by more than 80 luma
+    # units, the container sample is unreliable — override it with the
+    # region-interior estimate so the scorer doesn't flag clean white bubbles.
+    classified_brightness = float(
+        (plan.debug_metrics.get("bg") or {}).get("mean_brightness") or -1
+    )
+    if classified_brightness >= 0 and bg_bgr is not None:
+        sampled_luma = float(
+            0.114 * bg_bgr[0] + 0.587 * bg_bgr[1] + 0.299 * bg_bgr[2]
+        )
+        if abs(sampled_luma - classified_brightness) > 80:
+            override_bgr, _conf = _estimate_plain_bg_color(
+                img_cv,
+                None,
+                mask,
+                plan.region_bbox,
+                allow_dark=(plan.background_model == "dark_bubble"),
+            )
+            plan.debug_metrics["residual_bg_override"] = (
+                f"container_luma={sampled_luma:.0f} classified={classified_brightness:.0f} "
+                f"divergence={abs(sampled_luma - classified_brightness):.0f} → region_interior"
+            )
+            bg_bgr = override_bgr
+            metrics = {"reason": "overridden_by_brightness_divergence"}
     active = mask > 0
     px = result[active].astype(np.float32)
     if px.shape[0] == 0:
@@ -6545,7 +6742,14 @@ def _route_model_backend_for_nontrivial_solid_mask(plan: CleanupPlan, backend: s
         return False
     plan.cleanup_backend = backend
     plan.cleanup_strategy = "mask_inpaint"
-    plan.inpaint_method = "telea"
+    # FIX-27: Do NOT use "telea" as the placeholder inpaint_method here.
+    # Previously this was "telea", which meant that when the model backend
+    # (iopaint/lama) failed or was unconfigured, _execute_telea() ran on a
+    # 40–100% region-covering SAM2 mask, destroying bubble edges.  Use
+    # "local_sample" so that if the model backend is unavailable the fallback
+    # is a flat-fill sample rather than TELEA smearing.  The real model will
+    # overwrite this value when it succeeds.
+    plan.inpaint_method = "local_sample"
     plan.skip_reason = ""
     plan.debug_metrics["cleanup_route"] = "model_inpaint_solid_bubble"
     plan.debug_metrics["model_inpaint_required"] = True
@@ -6863,7 +7067,7 @@ def build_cleanup_plan(
             else "no_text_for_cleanup"
         )
         plan.debug_metrics["mask"] = {
-            "region_area": int(max(1, plan.region_bbox[2] * plan.region_bbox[3])),
+            "region_area": int(max(1, plan.region_bbox[2] * plan.region_bbox[3])) if plan.region_bbox is not None else 0,
             "text_bbox_area": 0,
             "mask_area": 0,
             "mask_region_ratio": 0.0,
@@ -7377,10 +7581,29 @@ def build_cleanup_plan(
         and plan.text_mask is not None
     ):
         cleanup = plan.text_mask.copy()
+        # FIX-BBOX-ARTIFACT: Strip hard 90-degree bounding-box corner artifacts
+        # from the outline/shadow and halo masks before they enter the cleanup.
+        # These arise because the halo dilation is centred on the OCR text bbox,
+        # so its outer boundary contains straight lines and right-angle corners
+        # that look exactly like comic panel borders to LaMa.  When LaMa sees them
+        # it tries to connect the box edges and synthesizes a large blocky smudge
+        # across the bubble interior.  A small morphological opening (3×3 ellipse,
+        # 1 iteration) removes isolated straight-line artifacts and loose corners
+        # without eroding real glyph-adjacent shadow pixels that form connected
+        # blobs with area ≥ 3×3 = 9 px.
+        _open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         if plan.outline_shadow_mask is not None:
-            cleanup = cv2.bitwise_or(cleanup, plan.outline_shadow_mask)
+            _osm_clean = cv2.morphologyEx(
+                (plan.outline_shadow_mask > 0).astype(np.uint8) * 255,
+                cv2.MORPH_OPEN, _open_k,
+            )
+            cleanup = cv2.bitwise_or(cleanup, _osm_clean)
         if plan.halo_mask is not None:
-            cleanup = cv2.bitwise_or(cleanup, plan.halo_mask)
+            _halo_clean = cv2.morphologyEx(
+                (plan.halo_mask > 0).astype(np.uint8) * 255,
+                cv2.MORPH_OPEN, _open_k,
+            )
+            cleanup = cv2.bitwise_or(cleanup, _halo_clean)
         # Confine to container_mask if available and high-confidence.
         # FIX-6: use normalize_mask_to_image instead of manual canvas build.
         if (
@@ -7406,8 +7629,30 @@ def build_cleanup_plan(
             cv2.drawContours(_solid_cm, _cm_contours, -1, 1, thickness=cv2.FILLED)
             global_cm_solid = (_solid_cm * 255).astype(np.uint8)
 
-            confined = cv2.bitwise_and(cleanup, global_cm_solid)
-            preserves, retained_ratio = _mask_preserves_cleanup(cleanup, global_cm_solid)
+            # FIX-STROKE-SAFE: For speech and caption bubbles, erode the
+            # container silhouette inward by 9 px before using it as the
+            # confinement boundary.  SAM2 / YOLO container masks extend to the
+            # outer edge of the bubble's ink stroke; a direct AND lets the
+            # cleanup mask sit on top of that stroke, giving LaMa dark pixels
+            # as its only local context and producing the characteristic muddy
+            # gray smudge.  Peeling the boundary 9 px inward guarantees every
+            # cleanup pixel is surrounded by clean white fill pixels, which
+            # LaMa can safely copy.
+            # The eroded mask is used ONLY for confinement.  text_mask is
+            # always OR-ed back afterward so no glyph pixel is ever lost.
+            if plan.region_class in {"speech_bubble", "caption_box"}:
+                confinement_mask = _erode_container_to_pure_interior(
+                    global_cm_solid, erode_px=9
+                )
+                plan.debug_metrics["container_confinement_eroded_px"] = int(
+                    np.count_nonzero(global_cm_solid)
+                    - np.count_nonzero(confinement_mask)
+                )
+            else:
+                confinement_mask = global_cm_solid
+
+            confined = cv2.bitwise_and(cleanup, confinement_mask)
+            preserves, retained_ratio = _mask_preserves_cleanup(cleanup, confinement_mask)
             plan.debug_metrics["container_confine_retained_ratio"] = round(retained_ratio, 4)
             # Only use confinement if the detected container preserves the
             # glyph mask. On dark narration art the container detector can lock
@@ -7434,9 +7679,7 @@ def build_cleanup_plan(
         # punched through letter interiors.  LaMa reads unmasked pixels as
         # pristine background texture; holes make it copy glyph fragments into
         # the inpainted result.
-        cleanup = (
-            _ndimage.binary_fill_holes(cleanup > 0).astype(np.uint8) * 255
-        )
+        cleanup = _fill_holes_per_component(cleanup)  # FIX-22: per-component fill so inter-row gaps are not merged.
         #
         # Step 3 – Speckle filter: drop micro-components below 15 px that are
         # pure noise and would corrupt the background texture sample.
@@ -7627,21 +7870,13 @@ def execute_cleanup_plan(
             and plan.region_class in {"speech_bubble", "caption_box"}
             and _try_external_inpaint_backend(img_cv, result, mask, plan)
         ):
-            _guard_flat_bubble_smear(img_cv, result, mask, plan)
-            plan.debug_metrics["retry_used"] = False
-            plan.debug_metrics["final_cleanup_decision"] = {
-                "strategy": plan.cleanup_strategy,
-                "inpaint_method": plan.inpaint_method,
-                "skip_reason": plan.skip_reason,
-                "retry_used": False,
-            }
-            plan.debug_metrics["final_cleanup_mask_px"] = int(np.count_nonzero(plan.cleanup_mask)) if plan.cleanup_mask is not None else 0
-            _save_cleanup_debug_artifacts(img_cv, result, plan)
+            _model_inpaint_succeeded_path(img_cv, result, plan, mask)  # FIX-21 + FIX-24
             return
         if _external_inpaint_blocked(plan):
             _save_cleanup_debug_artifacts(img_cv, result, plan)
             return
         _execute_flat_fill(img_cv, result, mask, plan)
+        plan.debug_metrics["destructive_cleanup_executed"] = True  # FIX-24
         _guard_flat_bubble_smear(img_cv, result, mask, plan)
         residual = _score_cleanup_residual(img_cv, result, plan, mask)
         plan.debug_metrics["residual_score"] = residual
@@ -7740,15 +7975,16 @@ def execute_cleanup_plan(
                 pass
             else:
                 _execute_gradient_idw(img_cv, result, mask, plan)
+            plan.debug_metrics["destructive_cleanup_executed"] = True  # FIX-24
         else:
             if _try_external_inpaint_backend(img_cv, result, mask, plan):
-                _guard_flat_bubble_smear(img_cv, result, mask, plan)
-                _save_cleanup_debug_artifacts(img_cv, result, plan)
+                _model_inpaint_succeeded_path(img_cv, result, plan, mask)  # FIX-21 + FIX-24
                 return
             if _external_inpaint_blocked(plan):
                 _save_cleanup_debug_artifacts(img_cv, result, plan)
                 return
             _execute_ns(result, mask) if method == "ns" else _execute_telea(result, mask)
+            plan.debug_metrics["destructive_cleanup_executed"] = True  # FIX-24
         _guard_flat_bubble_smear(img_cv, result, mask, plan)
         residual = _score_cleanup_residual(img_cv, result, plan, mask)
         plan.debug_metrics["residual_score"] = residual
@@ -7766,13 +8002,13 @@ def execute_cleanup_plan(
 
     if strategy == "texture_clone":
         if _try_external_inpaint_backend(img_cv, result, mask, plan):
-            _guard_flat_bubble_smear(img_cv, result, mask, plan)
-            _save_cleanup_debug_artifacts(img_cv, result, plan)
+            _model_inpaint_succeeded_path(img_cv, result, plan, mask)  # FIX-21 + FIX-24
             return
         if _external_inpaint_blocked(plan):
             _save_cleanup_debug_artifacts(img_cv, result, plan)
             return
         _execute_ns(result, mask) if method == "ns" else _execute_telea(result, mask)
+        plan.debug_metrics["destructive_cleanup_executed"] = True  # FIX-24
         _guard_flat_bubble_smear(img_cv, result, mask, plan)
         residual = _score_cleanup_residual(img_cv, result, plan, mask)
         plan.debug_metrics["residual_score"] = residual
@@ -7790,13 +8026,20 @@ def execute_cleanup_plan(
 
     if strategy == "mask_inpaint":
         if _try_external_inpaint_backend(img_cv, result, mask, plan):
-            _guard_flat_bubble_smear(img_cv, result, mask, plan)
-            _save_cleanup_debug_artifacts(img_cv, result, plan)
+            _model_inpaint_succeeded_path(img_cv, result, plan, mask)  # FIX-21 + FIX-24
             return
         if _external_inpaint_blocked(plan):
             _save_cleanup_debug_artifacts(img_cv, result, plan)
             return
-        _execute_ns(result, mask) if method == "ns" else _execute_telea(result, mask)
+        # FIX-27: label what actually ran so meta is honest (cleanup_backend_used
+        # is no longer set prematurely in _try_external_inpaint_backend).
+        if method == "ns":
+            _execute_ns(result, mask)
+            plan.debug_metrics.setdefault("cleanup_backend_used", "cv_ns")
+        else:
+            _execute_telea(result, mask)
+            plan.debug_metrics.setdefault("cleanup_backend_used", "cv_telea")
+        plan.debug_metrics["destructive_cleanup_executed"] = True  # FIX-24
         _guard_flat_bubble_smear(img_cv, result, mask, plan)
         residual = _score_cleanup_residual(img_cv, result, plan, mask)
         plan.debug_metrics["residual_score"] = residual
@@ -7904,6 +8147,27 @@ def _region_index_from_id(region_id: str) -> Optional[int]:
     return None
 
 
+def _resolve_backend_label(cleanup_backend: str, plan) -> str:
+    """
+    Map the internal cleanup_backend identifier to the human-readable string
+    stored in the ``cleanup_execution`` meta field.
+
+    FIX-23: iopaint and lama_pt were previously collapsed into "CV-only",
+    making it impossible to distinguish model-inpainted results from pure
+    OpenCV inpainted results in eval tooling.
+    """
+    if bool(plan.debug_metrics.get("manual_mask_used", False)):
+        return "manual_mask"
+    if plan.cleanup_strategy in ("skip", "review") or plan.cleanup_mask is None:
+        return "skipped"
+    _label_map = {
+        "lama_onnx": "lama-onnx",
+        "lama_pt":   "lama_pt",
+        "iopaint":   "iopaint",
+    }
+    return _label_map.get(cleanup_backend, "CV-only")
+
+
 def _cleanup_debug_meta(
     plan: CleanupPlan,
     crop_bbox: Tuple[int, int, int, int],
@@ -7913,11 +8177,7 @@ def _cleanup_debug_meta(
     selected_reason = str(plan.debug_metrics.get("selected_text_mask_candidate", plan.text_mask_reason) or "")
     candidate_rows = plan.debug_metrics.get("text_mask_candidate_scores", []) or []
     cleanup_backend = str(plan.cleanup_backend or "opencv")
-    backend_label = "skipped"
-    if bool(plan.debug_metrics.get("manual_mask_used", False)):
-        backend_label = "manual_mask"
-    elif plan.cleanup_strategy not in ("skip", "review") and plan.cleanup_mask is not None:
-        backend_label = "lama-onnx" if cleanup_backend == "lama_onnx" else "CV-only"
+    backend_label = _resolve_backend_label(cleanup_backend, plan)  # FIX-23
     meta = {
         "page_index": int(plan.page_index),
         "region_id": str(plan.region_id or ""),
@@ -8098,6 +8358,8 @@ def _execute_flat_fill(
     Uses the bubble/caption interior when available, samples a robust BGR
     background colour, then blends a small feather clipped to the safe area.
     """
+    if plan.region_bbox is None:
+        return
     rx, ry, rw, rh = plan.region_bbox
     h, w           = img_cv.shape[:2]
     x1, y1         = max(0, rx), max(0, ry)
@@ -8191,6 +8453,7 @@ def _guard_flat_bubble_smear(
         or plan.background_model not in ("flat_light", "flat_colored")
         or mask is None
         or not np.any(mask)
+        or plan.region_bbox is None
     ):
         return
 
@@ -8246,6 +8509,212 @@ def _guard_flat_bubble_smear(
             f"mean_diff={mean_diff:.1f} gray_std={gray_std:.1f} "
             f"bg_bgr={bg_bgr.astype(np.uint8).tolist()}"
         )
+
+
+def _container_sweep_residuals(
+    img_cv: np.ndarray,
+    result: np.ndarray,
+    plan: CleanupPlan,
+    mask: np.ndarray,
+) -> int:
+    """
+    FIX-29: Container-sweep residual pass.
+
+    After LaMa inpainting + ring-expansion both fail to clear all glyphs,
+    sweep the entire bubble interior for pixels that still deviate from the
+    background colour and inpaint them with TELEA.
+
+    This handles the common failure mode where the text mask missed a large
+    fraction of glyph pixels (e.g. SAM2 skipped, low-confidence CV fallback).
+    The ring-based _build_residual_guided_expansion cannot find these pixels
+    because they are not adjacent to the already-cleaned mask area.
+
+    Only fires for:
+      - flat_light / flat_colored background (white/light bubble interior)
+      - speech_bubble or caption_box region class
+      - container_mask + container_bbox present
+      - residual.bad still True after ring expansion
+
+    Returns the number of pixels fixed (0 if nothing to do or sweep skipped).
+    """
+    if plan.background_model not in ("flat_light", "flat_colored", "dark_bubble"):
+        return 0
+    if plan.region_class not in ("speech_bubble", "caption_box"):
+        return 0
+    if plan.container_mask is None or plan.container_bbox is None:
+        return 0
+
+    global_cm = normalize_mask_to_image(plan.container_mask, plan.container_bbox, img_cv.shape)
+    if not np.any(global_cm):
+        return 0
+
+    # Erode container mask by ~5px so we don't paint over the bubble border line
+    interior = cv2.erode(
+        (global_cm > 0).astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    if not np.any(interior):
+        return 0
+
+    # Sample background colour from the raw image (not the already-modified result)
+    # using the interior pixels that weren't in the cleanup mask.
+    bg_scope = (interior > 127) & (mask == 0)
+    bg_pixels = img_cv[bg_scope]
+    if bg_pixels.shape[0] < 30:
+        # Too few reference pixels — fall back to the already-scored bg estimate
+        sampled_bgr = plan.debug_metrics.get("residual_score", {}).get("sampled_bg_bgr")
+        if isinstance(sampled_bgr, list) and len(sampled_bgr) == 3:
+            bg_mean = np.array(sampled_bgr, dtype=np.float32)
+        else:
+            bg_mean = np.array([255, 255, 255], dtype=np.float32)
+    else:
+        bg_mean = bg_pixels.astype(np.float32).mean(axis=0)
+
+    bg_gray = float(0.114 * bg_mean[0] + 0.587 * bg_mean[1] + 0.299 * bg_mean[2])
+
+    # Detect residual pixels in the *result* (post-LaMa) that diverge from bg
+    result_f = result.astype(np.float32)
+    gray     = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    diff     = np.sqrt(np.sum((result_f - bg_mean[None, None, :]) ** 2, axis=2))
+
+    # Thresholds: conservative enough to avoid false positives on textured bgs,
+    # but low enough to catch semi-transparent glyph antialiasing fringe.
+    diff_thr = 22.0 if plan.background_model == "flat_light" else 28.0
+    gray_thr = 16.0 if plan.background_model == "flat_light" else 22.0
+
+    residual_px = (
+        (interior > 127)
+        & (diff > diff_thr)
+        & (np.abs(gray - bg_gray) > gray_thr)
+    ).astype(np.uint8) * 255
+
+    if not np.any(residual_px):
+        return 0
+
+    # Dilate to capture antialiasing halos
+    sweep_mask = cv2.dilate(
+        residual_px,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=1,
+    )
+    sweep_mask = cv2.bitwise_and(sweep_mask, interior)
+
+    if not np.any(sweep_mask):
+        return 0
+
+    swept_px = int(np.count_nonzero(sweep_mask))
+
+    # Safety: if the sweep would touch >60% of the container it is probably
+    # doing something wrong (heavily textured bg misidentified as flat_light).
+    container_area = max(1, int(np.count_nonzero(global_cm)))
+    if swept_px / container_area > 0.60:
+        debug_print(
+            f"_container_sweep_residuals: sweep_mask {swept_px}/{container_area} "
+            f"({100*swept_px/container_area:.1f}%) exceeds 60%% safety cap — skipped "
+            f"region={plan.region_id}"
+        )
+        return 0
+
+    # Inpaint with TELEA — better for scattered single-pixel remnants than flat fill
+    cv2.inpaint(result, sweep_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA, dst=result)
+    plan.debug_metrics["sweep_residual_px"] = swept_px
+    debug_print(
+        f"_container_sweep_residuals: fixed {swept_px} px  region={plan.region_id}"
+    )
+    return swept_px
+
+
+def _model_inpaint_succeeded_path(
+    img_cv: np.ndarray,
+    result: np.ndarray,
+    plan: CleanupPlan,
+    mask: np.ndarray,
+) -> None:
+    """
+    Common post-processing after an external model backend (iopaint / lama)
+    successfully writes pixels into ``result``.
+
+    FIX-24: marks destructive_cleanup_executed=True.
+    FIX-21: runs residual scoring so boundary-row stragglers left by
+            the model are detected and flagged, matching what the TELEA path
+            has always done.
+    FIX-28c: When the residual scorer fires after LaMa, attempt a
+            residual-guided flat-fill expansion pass on the leftover pixels
+            rather than immediately marking for review.  Conditions that must
+            ALL be true to attempt retry:
+            - cleanup_residual_retry_enabled is True
+            - residual.far_ratio <= 0.60 (genuine stragglers, not lama
+              hallucination over a textured bg — very high far_ratio means
+              lama changed the whole fill area, not that a few glyphs remain)
+            - region_class is speech_bubble or caption_box
+            - container_mask + container_bbox are present
+            The expansion calls _build_residual_guided_expansion with the
+            strategy temporarily set to "flat_fill" to pass its gate check,
+            then applies the expansion pixels with flat_fill.  The strategy
+            is restored afterward so nothing downstream sees the override.
+    """
+    plan.debug_metrics["destructive_cleanup_executed"] = True          # FIX-24
+    _guard_flat_bubble_smear(img_cv, result, mask, plan)
+    residual = _score_cleanup_residual(img_cv, result, plan, mask)
+    plan.debug_metrics["residual_score"] = residual
+    retry_used = False
+
+    # FIX-28c: residual expansion retry on the lama/model path
+    if (
+        bool(residual.get("bad", False))
+        and policy_cleanup_residual_retry_enabled(plan)
+        and float(residual.get("residual_far_ratio", 1.0)) <= 0.60
+        and plan.region_class in ("speech_bubble", "caption_box")
+        and plan.container_mask is not None
+        and plan.container_bbox is not None
+    ):
+        _orig_strategy = plan.cleanup_strategy
+        plan.cleanup_strategy = "flat_fill"  # satisfy gate in _build_residual_guided_expansion
+        retry_mask, expansion_px = _build_residual_guided_expansion(
+            img_cv, result, plan, mask, residual
+        )
+        plan.cleanup_strategy = _orig_strategy  # restore immediately
+        if retry_mask is not None and expansion_px > 0 and np.any(retry_mask):
+            retry_used = True
+            plan.cleanup_mask = retry_mask
+            _execute_flat_fill(img_cv, result, retry_mask, plan)
+            residual = _score_cleanup_residual(img_cv, result, plan, retry_mask)
+            plan.debug_metrics["residual_score"] = residual
+            mask = retry_mask
+            plan.debug_metrics["model_inpaint_residual_retry_expansion_px"] = expansion_px
+        else:
+            plan.debug_metrics["model_inpaint_residual_retry_expansion_px"] = 0
+            # FIX-29: Ring expansion found nothing (missed pixels are not adjacent
+            # to the original mask).  Fall back to a whole-container sweep that
+            # detects ALL remaining dark pixels inside the bubble and inpaints them.
+            _sweep_px = _container_sweep_residuals(img_cv, result, plan, mask)
+            if _sweep_px > 0:
+                retry_used = True
+                plan.debug_metrics["model_inpaint_sweep_retry_px"] = _sweep_px
+                residual = _score_cleanup_residual(img_cv, result, plan, mask)
+                plan.debug_metrics["residual_score"] = residual
+
+    if bool(residual.get("bad", False)):
+        _mark_residual_review(plan)
+    plan.debug_metrics["retry_used"] = retry_used
+
+    # FIX-28d: inpaint_method in final_cleanup_decision should reflect what
+    # actually ran (lama_pt / lama_onnx / iopaint), not the routing placeholder
+    # ("telea" or "local_sample") that was set before execution.
+    actual_backend = str(plan.debug_metrics.get("cleanup_backend_used") or "")
+    reported_method = actual_backend if actual_backend else plan.inpaint_method
+
+    plan.debug_metrics["final_cleanup_decision"] = {
+        "strategy": plan.cleanup_strategy,
+        "inpaint_method": reported_method,
+        "skip_reason": plan.skip_reason,
+        "retry_used": retry_used,
+    }
+    plan.debug_metrics["final_cleanup_mask_px"] = (
+        int(np.count_nonzero(plan.cleanup_mask)) if plan.cleanup_mask is not None else 0
+    )
+    _save_cleanup_debug_artifacts(img_cv, result, plan)
 
 
 def _fit_color_plane(
@@ -8438,6 +8907,70 @@ def _execute_ns(
     result[mask_u8 > 0] = inpainted[mask_u8 > 0]
 
 
+def _handle_model_inpaint_required_failure(
+    plan,
+    backend: str,
+    reason: str,
+) -> None:
+    """
+    When a model backend is required but unavailable, record the failure and
+    flag for review WITHOUT blocking the CV fallback.
+
+    FIX-26: Previously, any failure with model_inpaint_required=True would set
+    cleanup_strategy="review" and external_inpaint_blocked=True.  Every
+    strategy branch in execute_cleanup_plan checks _external_inpaint_blocked
+    and exits immediately when True, so NO pixels were written.
+
+    A completely uncleaned region is worse than a CV-cleaned region flagged
+    for review: the latter gives reviewers something to act on, can be
+    re-queued when the model is restored, and still represents an improvement
+    over the raw source.
+
+    FIX-27: When the background is flat white and the cleanup mask is large
+    (mask_region_ratio > 0.3), running TELEA on that mask destroys bubble
+    edges and smears text residue across the fill area.  For these cases we
+    restore the flat_fill / local_sample strategy so the CV fallback is a
+    flat colour sample rather than TELEA smearing.  The region is still
+    flagged review_required_after_cleanup=True so it can be re-queued when
+    the model comes back online.
+    """
+    plan.debug_metrics["cleanup_backend_fallback"] = f"{backend}_fallback:{reason}"
+    plan.debug_metrics["model_inpaint_fallback_to_cv"] = f"{backend}_unavailable:{reason}"
+    plan.debug_metrics["review_required_after_cleanup"] = True
+
+    # FIX-27: Restore flat_fill for flat-white bubbles when the model is down.
+    # Condition: background is flat/light AND mask covers a significant chunk
+    # of the region — this is exactly the profile where TELEA is catastrophic
+    # (it smears bubble edges and leaves visible residue on white fill areas).
+    bg_model = str(plan.background_model or "")
+    flat_white_bg = bg_model in {"flat_light", "flat_colored"}
+    bg_metrics = plan.debug_metrics.get("bg", {})
+    bg_brightness = float(bg_metrics.get("mean_brightness", 0) if bg_metrics else 0)
+    bright_enough = bg_brightness >= 220  # clearly a light-background bubble
+    mask_ratio = float(plan.debug_metrics.get("mask", {}).get("mask_region_ratio", 0) or 0)
+    large_mask = mask_ratio >= 0.30  # large enough that TELEA will damage edges
+
+    if (flat_white_bg or bright_enough) and large_mask:
+        plan.cleanup_strategy = "flat_fill"
+        plan.inpaint_method = "local_sample"
+        plan.debug_metrics["model_inpaint_flat_fill_restore"] = (
+            f"restored_flat_fill: bg={bg_model} brightness={bg_brightness:.0f} "
+            f"mask_ratio={mask_ratio:.3f} backend_failure={backend}:{reason}"
+        )
+
+
+def _record_backend_failure(plan: CleanupPlan, backend: str, reason: str) -> None:
+    """Centralised failure-dispatch for _try_external_inpaint_backend.
+
+    Escalates to the model-inpaint-required handler (FIX-26) when the flag
+    is set, otherwise records a soft fallback note in debug_metrics.
+    """
+    if bool(plan.debug_metrics.get("model_inpaint_required", False)):
+        _handle_model_inpaint_required_failure(plan, backend, reason)  # FIX-26
+    else:
+        plan.debug_metrics["cleanup_backend_fallback"] = f"{backend}_fallback:{reason}"
+
+
 def _try_external_inpaint_backend(
     img_cv: np.ndarray,
     result: np.ndarray,
@@ -8448,26 +8981,21 @@ def _try_external_inpaint_backend(
     if override_mode in {"force_telea", "force_ns"}:
         return False
     backend = (plan.cleanup_backend or "opencv").strip().lower()
-    plan.debug_metrics["cleanup_backend_used"] = backend
+    # FIX-27: Do NOT record cleanup_backend_used here — we haven't confirmed
+    # the backend is reachable yet.  We write it only on the success path
+    # (see return True sites below) so the meta field reflects what actually
+    # ran, not what was attempted.  When the backend is unavailable,
+    # cleanup_backend_used stays unset and the CV fallback path writes its
+    # own label instead.
     if backend not in {"iopaint", "lama_onnx", "lama_pt"}:
         return False
     if backend == "iopaint" and not (plan.iopaint_url or "").strip():
-        plan.debug_metrics["cleanup_backend_fallback"] = "iopaint_fallback:no_url"
-        if bool(plan.debug_metrics.get("model_inpaint_required", False)):
-            plan.debug_metrics["external_inpaint_blocked"] = True
-            plan.cleanup_strategy = "review"
-            plan.inpaint_method = "skip"
-            plan.skip_reason = "iopaint_required_unavailable:no_url"
+        _record_backend_failure(plan, "iopaint", "no_url")
         return False
     if backend == "lama_onnx":
         model_path = (plan.lama_model_path or "").strip()
         if not model_path:
-            plan.debug_metrics["cleanup_backend_fallback"] = "lama_onnx_fallback:no_model_path"
-            if bool(plan.debug_metrics.get("model_inpaint_required", False)):
-                plan.debug_metrics["external_inpaint_blocked"] = True
-                plan.cleanup_strategy = "review"
-                plan.inpaint_method   = "skip"
-                plan.skip_reason      = "lama_onnx_required_unavailable:no_model_path"
+            _record_backend_failure(plan, "lama_onnx", "no_model_path")
             return False
         try:
             engine = AIManager.get_lama(model_path)
@@ -8489,6 +9017,7 @@ def _try_external_inpaint_backend(
             result[mask > 0] = out_bgr[mask > 0]
             plan.debug_metrics["lama_tile_size"] = tile_size
             plan.debug_metrics["lama_device"]    = engine.device
+            plan.debug_metrics["cleanup_backend_used"] = "lama_onnx"  # FIX-27: record on success only
             debug_print(
                 f"lama_onnx_inpaint: region={plan.region_id} "
                 f"tile_size={tile_size} device={engine.device} "
@@ -8496,12 +9025,7 @@ def _try_external_inpaint_backend(
             )
             return True
         except Exception as exc:
-            plan.debug_metrics["cleanup_backend_fallback"] = f"lama_onnx_fallback:{exc}"
-            if bool(plan.debug_metrics.get("model_inpaint_required", False)):
-                plan.debug_metrics["external_inpaint_blocked"] = True
-                plan.cleanup_strategy = "review"
-                plan.inpaint_method   = "skip"
-                plan.skip_reason      = f"lama_onnx_required_unavailable:{exc}"
+            _record_backend_failure(plan, "lama_onnx", str(exc))
             debug_print(
                 f"lama_onnx_inpaint: fallback_to_opencv region={plan.region_id} reason={exc}"
             )
@@ -8515,12 +9039,7 @@ def _try_external_inpaint_backend(
             from PIL import Image as _PILImage             # type: ignore[import]
             import torch                                  # type: ignore[import]
         except ImportError:
-            plan.debug_metrics["cleanup_backend_fallback"] = "lama_pt_fallback:simple_lama_inpainting_not_installed"
-            if bool(plan.debug_metrics.get("model_inpaint_required", False)):
-                plan.debug_metrics["external_inpaint_blocked"] = True
-                plan.cleanup_strategy = "review"
-                plan.inpaint_method   = "skip"
-                plan.skip_reason      = "lama_pt_required_unavailable:not_installed"
+            _record_backend_failure(plan, "lama_pt", "simple_lama_inpainting_not_installed")
             return False
         try:
             # Lazy singleton so the model is only loaded once per process
@@ -8529,8 +9048,8 @@ def _try_external_inpaint_backend(
                 if hasattr(os, "add_dll_directory") and os.path.isdir(torch_lib):
                     try:
                         os.add_dll_directory(torch_lib)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        debug_print(f"lama_pt_inpaint: add_dll_directory({torch_lib!r}) failed: {_e} — LaMa may fail with a DLL error")
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 try:
                     _try_external_inpaint_backend._simple_lama = SimpleLama(device=device)
@@ -8558,18 +9077,14 @@ def _try_external_inpaint_backend(
                     )
 
             result[mask > 0] = out_bgr[mask > 0]
+            plan.debug_metrics["cleanup_backend_used"] = "lama_pt"  # FIX-27: record on success only
             debug_print(
                 f"lama_pt_inpaint: region={plan.region_id} "
                 f"mask_px={int(np.count_nonzero(mask))}"
             )
             return True
         except Exception as exc:
-            plan.debug_metrics["cleanup_backend_fallback"] = f"lama_pt_fallback:{exc}"
-            if bool(plan.debug_metrics.get("model_inpaint_required", False)):
-                plan.debug_metrics["external_inpaint_blocked"] = True
-                plan.cleanup_strategy = "review"
-                plan.inpaint_method   = "skip"
-                plan.skip_reason      = f"lama_pt_required_unavailable:{exc}"
+            _record_backend_failure(plan, "lama_pt", str(exc))
             debug_print(
                 f"lama_pt_inpaint: fallback_to_opencv region={plan.region_id} reason={exc}"
             )
@@ -8579,18 +9094,14 @@ def _try_external_inpaint_backend(
 
         decoded = call_iopaint_inpaint(plan.iopaint_url, img_cv, mask, timeout=8)
         result[mask > 0] = decoded[mask > 0]
+        plan.debug_metrics["cleanup_backend_used"] = backend  # FIX-27: record on success only
         debug_print(
             f"external_inpaint_backend: backend={backend} region={plan.region_id} "
             f"mask_px={int(np.count_nonzero(mask))}"
         )
         return True
     except Exception as exc:
-        plan.debug_metrics["cleanup_backend_fallback"] = f"{backend}_fallback:{exc}"
-        if bool(plan.debug_metrics.get("model_inpaint_required", False)):
-            plan.debug_metrics["external_inpaint_blocked"] = True
-            plan.cleanup_strategy = "review"
-            plan.inpaint_method = "skip"
-            plan.skip_reason = f"{backend}_required_unavailable:{exc}"
+        _record_backend_failure(plan, backend, str(exc))
         debug_print(
             f"external_inpaint_backend: fallback_to_opencv region={plan.region_id} "
             f"backend={backend} reason={exc}"
@@ -8734,9 +9245,7 @@ def erase_text_region_planned(
                 # manually-overridden retries are also clean.
                 _h_kernel_r = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
                 cleanup = cv2.morphologyEx(cleanup, cv2.MORPH_CLOSE, _h_kernel_r)
-                cleanup = (
-                    _ndimage.binary_fill_holes(cleanup > 0).astype(np.uint8) * 255
-                )
+                cleanup = _fill_holes_per_component(cleanup)  # FIX-22: per-component fill so inter-row gaps are not merged.
                 _n_r, _lbl_r, _st_r, _ = cv2.connectedComponentsWithStats(cleanup, 8)
                 _clean_r = np.zeros_like(cleanup)
                 _tx_r, _ty_r, _tw_r, _th_r = (plan.text_bbox or (0, 0, img_cv.shape[1], img_cv.shape[0]))

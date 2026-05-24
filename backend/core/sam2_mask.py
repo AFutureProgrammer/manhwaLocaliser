@@ -142,8 +142,15 @@ def _prepare_import_path(model_path: pathlib.Path) -> None:
 def _select_device(torch: Any, requested: str) -> str:
     device = str(requested or "auto").strip().lower()
     if device == "auto":
-        # Avoid probing CUDA on auto. On Windows, torch.cuda.is_available() can
-        # load incompatible cuDNN DLLs before Python can catch a clean fallback.
+        # Probe CUDA inside a try/except so that any DLL-load failures on Windows
+        # (cuDNN, cuBLAS, etc.) are caught here and we fall back to CPU cleanly.
+        # If the model-build step itself raises a CUDA runtime error the existing
+        # fallback in load() will also catch it, giving us two layers of defence.
+        try:
+            if bool(getattr(torch.cuda, "is_available", lambda: False)()):
+                return "cuda"
+        except Exception:
+            pass
         return "cpu"
     if device == "cuda" and not bool(getattr(torch.cuda, "is_available", lambda: False)()):
         raise RuntimeError("SAM2 device is set to cuda, but CUDA is not available to torch.")
@@ -172,6 +179,9 @@ def _config_for_checkpoint(checkpoint_path: pathlib.Path) -> str:
             return "configs/sam2.1/sam2.1_hiera_b+.yaml"
         if "hiera_l" in name or "large" in name:
             return "configs/sam2.1/sam2.1_hiera_l.yaml"
+        # Unrecognised sam2.1 checkpoint: fall back to tiny rather than leaking
+        # into the sam2 (non-sam2.1) block below and picking the wrong family.
+        return "configs/sam2.1/sam2.1_hiera_t.yaml"
     if "hiera_s" in name or "small" in name:
         return "configs/sam2/sam2_hiera_s.yaml"
     if "hiera_b" in name or "base" in name:
@@ -295,10 +305,13 @@ def _points(values: Any) -> List[Tuple[float, float]]:
     for item in values:
         try:
             if isinstance(item, dict):
-                points.append((float(item.get("x")), float(item.get("y"))))
+                x, y = item.get("x"), item.get("y")
+                if x is None or y is None:
+                    continue  # required keys missing — skip explicitly
+                points.append((float(x), float(y)))
             elif isinstance(item, (list, tuple)) and len(item) >= 2:
                 points.append((float(item[0]), float(item[1])))
-        except Exception:
+        except (TypeError, ValueError):
             continue
     return points
 
@@ -310,6 +323,92 @@ def _encode_mask_png(mask: np.ndarray) -> str:
     return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 
+def _grid_clicks(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    cols: int = 3,
+    rows: int = 2,
+    inset_frac: float = 0.15,
+) -> List[Tuple[float, float]]:
+    """
+    Return a uniform grid of (cols × rows) points inside the given box,
+    inset slightly from each edge so clicks don't land on bubble borders.
+    """
+    w = x2 - x1
+    h = y2 - y1
+    ix = max(1, int(w * inset_frac))
+    iy = max(1, int(h * inset_frac))
+    ax1, ay1 = x1 + ix, y1 + iy
+    ax2, ay2 = x2 - ix, y2 - iy
+    if ax2 <= ax1 or ay2 <= ay1:
+        return [(x1 + w / 2.0, y1 + h / 2.0)]
+    points: List[Tuple[float, float]] = []
+    for r in range(rows):
+        fy = ay1 + (ay2 - ay1) * (r + 0.5) / rows
+        for c in range(cols):
+            fx = ax1 + (ax2 - ax1) * (c + 0.5) / cols
+            points.append((float(fx), float(fy)))
+    return points
+
+
+def _refine_mask_to_strokes(
+    mask: np.ndarray,
+    image_cv: np.ndarray,
+    bg_color_bgr: Tuple[int, int, int],
+    *,
+    stroke_dist_threshold: float = 38.0,
+    min_stroke_frac: float = 0.05,
+    dilate_px: int = 1,
+) -> Tuple[np.ndarray, bool]:
+    """
+    Post-process a SAM2 blob mask to retain only glyph-stroke pixels.
+
+    SAM2 with a single center-click on dense text returns a blob covering the
+    entire text body (including inter-glyph whitespace).  This step subtracts
+    pixels whose colour is close to the background, leaving only dark strokes.
+
+    Returns (refined_mask, refined_to_glyphs).
+    - refined_to_glyphs is True when the refinement materially reduced the mask
+      (stroke area < 85 % of original AND at least min_stroke_frac of original
+      pixels remain — guarding against accidentally stripping everything on an
+      unusual background).
+    - A small dilation is applied afterward to recover stroke-edge anti-aliasing
+      pixels that the threshold might clip.
+    """
+    active = mask > 0
+    if not np.any(active):
+        return mask, False
+
+    bg = np.array(bg_color_bgr, dtype=np.float32)
+    img_f = image_cv.astype(np.float32)
+    dist = np.sqrt(np.sum((img_f - bg[None, None, :]) ** 2, axis=2))
+
+    stroke = active & (dist > stroke_dist_threshold)
+    stroke_px = int(np.count_nonzero(stroke))
+    original_px = int(np.count_nonzero(active))
+
+    if stroke_px < max(4, int(original_px * min_stroke_frac)):
+        # Threshold stripped almost everything — bg_color estimate is probably
+        # wrong (dark bubble, unusual fill).  Return original mask unchanged.
+        return mask, False
+
+    if dilate_px > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1)
+        )
+        stroke_u8 = (stroke.astype(np.uint8)) * 255
+        stroke_u8 = cv2.dilate(stroke_u8, kernel, iterations=1)
+        stroke_u8 &= (active.astype(np.uint8)) * 255  # clamp to SAM2 region
+        stroke = stroke_u8 > 0
+
+    refined_px = int(np.count_nonzero(stroke))
+    refined_to_glyphs = refined_px < int(original_px * 0.85)
+    refined_mask = (stroke.astype(np.uint8)) * 255
+    return refined_mask, refined_to_glyphs
+
+
 def propose_mask(
     image_cv: np.ndarray,
     bbox: Tuple[int, int, int, int],
@@ -317,7 +416,35 @@ def propose_mask(
     negative_clicks: Any = None,
     mode: str = "cleanup",
     config: Any = None,
+    text_bbox: Optional[Tuple[int, int, int, int]] = None,
+    bg_color_bgr: Optional[Tuple[int, int, int]] = None,
 ) -> Dict[str, Any]:
+    """
+    Run SAM2 on ``image_cv`` to propose a text/glyph mask.
+
+    Parameters
+    ----------
+    bbox : (x, y, w, h)
+        Region bounding box — passed to SAM2 as a box prompt.
+    positive_clicks : list of {x,y} dicts or (x,y) tuples, optional
+        Foreground hint points.  When absent and mode=="cleanup", a 3×2 grid
+        of points is auto-generated from ``text_bbox`` (if given) or from
+        ``bbox`` — spreading clicks across the text area rather than using a
+        single center point, which on dense Korean text causes SAM2 to segment
+        the entire text blob rather than individual strokes.
+    negative_clicks : list, optional
+        Background hint points.
+    text_bbox : (x, y, w, h), optional
+        Tighter bounding box around the actual text (from OCR / text detector).
+        Used to place positive clicks more accurately inside the text area.
+    bg_color_bgr : (B, G, R), optional
+        Background fill colour of the bubble.  When provided, the raw SAM2
+        mask is post-processed to retain only pixels that differ from this
+        colour by more than a stroke-distance threshold, setting
+        ``refined_to_glyphs=True`` in the response.  This corrects the most
+        common failure mode where SAM2 returns a blob covering the entire text
+        body (including inter-glyph whitespace) rather than just the strokes.
+    """
     state = load(config)
     if state.get("status") != "ready":
         return {"ok": False, "status": state.get("status", "failed"), "error": state.get("error") or "Embedded SAM2 is not ready."}
@@ -330,14 +457,38 @@ def propose_mask(
         x2, y2 = min(iw, x + max(1, w)), min(ih, y + max(1, h))
         if x2 <= x1 or y2 <= y1:
             return {"ok": False, "status": "error", "error": "SAM2 received an invalid bbox."}
+
         pos = _points(positive_clicks)
         neg = _points(negative_clicks)
+
         if not pos:
-            pos = [(x1 + (x2 - x1) / 2.0, y1 + (y2 - y1) / 2.0)]
+            # Build a multi-point positive-click grid rather than a single
+            # center click.  For dense Korean text, a single center click
+            # lands on a glyph and SAM2 segments the entire filled text body.
+            # A grid of 6 points spread across the text area gives SAM2
+            # multiple foreground anchors and produces a tighter blob that
+            # better matches actual glyph coverage.
+            if text_bbox is not None:
+                tx, ty, tw, th = [int(v) for v in text_bbox]
+                tx1 = max(x1, tx)
+                ty1 = max(y1, ty)
+                tx2 = min(x2, tx + max(1, tw))
+                ty2 = min(y2, ty + max(1, th))
+                if tx2 > tx1 and ty2 > ty1:
+                    pos = _grid_clicks(tx1, ty1, tx2, ty2, cols=3, rows=2, inset_frac=0.12)
+                else:
+                    pos = _grid_clicks(x1, y1, x2, y2, cols=3, rows=2)
+            else:
+                pos = _grid_clicks(x1, y1, x2, y2, cols=3, rows=2)
+
         point_coords = np.array([*pos, *neg], dtype=np.float32)
         point_labels = np.array([*[1] * len(pos), *[0] * len(neg)], dtype=np.int32)
         box = np.array([x1, y1, x2, y2], dtype=np.float32)
         rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
+
+        # _LOCK is held for the entire set_image+predict call.  SAM2 predictors
+        # are stateful (set_image mutates internal image embeddings), so
+        # concurrent calls must serialize here.
         with _LOCK:
             _PREDICTOR.set_image(rgb)
             masks, scores, _ = _PREDICTOR.predict(
@@ -348,15 +499,28 @@ def propose_mask(
             )
         if masks is None or len(masks) == 0:
             return {"ok": False, "status": "error", "error": "SAM2 prediction returned no masks."}
+
         best = int(np.argmax(scores)) if scores is not None and len(scores) else 0
         mask = (masks[best] > 0).astype(np.uint8) * 255
         confidence = float(scores[best]) if scores is not None and len(scores) else 0.0
+
+        # Glyph-stroke refinement: strip inter-glyph whitespace pixels from
+        # the SAM2 blob using the known background colour.  This turns a coarse
+        # "text body" mask into a tight "stroke pixels only" mask, which gives
+        # LaMa a much smaller and more accurate cleanup region to inpaint.
+        refined_to_glyphs = False
+        if bg_color_bgr is not None:
+            mask, refined_to_glyphs = _refine_mask_to_strokes(
+                mask, image_cv, bg_color_bgr
+            )
+
         return {
             "ok": True,
             "status": "ready",
             "mask_b64": _encode_mask_png(mask),
             "bbox": [0, 0, int(iw), int(ih)],
             "confidence": confidence,
+            "refined_to_glyphs": refined_to_glyphs,
             "reason": f"embedded_sam2_{str(mode or 'cleanup')}_proposal",
             "backend": "embedded",
         }
