@@ -71,7 +71,7 @@
   "cleanup_iopaint_candidate_timeout_sec": "5",
   "cleanup_skip_unavailable_iopaint_candidate": true,
   "cleanup_mask_backend": "auto",
-  "cleanup_force_enabled": false,
+  "cleanup_force_enabled": true,
   "cleanup_status_enabled": true,
   "sam2_enabled": true,
   "sam2_load_mode": "lazy",
